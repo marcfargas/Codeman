@@ -1,5 +1,22 @@
 # aicodeman
 
+## 0.3.10
+
+### Patch Changes
+
+- - feat: upgrade xterm.js from 5.3 to 6.0 with native DEC 2026 synchronized output support
+  - feat: add history session resume UI and API — resume Claude conversations after reboot
+  - feat: add resumeSessionId support for conversation resume across session restarts
+  - feat: persist active tabs across page refresh
+  - feat: improve session resume reliability and persist user settings
+  - perf: increase terminal scrollback from 5,000 to 20,000 lines
+  - fix: resolve terminal resize scrollback ghost renders
+  - fix: route shell sessions to correct endpoint on tab click
+  - fix: correct claudeSessionId for resumed sessions (use original Claude conversation ID)
+  - fix: increase default desktop font size from 12 to 14
+  - refactor: extract shared \_fetchHistorySessions() method to eliminate duplication
+  - refactor: remove dead DEC 2026 sync code (extractSyncSegments, DEC_SYNC_START/END constants)
+
 ## 0.3.9
 
 ### Patch Changes
