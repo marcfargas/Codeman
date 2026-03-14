@@ -28,7 +28,24 @@
 curl -fsSL https://raw.githubusercontent.com/Ark0N/Codeman/master/install.sh | bash
 ```
 
-This installs Node.js and tmux if missing, clones Codeman to `~/.codeman/app`, and builds it. You'll need at least one AI coding CLI installed — [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) (or both). After install:
+This installs Node.js and tmux if missing, clones Codeman to `~/.codeman/app`, and builds it.
+
+**Install from a fork or specific branch:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/douchekr/Codeman/feat/input-cjk-form/install.sh | \
+  CODEMAN_REPO_URL=https://github.com/douchekr/Codeman.git \
+  CODEMAN_BRANCH=feat/input-cjk-form bash
+```
+
+The installer supports these environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CODEMAN_REPO_URL` | upstream Codeman | Custom git repository URL |
+| `CODEMAN_BRANCH` | `master` | Git branch to install |
+| `CODEMAN_INSTALL_DIR` | `~/.codeman/app` | Custom install directory |
+| `CODEMAN_SKIP_SYSTEMD` | `0` | Skip systemd service setup prompt |
+| `CODEMAN_NONINTERACTIVE` | `0` | Skip all prompts (for CI/automation) | You'll need at least one AI coding CLI installed — [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) (or both). After install:
 
 ```bash
 codeman web

@@ -9,6 +9,8 @@
 #   CODEMAN_INSTALL_DIR       - Custom install directory (default: ~/.codeman/app)
 #   CODEMAN_SKIP_SYSTEMD=1    - Skip systemd service setup prompt
 #   CODEMAN_NODE_VERSION      - Node.js major version to install (default: 22)
+#   CODEMAN_REPO_URL          - Custom git repository URL (default: upstream Codeman)
+#   CODEMAN_BRANCH            - Git branch to install (default: master)
 
 set -euo pipefail
 
@@ -17,7 +19,8 @@ set -euo pipefail
 # ============================================================================
 
 INSTALL_DIR="${CODEMAN_INSTALL_DIR:-$HOME/.codeman/app}"
-REPO_URL="https://github.com/Ark0N/Codeman.git"
+REPO_URL="${CODEMAN_REPO_URL:-https://github.com/Ark0N/Codeman.git}"
+BRANCH="${CODEMAN_BRANCH:-master}"
 MIN_NODE_VERSION=18
 TARGET_NODE_VERSION="${CODEMAN_NODE_VERSION:-22}"
 NONINTERACTIVE="${CODEMAN_NONINTERACTIVE:-0}"
@@ -1081,7 +1084,7 @@ main() {
         mkdir -p "$(dirname "$INSTALL_DIR")"
 
         # Clone repository (shallow for speed)
-        git clone --quiet --depth 1 "$REPO_URL" "$INSTALL_DIR"
+        git clone --quiet --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
         cd "$INSTALL_DIR"
     fi
 
