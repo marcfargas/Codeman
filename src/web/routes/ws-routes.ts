@@ -38,6 +38,13 @@ const WS_BATCH_INTERVAL_MS = 8;
 /** Flush immediately when batch exceeds this size (bytes) for responsiveness. */
 const WS_BATCH_FLUSH_THRESHOLD = 16384;
 
+/** How often to ping each WebSocket client (ms). Detects stale connections that
+ *  TCP keepalive won't catch for minutes, especially through tunnels/proxies. */
+const WS_PING_INTERVAL_MS = 30_000;
+
+/** If pong isn't received within this window after a ping, terminate the socket. */
+const WS_PONG_TIMEOUT_MS = 10_000;
+
 /** DEC 2026 synchronized update markers. Wrapping output in these tells xterm.js
  *  to buffer all content and render atomically in a single frame — eliminates
  *  flicker from cursor-up redraws that Ink sends without its own sync markers
@@ -133,7 +140,35 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort): void {
     session.on('clearTerminal', onClearTerminal);
     session.on('needsRefresh', onNeedsRefresh);
 
+    // Heartbeat: detect stale connections (especially through tunnels where
+    // TCP RST can take minutes to propagate).
+    let pongTimeout: ReturnType<typeof setTimeout> | null = null;
+    let alive = true;
+
+    socket.on('pong', () => {
+      alive = true;
+      if (pongTimeout) {
+        clearTimeout(pongTimeout);
+        pongTimeout = null;
+      }
+    });
+
+    const pingInterval = setInterval(() => {
+      if (!alive) {
+        // Previous ping never got a pong — connection is dead
+        socket.terminate();
+        return;
+      }
+      alive = false;
+      socket.ping();
+      pongTimeout = setTimeout(() => {
+        socket.terminate();
+      }, WS_PONG_TIMEOUT_MS);
+    }, WS_PING_INTERVAL_MS);
+
     socket.on('close', () => {
+      clearInterval(pingInterval);
+      if (pongTimeout) clearTimeout(pongTimeout);
       if (batchTimer) clearTimeout(batchTimer);
       batchChunks = [];
       session.off('terminal', onTerminal);
