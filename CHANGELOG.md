@@ -1,5 +1,11 @@
 # aicodeman
 
+## 0.4.1
+
+### Patch Changes
+
+- Performance optimizations: V8 compile cache for 10-20% faster cold starts, lazy-load WebGL addon (244KB saved on mobile), preload hints for critical scripts, batch tmux reconciliation (N subprocess calls → 1). Also: WebSocket session lifecycle fixes, CJK IME input support, CI upgrade to Node 24/actions v6, install.sh fork support, and CLAUDE.md/README documentation refresh.
+
 ## 0.4.0
 
 ### Minor Changes
