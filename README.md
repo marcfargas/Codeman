@@ -32,9 +32,9 @@ This installs Node.js and tmux if missing, clones Codeman to `~/.codeman/app`, a
 
 **Install from a fork or specific branch:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/douchekr/Codeman/feat/input-cjk-form/install.sh | \
-  CODEMAN_REPO_URL=https://github.com/douchekr/Codeman.git \
-  CODEMAN_BRANCH=feat/input-cjk-form bash
+curl -fsSL https://raw.githubusercontent.com/<user>/Codeman/<branch>/install.sh | \
+  CODEMAN_REPO_URL=https://github.com/<user>/Codeman.git \
+  CODEMAN_BRANCH=<branch> bash
 ```
 
 The installer supports these environment variables:
