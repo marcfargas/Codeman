@@ -709,7 +709,7 @@ export function registerSystemRoutes(
     for await (const chunk of req.raw) {
       totalSize += chunk.length;
       if (totalSize > MAX_SCREENSHOT_SIZE) {
-        reply.status(413);
+        reply.code(413);
         return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'File too large (max 10MB)');
       }
       chunks.push(chunk as Buffer);
@@ -794,12 +794,12 @@ export function registerSystemRoutes(
     const { name } = req.params as { name: string };
     // Prevent path traversal
     if (name.includes('/') || name.includes('\\') || name.includes('..')) {
-      reply.status(400);
+      reply.code(400);
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid filename');
     }
     const filepath = join(SCREENSHOTS_DIR, name);
     if (!existsSync(filepath)) {
-      reply.status(404);
+      reply.code(404);
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Screenshot not found');
     }
     const ext = name.match(/\.(png|jpg|jpeg|webp|gif)$/i)?.[1]?.toLowerCase() ?? 'png';

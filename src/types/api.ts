@@ -117,7 +117,7 @@ export interface CaseInfo {
  * @param value The value to check
  * @returns True if the value is an Error instance
  */
-export function isError(value: unknown): value is Error {
+function isError(value: unknown): value is Error {
   return value instanceof Error;
 }
 

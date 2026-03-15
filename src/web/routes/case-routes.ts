@@ -18,6 +18,28 @@ import { CASES_DIR, validatePathWithinBase } from '../route-helpers.js';
 import { SseEvent } from '../sse-events.js';
 import type { EventPort, ConfigPort } from '../ports/index.js';
 
+const LINKED_CASES_FILE = join(homedir(), '.codeman', 'linked-cases.json');
+
+/** Read and parse linked-cases.json, returning empty object on missing/invalid file. */
+async function readLinkedCases(): Promise<Record<string, string>> {
+  try {
+    return JSON.parse(await fs.readFile(LINKED_CASES_FILE, 'utf-8'));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      console.warn('[Server] Failed to read linked cases:', err);
+    }
+    return {};
+  }
+}
+
+/** Resolve a case name to its directory path, checking linked cases if not in CASES_DIR. */
+async function resolveCasePath(name: string): Promise<string> {
+  const casePath = join(CASES_DIR, name);
+  if (existsSync(casePath)) return casePath;
+  const linkedCases = await readLinkedCases();
+  return linkedCases[name] ?? casePath;
+}
+
 export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & ConfigPort): void {
   // ═══════════════════════════════════════════════════════════════
   // Case CRUD (list, create, link, detail, fix-plan)
@@ -45,22 +67,15 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
     }
 
     // Get linked cases
-    const linkedCasesFile = join(homedir(), '.codeman', 'linked-cases.json');
-    try {
-      const linkedCases: Record<string, string> = JSON.parse(await fs.readFile(linkedCasesFile, 'utf-8'));
-      for (const [name, path] of Object.entries(linkedCases)) {
-        // Only add if not already in cases (avoid duplicates) and path exists
-        if (!cases.some((c) => c.name === name) && existsSync(path)) {
-          cases.push({
-            name,
-            path,
-            hasClaudeMd: existsSync(join(path, 'CLAUDE.md')),
-          });
-        }
-      }
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.warn('[Server] Failed to read linked cases:', err);
+    const linkedCases = await readLinkedCases();
+    const existingNames = new Set(cases.map((c) => c.name));
+    for (const [name, path] of Object.entries(linkedCases)) {
+      if (!existingNames.has(name) && existsSync(path)) {
+        cases.push({
+          name,
+          path,
+          hasClaudeMd: existsSync(join(path, 'CLAUDE.md')),
+        });
       }
     }
 
@@ -126,15 +141,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
     }
 
     // Load existing linked cases
-    const linkedCasesFile = join(homedir(), '.codeman', 'linked-cases.json');
-    let linkedCases: Record<string, string> = {};
-    try {
-      linkedCases = JSON.parse(await fs.readFile(linkedCasesFile, 'utf-8'));
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.warn('[Server] Failed to read linked cases:', err);
-      }
-    }
+    const linkedCases = await readLinkedCases();
 
     // Check if name is already linked
     if (linkedCases[name]) {
@@ -151,7 +158,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       if (!existsSync(codemanDir)) {
         mkdirSync(codemanDir, { recursive: true });
       }
-      await fs.writeFile(linkedCasesFile, JSON.stringify(linkedCases, null, 2));
+      await fs.writeFile(LINKED_CASES_FILE, JSON.stringify(linkedCases, null, 2));
       ctx.broadcast(SseEvent.CaseLinked, { name, path: expandedPath });
       return { success: true, data: { case: { name, path: expandedPath } } };
     } catch (err) {
@@ -166,34 +173,18 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case name');
     }
 
-    // First check linked cases
-    const linkedCasesFile = join(homedir(), '.codeman', 'linked-cases.json');
-    try {
-      const linkedCases: Record<string, string> = JSON.parse(await fs.readFile(linkedCasesFile, 'utf-8'));
-      if (linkedCases[name]) {
-        const linkedPath = linkedCases[name];
-        return {
-          name,
-          path: linkedPath,
-          hasClaudeMd: existsSync(join(linkedPath, 'CLAUDE.md')),
-          linked: true,
-        };
-      }
-    } catch {
-      // ENOENT or parse errors - fall through to CASES_DIR check
-    }
-
-    // Then check CASES_DIR
-    const casePath = join(CASES_DIR, name);
+    const casePath = await resolveCasePath(name);
 
     if (!existsSync(casePath)) {
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Case not found');
     }
 
+    const linked = casePath !== join(CASES_DIR, name);
     return {
       name,
       path: casePath,
       hasClaudeMd: existsSync(join(casePath, 'CLAUDE.md')),
+      ...(linked && { linked: true }),
     };
   });
 
@@ -206,21 +197,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
     }
 
     // Get case path (check linked cases first, then CASES_DIR)
-    let casePath: string | null = null;
-
-    const linkedCasesFile = join(homedir(), '.codeman', 'linked-cases.json');
-    try {
-      const linkedCases: Record<string, string> = JSON.parse(await fs.readFile(linkedCasesFile, 'utf-8'));
-      if (linkedCases[name]) {
-        casePath = linkedCases[name];
-      }
-    } catch {
-      // ENOENT or parse errors - fall through to CASES_DIR
-    }
-
-    if (!casePath) {
-      casePath = join(CASES_DIR, name);
-    }
+    const casePath = await resolveCasePath(name);
 
     const fixPlanPath = join(casePath, '@fix_plan.md');
 
@@ -321,23 +298,11 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
 
   app.get('/api/cases/:caseName/ralph-wizard/files', async (req) => {
     const { caseName } = req.params as { caseName: string };
-    let casePath = validatePathWithinBase(caseName, CASES_DIR);
-    if (!casePath) {
+    if (!validatePathWithinBase(caseName, CASES_DIR)) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case name');
     }
 
-    // Check linked cases if path doesn't exist
-    if (!existsSync(casePath)) {
-      const linkedCasesFile = join(homedir(), '.codeman', 'linked-cases.json');
-      try {
-        const linkedCases: Record<string, string> = JSON.parse(await fs.readFile(linkedCasesFile, 'utf-8'));
-        if (linkedCases[caseName]) {
-          casePath = linkedCases[caseName];
-        }
-      } catch {
-        // No linked cases file
-      }
-    }
+    const casePath = await resolveCasePath(caseName);
 
     const wizardDir = join(casePath, 'ralph-wizard');
 
@@ -376,8 +341,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
   // Cache disabled to ensure fresh prompts when starting new plan generations
   app.get('/api/cases/:caseName/ralph-wizard/file/:filePath', async (req, reply) => {
     const { caseName, filePath } = req.params as { caseName: string; filePath: string };
-    let casePath = validatePathWithinBase(caseName, CASES_DIR);
-    if (!casePath) {
+    if (!validatePathWithinBase(caseName, CASES_DIR)) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case name');
     }
 
@@ -386,18 +350,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
     reply.header('Pragma', 'no-cache');
     reply.header('Expires', '0');
 
-    // Check linked cases if path doesn't exist
-    if (!existsSync(casePath)) {
-      const linkedCasesFile = join(homedir(), '.codeman', 'linked-cases.json');
-      try {
-        const linkedCases: Record<string, string> = JSON.parse(await fs.readFile(linkedCasesFile, 'utf-8'));
-        if (linkedCases[caseName]) {
-          casePath = linkedCases[caseName];
-        }
-      } catch {
-        // No linked cases file
-      }
-    }
+    const casePath = await resolveCasePath(caseName);
 
     const wizardDir = join(casePath, 'ralph-wizard');
 

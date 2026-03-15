@@ -109,7 +109,7 @@ Codeman is a Claude Code session manager with web interface and autonomous Ralph
 | **Infra** | `src/hooks-config.ts`, `src/push-store.ts`, `src/tunnel-manager.ts`, `src/image-watcher.ts`, `src/file-stream-manager.ts` | |
 | **Plan** | `src/plan-orchestrator.ts`, `src/prompts/*.ts`, `src/templates/claude-md.ts` | |
 | **Web** | `src/web/server.ts`, `src/web/sse-events.ts`, `src/web/routes/*.ts` (13 route modules incl. `ws-routes.ts` + barrel), `src/web/ports/*.ts`, `src/web/middleware/auth.ts`, `src/web/schemas.ts` | |
-| **Frontend** | `src/web/public/app.js` (~2.6K lines, core) + 6 domain modules (`terminal-ui.js`, `respawn-ui.js`, `ralph-panel.js`, `settings-ui.js`, `panels-ui.js`, `session-ui.js`) + 5 existing modules (`ralph-wizard.js`, `api-client.js`, `subagent-windows.js`, `sw.js`, `input-cjk.js`) | |
+| **Frontend** | `src/web/public/app.js` (~2.6K lines, core) + 5 infra modules (`constants.js`, `mobile-handlers.js`, `voice-input.js`, `notification-manager.js`, `keyboard-accessory.js`) + 6 domain modules (`terminal-ui.js`, `respawn-ui.js`, `ralph-panel.js`, `settings-ui.js`, `panels-ui.js`, `session-ui.js`) + 4 feature modules (`ralph-wizard.js`, `api-client.js`, `subagent-windows.js`, `input-cjk.js`) + `sw.js` | |
 | **Types** | `src/types/index.ts` → 13 domain files | See `@fileoverview` in index.ts |
 
 ★ = Large file (>50KB). All files have `@fileoverview` JSDoc — read that before diving in.
@@ -166,7 +166,7 @@ Frontend JS modules have `@fileoverview` with `@dependency`/`@loadorder` tags. L
 
 ### SSE Event Registry
 
-~100 event types in `src/web/sse-events.ts` (backend) and `SSE_EVENTS` in `constants.js` (frontend). Both must be kept in sync.
+~106 event types in `src/web/sse-events.ts` (backend) and `SSE_EVENTS` in `constants.js` (frontend). Both must be kept in sync.
 
 ### API Routes
 
