@@ -51,6 +51,39 @@ const CLAUDE_BANNER_PATTERN = /\x1b\[1mClaud/;
 const CTRL_L_PATTERN = /\x0c/g;
 const LEADING_WHITESPACE_PATTERN = /^[\s\r\n]+/;
 
+/**
+ * Strip redundant Ink spinner/status-bar redraw frames from the terminal buffer.
+ * Ink (Claude Code's TUI) uses absolute cursor positioning (CSI n d = VPA, CSI n;m H = CUP)
+ * to animate the spinner and update the status bar. During long thinking phases, these frames
+ * accumulate to 500KB+ of repeated overwrites to the same rows. When the buffer is tailed,
+ * only spinner frames are returned, making the terminal appear empty.
+ *
+ * Strategy: find where absolute-positioned redraws begin (first VPA sequence), then keep
+ * only the last ~4KB of redraw frames (the final visual state) and discard the rest.
+ */
+function stripInkRedrawBloat(buffer: string): string {
+  // Find where Ink's absolute-positioned redraws start (first CSI n d = VPA)
+  // eslint-disable-next-line no-control-regex
+  const firstVPA = buffer.search(/\x1b\[\d+d/);
+  if (firstVPA === -1) return buffer; // No Ink redraws
+
+  const contentPart = buffer.slice(0, firstVPA);
+  const redrawPart = buffer.slice(firstVPA);
+
+  // If the redraw section is small (<16KB), not worth stripping
+  if (redrawPart.length < 16384) return buffer;
+
+  // Keep only the last 4KB of redraw frames — this preserves the final visual state
+  // (spinner position, status bar text, token count, etc.)
+  const tail = redrawPart.slice(-4096);
+  // Avoid starting mid-escape: find first complete frame boundary
+  // eslint-disable-next-line no-control-regex
+  const frameStart = tail.search(/\x1b\(B\x1b\[m|\x1b\[\d+d|\x1b\[\d+;\d+H/);
+  const cleanTail = frameStart > 0 ? tail.slice(frameStart) : tail;
+
+  return contentPart + cleanTail;
+}
+
 export function registerSessionRoutes(
   app: FastifyInstance,
   ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort
@@ -534,10 +567,16 @@ export function registerSessionRoutes(
     let truncated = false;
     let cleanBuffer: string;
 
-    if (tailBytes > 0 && fullSize > tailBytes) {
+    // Strip redundant Ink spinner/status redraws BEFORE tailing.
+    // During long thinking phases, Ink rewrites the same rows thousands of times
+    // (500KB+). Without stripping, tail mode returns only spinner frames and
+    // the terminal appears empty when switching tabs.
+    const strippedBuffer = stripInkRedrawBloat(session.terminalBuffer);
+
+    if (tailBytes > 0 && strippedBuffer.length > tailBytes) {
       // Fast path: tail from the end, skip expensive banner search on full 2MB buffer.
       // Banner is near the top and gets discarded by tail anyway.
-      cleanBuffer = session.terminalBuffer.slice(-tailBytes);
+      cleanBuffer = strippedBuffer.slice(-tailBytes);
       truncated = true;
       // Avoid starting mid-ANSI-escape: find first newline within the first 4KB
       // and start from there. This prevents xterm.js from parsing a partial escape
@@ -548,7 +587,7 @@ export function registerSessionRoutes(
       }
     } else {
       // Full buffer: clean junk before actual Claude content
-      cleanBuffer = session.terminalBuffer;
+      cleanBuffer = strippedBuffer;
 
       // Find where Claude banner starts (has color codes before "Claude")
       const claudeMatch = cleanBuffer.match(CLAUDE_BANNER_PATTERN);
