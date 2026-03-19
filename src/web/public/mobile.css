@@ -428,6 +428,18 @@ html.mobile-init .file-browser-panel {
     position: relative;
   }
 
+  /* When keyboard is visible, pin the app container to the viewport.
+     iOS Safari scrolls the page to bring the focused input (xterm's hidden
+     textarea) into view, even with overflow:hidden. position:fixed prevents
+     the browser from scrolling the document under the app. */
+  .keyboard-visible .app {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+  }
+
   /* Ultra-compact session tabs — .tabs-two-rows override needed to match
      specificity of .session-tabs.tabs-two-rows in styles.css (0,2,0) */
   .session-tabs,

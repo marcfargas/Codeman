@@ -36,15 +36,19 @@
 const MobileDetection = {
   /** Check if device supports touch input */
   isTouchDevice() {
-    return 'ontouchstart' in window ||
+    return (
+      'ontouchstart' in window ||
       navigator.maxTouchPoints > 0 ||
-      (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+      (window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
+    );
   },
 
   /** Check if device is iOS (iPhone, iPad, iPod) */
   isIOS() {
-    return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    return (
+      /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+    );
   },
 
   /** Check if browser is Safari */
@@ -77,7 +81,14 @@ const MobileDetection = {
     const isTouch = this.isTouchDevice();
 
     // Remove existing device classes
-    body.classList.remove('device-mobile', 'device-tablet', 'device-desktop', 'touch-device', 'ios-device', 'safari-browser');
+    body.classList.remove(
+      'device-mobile',
+      'device-tablet',
+      'device-desktop',
+      'touch-device',
+      'ios-device',
+      'safari-browser'
+    );
 
     // Add current device class
     body.classList.add(`device-${deviceType}`);
@@ -153,7 +164,7 @@ const MobileDetection = {
       this._gestureStartHandler = null;
       this._gestureChangeHandler = null;
     }
-  }
+  },
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -202,6 +213,17 @@ const KeyboardHandler = {
       // Also handle scroll (iOS scrolls viewport when keyboard appears)
       window.visualViewport.addEventListener('scroll', this._viewportScrollHandler);
     }
+
+    // Prevent page-level scroll when keyboard is visible.
+    // iOS Safari scrolls the document to bring xterm's hidden textarea into
+    // view when the user types, pushing the entire UI off-screen. The CSS
+    // position:fixed on .app prevents most cases, but reset as a safety net.
+    this._windowScrollHandler = () => {
+      if (this.keyboardVisible) {
+        window.scrollTo(0, 0);
+      }
+    };
+    window.addEventListener('scroll', this._windowScrollHandler);
   },
 
   /** Remove event listeners */
@@ -217,6 +239,10 @@ const KeyboardHandler = {
     if (this._viewportScrollHandler && window.visualViewport) {
       window.visualViewport.removeEventListener('scroll', this._viewportScrollHandler);
       this._viewportScrollHandler = null;
+    }
+    if (this._windowScrollHandler) {
+      window.removeEventListener('scroll', this._windowScrollHandler);
+      this._windowScrollHandler = null;
     }
   },
 
@@ -327,6 +353,10 @@ const KeyboardHandler = {
       KeyboardAccessoryBar.show();
     }
 
+    // Reset any page scroll that occurred during keyboard open.
+    // iOS Safari may scroll the document to reveal xterm's hidden textarea.
+    window.scrollTo(0, 0);
+
     // Refit terminal locally AND send resize to server so Claude Code (Ink)
     // knows the actual terminal dimensions. Without this, Ink redraws at the
     // old (larger) row count when the user types, causing content to scroll
@@ -335,11 +365,16 @@ const KeyboardHandler = {
     // while keyboard is up — this one-shot resize on open/close is sufficient.
     setTimeout(() => {
       if (typeof app !== 'undefined' && app.terminal) {
-        if (app.fitAddon) try { app.fitAddon.fit(); } catch {}
+        if (app.fitAddon)
+          try {
+            app.fitAddon.fit();
+          } catch {}
         app.terminal.scrollToBottom();
         // Send resize to server so PTY dimensions match xterm
         this._sendTerminalResize();
       }
+      // Reset again after fit/resize in case layout changes triggered scroll
+      window.scrollTo(0, 0);
     }, 150);
 
     // Reposition subagent windows to stack from bottom (above keyboard)
@@ -358,7 +393,9 @@ const KeyboardHandler = {
     // Refit terminal, scroll to bottom, and send resize to restore original dimensions
     setTimeout(() => {
       if (typeof app !== 'undefined' && app.fitAddon) {
-        try { app.fitAddon.fit(); } catch {}
+        try {
+          app.fitAddon.fit();
+        } catch {}
         if (app.terminal) app.terminal.scrollToBottom();
         // Send resize to server to restore full terminal size
         this._sendTerminalResize();
@@ -381,7 +418,7 @@ const KeyboardHandler = {
         fetch(`/api/sessions/${app.activeSessionId}/resize`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cols, rows })
+          body: JSON.stringify({ cols, rows }),
         }).catch(() => {});
       }
     } catch {}
@@ -404,11 +441,7 @@ const KeyboardHandler = {
         return false;
       }
     }
-    return (
-      tagName === 'input' ||
-      tagName === 'textarea' ||
-      el.isContentEditable
-    );
+    return tagName === 'input' || tagName === 'textarea' || el.isContentEditable;
   },
 
   /** Scroll input into view above the keyboard */
@@ -434,7 +467,7 @@ const KeyboardHandler = {
       // For page-level - use scrollIntoView
       input.scrollIntoView({ block: 'center', behavior: 'smooth' });
     }
-  }
+  },
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -449,8 +482,8 @@ const SwipeHandler = {
   startX: 0,
   startY: 0,
   startTime: 0,
-  minSwipeDistance: 80,  // Minimum pixels for a valid swipe
-  maxSwipeTime: 300,     // Maximum ms for a swipe gesture
+  minSwipeDistance: 80, // Minimum pixels for a valid swipe
+  maxSwipeTime: 300, // Maximum ms for a swipe gesture
   maxVerticalDrift: 100, // Max vertical movement allowed
 
   _touchStartHandler: null,
@@ -501,9 +534,9 @@ const SwipeHandler = {
     const deltaX = endX - this.startX;
     const deltaY = Math.abs(endY - this.startY);
 
-    if (elapsed > this.maxSwipeTime) return;  // Too slow
-    if (deltaY > this.maxVerticalDrift) return;  // Too much vertical movement
-    if (Math.abs(deltaX) < this.minSwipeDistance) return;  // Too short
+    if (elapsed > this.maxSwipeTime) return; // Too slow
+    if (deltaY > this.maxVerticalDrift) return; // Too much vertical movement
+    if (Math.abs(deltaX) < this.minSwipeDistance) return; // Too short
 
     // Valid swipe detected
     if (deltaX > 0) {
@@ -513,5 +546,5 @@ const SwipeHandler = {
       // Swipe left -> next session
       if (typeof app !== 'undefined') app.nextSession();
     }
-  }
+  },
 };
