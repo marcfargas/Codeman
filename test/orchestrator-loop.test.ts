@@ -966,4 +966,617 @@ describe('OrchestratorLoop', () => {
       expect(loop.state).toBe('idle');
     });
   });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Task Failure & Retry (handleTaskFailed)
+  // ═══════════════════════════════════════════════════════════════
+
+  describe('task failure & retry', () => {
+    it('retries a failed task when retries < 2', async () => {
+      const plan = createTestPlan();
+      plan.phases = [plan.phases[0]]; // Single phase
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      // First addTask returns a task that will "fail" on the first poll
+      let callCount = 0;
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        callCount++;
+        const task = createMockTask(options);
+        if (callCount === 1) {
+          // First task: mark as failed
+          task.fail('Transient error');
+        } else {
+          // Retry: mark as completed
+          task.complete();
+        }
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', { autoApprove: true });
+      loop.on('error', () => {}); // Suppress unhandled errors
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      // Wait for poll to detect failure, increment retries, re-queue, and detect completion
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+
+      // The task should have been retried (addTask called more than once)
+      expect(callCount).toBeGreaterThan(1);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Phase Error Retry (handlePhaseError auto-retry)
+  // ═══════════════════════════════════════════════════════════════
+
+  describe('phase error auto-retry', () => {
+    it('retries phase when task fails and retries exhaust within a phase', async () => {
+      const plan = createTestPlan();
+      plan.phases = [plan.phases[0]];
+      plan.phases[0].maxAttempts = 3;
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      // Task always fails — this triggers task retries (up to 2), then phase error
+      // Phase error handler sees attempts(1) < maxAttempts(3), resets tasks, re-executes
+      let addTaskCallCount = 0;
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        addTaskCallCount++;
+        const task = createMockTask(options);
+        // First few calls: always fail. After enough calls: succeed (so test eventually ends)
+        if (addTaskCallCount <= 4) {
+          task.fail('Persistent error');
+        } else {
+          task.complete();
+        }
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', { autoApprove: true });
+      loop.on('error', () => {});
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      // Wait for: task fail × 3 (retry twice) → phase error → phase retry → task fail × 1 → finally succeed
+      await new Promise((resolve) => setTimeout(resolve, 20000));
+
+      // addTask should have been called multiple times (initial + retries + phase retry)
+      expect(addTaskCallCount).toBeGreaterThan(2);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Verification with Criteria
+  // ═══════════════════════════════════════════════════════════════
+
+  describe('verification with criteria', () => {
+    it('runs verifier when phase has criteria and passes', async () => {
+      const plan = createTestPlan();
+      // Use phase 2 which has verification criteria
+      plan.phases = [plan.phases[1]];
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      // Tasks complete immediately
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        const task = createMockTask(options);
+        task.complete();
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      // Verifier passes
+      mockVerifierInstance.verifyPhase.mockResolvedValue({
+        passed: true,
+        summary: 'All checks passed',
+        checks: [],
+        suggestions: [],
+      });
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', { autoApprove: true });
+
+      const events: string[] = [];
+      loop.on('stateChanged', (state: string) => events.push(state));
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      // Wait for poll + verification
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+
+      expect(mockVerifierInstance.verifyPhase).toHaveBeenCalled();
+      expect(events).toContain('verifying');
+      expect(loop.state).toBe('completed');
+    });
+
+    it('replans on verification failure', async () => {
+      const plan = createTestPlan();
+      plan.phases = [plan.phases[1]]; // Phase with criteria
+      plan.phases[0].maxAttempts = 3;
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      let addTaskCalls = 0;
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        addTaskCalls++;
+        const task = createMockTask(options);
+        task.complete();
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      // First verification fails, second passes
+      mockVerifierInstance.verifyPhase
+        .mockResolvedValueOnce({
+          passed: false,
+          summary: 'Tests failing',
+          checks: [{ name: 'npm test', passed: false, output: 'FAIL' }],
+          suggestions: ['Fix the failing test'],
+        })
+        .mockResolvedValueOnce({
+          passed: true,
+          summary: 'All passed',
+          checks: [],
+          suggestions: [],
+        });
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', { autoApprove: true });
+      loop.on('error', () => {});
+
+      const states: string[] = [];
+      loop.on('stateChanged', (state: string) => states.push(state));
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      // Wait for: execute → verify → fail → replan → re-execute → verify → pass
+      await new Promise((resolve) => setTimeout(resolve, 15000));
+
+      expect(states).toContain('replanning');
+      expect(mockVerifierInstance.verifyPhase).toHaveBeenCalledTimes(2);
+      expect(loop.getStats().replanCount).toBeGreaterThanOrEqual(1);
+    });
+
+    it('fails phase after max verification attempts', async () => {
+      const plan = createTestPlan();
+      plan.phases = [plan.phases[1]];
+      plan.phases[0].maxAttempts = 1; // Only 1 attempt allowed
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        const task = createMockTask(options);
+        task.complete();
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      mockVerifierInstance.verifyPhase.mockResolvedValue({
+        passed: false,
+        summary: 'Permanently broken',
+        checks: [],
+        suggestions: [],
+      });
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', { autoApprove: true });
+      loop.on('error', () => {});
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+
+      expect(loop.state).toBe('failed');
+      expect(loop.getStats().phasesFailed).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Multi-Phase Advancement & Compact
+  // ═══════════════════════════════════════════════════════════════
+
+  describe('multi-phase advancement', () => {
+    it('advances through multiple phases sequentially', async () => {
+      const plan = createTestPlan();
+      // Both phases have no verification criteria
+      plan.phases[1].verificationCriteria = [];
+      plan.phases[1].testCommands = [];
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        const task = createMockTask(options);
+        task.complete();
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', {
+        autoApprove: true,
+        compactBetweenPhases: false,
+      });
+
+      const phasesStarted: string[] = [];
+      loop.on('phaseStarted', (phase: { id: string }) => phasesStarted.push(phase.id));
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      // Wait for both phases: 2 × (2s poll + 1s post-phase delay) + buffer
+      await new Promise((resolve) => setTimeout(resolve, 12000));
+
+      expect(phasesStarted).toContain('phase-1');
+      expect(phasesStarted).toContain('phase-2');
+      expect(loop.state).toBe('completed');
+      expect(loop.getStats().phasesCompleted).toBe(2);
+    });
+
+    it('compacts between phases when configured', async () => {
+      const plan = createTestPlan();
+      plan.phases[1].verificationCriteria = [];
+      plan.phases[1].testCommands = [];
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        const task = createMockTask(options);
+        task.complete();
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      const mockSession = createMockSession();
+      mockSessionManager.getIdleSessions.mockReturnValue([mockSession]);
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', {
+        autoApprove: true,
+        compactBetweenPhases: true,
+      });
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      // Wait for both phases + compact delay
+      await new Promise((resolve) => setTimeout(resolve, 14000));
+
+      // writeViaMux('/compact') should have been called between phases
+      expect(mockSession.writeViaMux).toHaveBeenCalledWith('/compact');
+      expect(loop.state).toBe('completed');
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Persistence Recovery Edge Cases
+  // ═══════════════════════════════════════════════════════════════
+
+  describe('persistence recovery edge cases', () => {
+    const fullConfig = {
+      plannerModel: 'opus' as const,
+      autoApprove: false,
+      maxPhaseRetries: 3,
+      phaseTimeoutMs: 1800000,
+      enableTeamAgents: true,
+      maxParallelSessions: 3,
+      verificationMode: 'moderate' as const,
+      compactBetweenPhases: true,
+      researchEnabled: true,
+    };
+    const zeroStats = {
+      phasesCompleted: 0,
+      phasesFailed: 0,
+      totalTasksCompleted: 0,
+      totalTasksFailed: 0,
+      totalDurationMs: 0,
+      replanCount: 0,
+    };
+
+    it('recovers verifying state as failed', () => {
+      mockStore.getOrchestratorState.mockReturnValue({
+        state: 'verifying',
+        plan: createTestPlan(),
+        currentPhaseIndex: 0,
+        startedAt: Date.now() - 5000,
+        completedAt: null,
+        config: fullConfig,
+        stats: zeroStats,
+      });
+
+      const recovered = new OrchestratorLoop(createMockMux(), '/test/dir');
+      expect(recovered.state).toBe('failed');
+      expect(recovered.getPlan()).toBeTruthy();
+      recovered.destroy();
+    });
+
+    it('recovers replanning state as failed', () => {
+      mockStore.getOrchestratorState.mockReturnValue({
+        state: 'replanning',
+        plan: createTestPlan(),
+        currentPhaseIndex: 1,
+        startedAt: Date.now() - 30000,
+        completedAt: null,
+        config: fullConfig,
+        stats: { ...zeroStats, replanCount: 1 },
+      });
+
+      const recovered = new OrchestratorLoop(createMockMux(), '/test/dir');
+      expect(recovered.state).toBe('failed');
+      expect(recovered.getStats().replanCount).toBe(1);
+      recovered.destroy();
+    });
+
+    it('recovers paused state as idle (paused is transient)', () => {
+      mockStore.getOrchestratorState.mockReturnValue({
+        state: 'paused',
+        plan: createTestPlan(),
+        currentPhaseIndex: 0,
+        startedAt: Date.now() - 10000,
+        completedAt: null,
+        config: fullConfig,
+        stats: zeroStats,
+      });
+
+      const recovered = new OrchestratorLoop(createMockMux(), '/test/dir');
+      // 'paused' is not handled by restore — falls through, stays idle
+      expect(recovered.state).toBe('idle');
+      recovered.destroy();
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Prompt Generation
+  // ═══════════════════════════════════════════════════════════════
+
+  describe('prompt generation', () => {
+    it('uses single-task prompt for single-task phases', async () => {
+      const plan = createTestPlan();
+      plan.phases = [plan.phases[0]]; // Phase 1 has 1 task
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      const mockSession = createMockSession();
+      mockSessionManager.getIdleSessions.mockReturnValue([mockSession]);
+
+      // Capture the prompt from addTask
+      let capturedPrompt = '';
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        capturedPrompt = options.prompt;
+        const task = createMockTask(options);
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+      mockTaskQueue.next.mockImplementation(() => {
+        const tasks = Array.from(mockTaskQueue._tasks.values());
+        return tasks.find((t) => t.isPending()) || null;
+      });
+
+      await loop.start('Goal');
+      await loop.approve();
+
+      // Single-task prompt should contain the task description and completion phrase
+      expect(capturedPrompt).toContain('Create project structure');
+      expect(capturedPrompt).toContain('ORCH_P1_T1');
+      expect(capturedPrompt).toContain('<promise>');
+      // Should NOT contain multi-task markers
+      expect(capturedPrompt).not.toContain('YOUR TASKS FOR THIS PHASE');
+    });
+
+    it('uses multi-task prompt for multi-task phases', async () => {
+      const plan = createTestPlan();
+      plan.phases[0].tasks.push({
+        id: 'phase-1-task-2',
+        phaseId: 'phase-1',
+        prompt: 'Write unit tests',
+        status: 'pending',
+        assignedSessionId: null,
+        queueTaskId: null,
+        parallel: false,
+        completionPhrase: 'ORCH_P1_T2',
+        timeoutMs: 600000,
+        startedAt: null,
+        completedAt: null,
+        error: null,
+        retries: 0,
+      });
+      plan.phases = [plan.phases[0]]; // Only phase 1 (now with 2 tasks)
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      const capturedPrompts: string[] = [];
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        capturedPrompts.push(options.prompt);
+        const task = createMockTask(options);
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      await loop.start('Goal');
+      await loop.approve();
+
+      // Multi-task prompt should contain the phase execution template markers
+      expect(capturedPrompts.length).toBeGreaterThanOrEqual(2);
+      expect(capturedPrompts[0]).toContain('YOUR TASKS FOR THIS PHASE');
+      expect(capturedPrompts[0]).toContain('VERIFICATION');
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Team Phase Error Handling
+  // ═══════════════════════════════════════════════════════════════
+
+  describe('team phase error handling', () => {
+    it('fails phase when session.sendInput throws', async () => {
+      const plan = createTestPlan();
+      plan.phases[0].teamStrategy = {
+        type: 'team',
+        config: {
+          leadPrompt: 'Lead prompt',
+          suggestedTeammates: ['Specialist'],
+          maxTeammates: 1,
+        },
+      };
+      plan.phases = [plan.phases[0]];
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      const mockSession = createMockSession();
+      mockSession.sendInput.mockRejectedValue(new Error('Session write failed'));
+      mockSessionManager.getIdleSessions.mockReturnValue([mockSession]);
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', { autoApprove: true });
+      loop.on('error', () => {});
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      // Wait for the error to propagate
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+
+      // Phase should have failed or be retrying
+      const phase = loop.getPlan()!.phases[0];
+      expect(phase.attempts).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Verification Session Retrieval
+  // ═══════════════════════════════════════════════════════════════
+
+  describe('verification session handling', () => {
+    it('skips verification when no sessions become available', async () => {
+      const plan = createTestPlan();
+      plan.phases = [plan.phases[1]]; // Phase with criteria
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        const task = createMockTask(options);
+        task.complete();
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      // Track state: once we enter 'verifying', stop returning sessions
+      let inVerification = false;
+      const mockSession = createMockSession();
+      mockSessionManager.getIdleSessions.mockImplementation(() => {
+        if (inVerification) return []; // No sessions for verification
+        return [mockSession];
+      });
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', { autoApprove: true });
+      loop.on('error', () => {});
+      loop.on('stateChanged', (state: string) => {
+        if (state === 'verifying') inVerification = true;
+      });
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      // Wait for poll + verification attempt + 10s session wait + fallback
+      await new Promise((resolve) => setTimeout(resolve, 18000));
+
+      // Should still complete (skip verification when no sessions)
+      expect(loop.state).toBe('completed');
+      // Verifier should NOT have been called (no sessions to verify with)
+      expect(mockVerifierInstance.verifyPhase).not.toHaveBeenCalled();
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Event Coverage
+  // ═══════════════════════════════════════════════════════════════
+
+  describe('event coverage', () => {
+    it('emits taskAssigned when task is assigned to session', async () => {
+      const plan = createTestPlan();
+      plan.phases = [plan.phases[0]];
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      const mockSession = createMockSession();
+      mockSessionManager.getIdleSessions.mockReturnValue([mockSession]);
+
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        const task = createMockTask(options);
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+      mockTaskQueue.next.mockImplementation(() => {
+        const tasks = Array.from(mockTaskQueue._tasks.values());
+        return tasks.find((t) => t.isPending()) || null;
+      });
+
+      const assigned: Array<{ task: unknown; sessionId: string }> = [];
+      loop.on('taskAssigned', (task: unknown, sessionId: string) => {
+        assigned.push({ task, sessionId });
+      });
+
+      await loop.start('Goal');
+      await loop.approve();
+
+      // Task assignment happens during assignQueuedTasksToSessions
+      expect(assigned.length).toBeGreaterThanOrEqual(1);
+      expect(assigned[0].sessionId).toBe('session-1');
+    });
+
+    it('emits phaseCompleted on successful phase', async () => {
+      const plan = createTestPlan();
+      plan.phases = [plan.phases[0]]; // No verification criteria
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        const task = createMockTask(options);
+        task.complete();
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', { autoApprove: true });
+
+      const completedPhases: string[] = [];
+      loop.on('phaseCompleted', (phase: { id: string }) => completedPhases.push(phase.id));
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      await new Promise((resolve) => setTimeout(resolve, 6000));
+
+      expect(completedPhases).toContain('phase-1');
+    });
+
+    it('emits phaseFailed when phase exhausts retries', async () => {
+      const plan = createTestPlan();
+      plan.phases = [plan.phases[0]];
+      plan.phases[0].maxAttempts = 1;
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+
+      // All tasks always fail
+      mockTaskQueue.addTask.mockImplementation((options) => {
+        const task = createMockTask(options);
+        task.fail('Permanent failure');
+        mockTaskQueue._tasks.set(task.id, task);
+        return task;
+      });
+
+      loop.destroy();
+      loop = new OrchestratorLoop(createMockMux(), '/test/dir', { autoApprove: true });
+      loop.on('error', () => {});
+
+      const failedPhases: Array<{ id: string; reason: string }> = [];
+      loop.on('phaseFailed', (phase: { id: string }, reason: string) => {
+        failedPhases.push({ id: phase.id, reason });
+      });
+
+      mockPlannerInstance.generatePlan.mockResolvedValue(plan);
+      await loop.start('Goal');
+
+      await new Promise((resolve) => setTimeout(resolve, 8000));
+
+      expect(loop.state).toBe('failed');
+      expect(failedPhases.length).toBeGreaterThanOrEqual(1);
+    });
+  });
 });
