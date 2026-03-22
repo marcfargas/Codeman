@@ -14,7 +14,7 @@ import { ApiErrorCode, createErrorResponse, getErrorMessage } from '../../types.
 import { CreateCaseSchema, LinkCaseSchema } from '../schemas.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { writeHooksConfig } from '../../hooks-config.js';
-import { CASES_DIR, validatePathWithinBase } from '../route-helpers.js';
+import { CASES_DIR, validatePathWithinBase, parseBody } from '../route-helpers.js';
 import { SseEvent } from '../sse-events.js';
 import type { EventPort, ConfigPort } from '../ports/index.js';
 
@@ -83,11 +83,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
   });
 
   app.post('/api/cases', async (req): Promise<ApiResponse<{ case: { name: string; path: string } }>> => {
-    const result = CreateCaseSchema.safeParse(req.body);
-    if (!result.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, result.error.issues[0]?.message ?? 'Validation failed');
-    }
-    const { name, description } = result.data;
+    const { name, description } = parseBody(CreateCaseSchema, req.body);
 
     const casePath = validatePathWithinBase(name, CASES_DIR);
     if (!casePath) {
@@ -120,11 +116,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
 
   // Link an existing folder as a case
   app.post('/api/cases/link', async (req): Promise<ApiResponse<{ case: { name: string; path: string } }>> => {
-    const lcResult = LinkCaseSchema.safeParse(req.body);
-    if (!lcResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const { name, path: folderPath } = lcResult.data;
+    const { name, path: folderPath } = parseBody(LinkCaseSchema, req.body, 'Invalid request body');
 
     // Expand ~ to home directory
     const expandedPath = folderPath.startsWith('~') ? join(homedir(), folderPath.slice(1)) : folderPath;

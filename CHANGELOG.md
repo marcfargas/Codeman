@@ -1,5 +1,19 @@
 # aicodeman
 
+## 0.5.1
+
+### Patch Changes
+
+- refactor: codebase cleanup — extract route helpers, eliminate boilerplate, optimize hot paths
+  - Add `parseBody()` helper to route-helpers.ts: validates request body against Zod schema with structured 400 error on failure, replacing 37 identical safeParse + error-check blocks across 10 route files
+  - Add `persistAndBroadcastSession()` helper: combines persist + SessionUpdated broadcast into one call, replacing 5 repeated 2-line pairs
+  - Migrate session-routes.ts to use `findSessionOrFail()` consistently (17 inline session lookups replaced) and `parseBody()` (12 patterns)
+  - Migrate ralph-routes.ts to use `findSessionOrFail()` (9 lookups) and `parseBody()` (4 patterns)
+  - Migrate 8 remaining route files to use `parseBody()` (21 patterns total)
+  - Fix O(n log n) eviction in bash-tool-parser.ts: replace `Array.from().sort()[0]` with O(n) min-scan for oldest active tool
+  - Extract `_debouncedCall()` utility in frontend: replaces 4 manual debounce patterns (7 lines each → 1 line) in app.js, panels-ui.js, ralph-panel.js
+  - Net reduction: 208 lines removed across 16 files
+
 ## 0.5.0
 
 ### Minor Changes

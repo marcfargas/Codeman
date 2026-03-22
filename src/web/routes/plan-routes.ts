@@ -17,7 +17,7 @@ import {
   PlanTaskUpdateSchema,
   PlanTaskAddSchema,
 } from '../schemas.js';
-import { findSessionOrFail, CASES_DIR, validatePathWithinBase } from '../route-helpers.js';
+import { findSessionOrFail, parseBody, CASES_DIR, validatePathWithinBase } from '../route-helpers.js';
 import { SseEvent } from '../sse-events.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../ports/index.js';
 
@@ -29,11 +29,11 @@ export function registerPlanRoutes(app: FastifyInstance, ctx: SessionPort & Even
   // ========== Generate Plan (Simple) ==========
 
   app.post('/api/generate-plan', async (req): Promise<ApiResponse> => {
-    const gpResult = GeneratePlanSchema.safeParse(req.body);
-    if (!gpResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const { taskDescription, detailLevel = 'standard' } = gpResult.data;
+    const { taskDescription, detailLevel = 'standard' } = parseBody(
+      GeneratePlanSchema,
+      req.body,
+      'Invalid request body'
+    );
 
     // Build sophisticated prompt based on Ralph Wiggum methodology
     const detailConfig = {
@@ -223,11 +223,7 @@ NOW: Generate the implementation plan for the task above. Think step by step.`;
   // ========== Generate Plan (Detailed Orchestration) ==========
 
   app.post('/api/generate-plan-detailed', async (req): Promise<ApiResponse> => {
-    const gpdResult = GeneratePlanDetailedSchema.safeParse(req.body);
-    if (!gpdResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const { taskDescription, caseName } = gpdResult.data;
+    const { taskDescription, caseName } = parseBody(GeneratePlanDetailedSchema, req.body, 'Invalid request body');
 
     // Determine output directory for saving wizard results
     let outputDir: string | undefined;
@@ -327,11 +323,7 @@ NOW: Generate the implementation plan for the task above. Think step by step.`;
   // ========== Cancel Plan Generation ==========
 
   app.post('/api/cancel-plan-generation', async (req): Promise<ApiResponse> => {
-    const cpResult = CancelPlanSchema.safeParse(req.body);
-    if (!cpResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const { orchestratorId } = cpResult.data;
+    const { orchestratorId } = parseBody(CancelPlanSchema, req.body, 'Invalid request body');
 
     // If specific orchestrator ID provided, cancel just that one
     if (orchestratorId) {
@@ -374,11 +366,7 @@ NOW: Generate the implementation plan for the task above. Think step by step.`;
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Ralph tracker not available');
     }
 
-    const ptuResult = PlanTaskUpdateSchema.safeParse(req.body);
-    if (!ptuResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const update = ptuResult.data as {
+    const update = parseBody(PlanTaskUpdateSchema, req.body, 'Invalid request body') as {
       status?: 'pending' | 'in_progress' | 'completed' | 'failed' | 'blocked';
       error?: string;
       incrementAttempts?: boolean;
@@ -454,11 +442,7 @@ NOW: Generate the implementation plan for the task above. Think step by step.`;
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Ralph tracker not available');
     }
 
-    const ptaResult = PlanTaskAddSchema.safeParse(req.body);
-    if (!ptaResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const task = ptaResult.data;
+    const task = parseBody(PlanTaskAddSchema, req.body, 'Invalid request body');
 
     const result = tracker.addPlanTask(task);
     ctx.broadcast(SseEvent.SessionPlanTaskAdded, { sessionId: id, task: result.task });

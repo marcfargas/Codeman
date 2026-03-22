@@ -19,6 +19,7 @@
 import { FastifyInstance } from 'fastify';
 import { ApiErrorCode, createErrorResponse, getErrorMessage } from '../../types.js';
 import { OrchestratorStartSchema, OrchestratorRejectSchema } from '../schemas.js';
+import { parseBody } from '../route-helpers.js';
 import { SseEvent } from '../sse-events.js';
 import type { EventPort, OrchestratorPort } from '../ports/index.js';
 
@@ -85,12 +86,7 @@ export function registerOrchestratorRoutes(app: FastifyInstance, ctx: Orchestrat
   // ═══════════════════════════════════════════════════════════════
 
   app.post('/api/orchestrator/start', async (req) => {
-    const parsed = OrchestratorStartSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-
-    const { goal, config } = parsed.data;
+    const { goal, config } = parseBody(OrchestratorStartSchema, req.body, 'Invalid request body');
 
     // Initialize loop if needed
     let loop = ctx.orchestratorLoop;
@@ -141,13 +137,10 @@ export function registerOrchestratorRoutes(app: FastifyInstance, ctx: Orchestrat
   app.post('/api/orchestrator/reject', async (req) => {
     const loop = getLoop();
 
-    const parsed = OrchestratorRejectSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Feedback is required');
-    }
+    const { feedback } = parseBody(OrchestratorRejectSchema, req.body, 'Feedback is required');
 
     try {
-      loop.reject(parsed.data.feedback).catch((err) => {
+      loop.reject(feedback).catch((err) => {
         console.error('[Orchestrator Route] Reject failed:', getErrorMessage(err));
       });
       return { ok: true, state: loop.state };

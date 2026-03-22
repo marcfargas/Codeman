@@ -32,7 +32,15 @@ import {
   QuickRunSchema,
   QuickStartSchema,
 } from '../schemas.js';
-import { autoConfigureRalph, CASES_DIR, SETTINGS_PATH, validatePathWithinBase } from '../route-helpers.js';
+import {
+  autoConfigureRalph,
+  CASES_DIR,
+  findSessionOrFail,
+  parseBody,
+  persistAndBroadcastSession,
+  SETTINGS_PATH,
+  validatePathWithinBase,
+} from '../route-helpers.js';
 import { AUTH_COOKIE_NAME } from '../middleware/auth.js';
 import { writeHooksConfig, updateCaseEnvVars } from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
@@ -138,11 +146,7 @@ export function registerSessionRoutes(
       );
     }
 
-    const result = CreateSessionSchema.safeParse(req.body);
-    if (!result.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, result.error.issues[0]?.message ?? 'Validation failed');
-    }
-    const body = result.data;
+    const body = parseBody(CreateSessionSchema, req.body);
     const workingDir = body.workingDir || process.cwd();
 
     // Validate workingDir exists and is a directory
@@ -210,23 +214,14 @@ export function registerSessionRoutes(
 
   app.put('/api/sessions/:id/name', async (req) => {
     const { id } = req.params as { id: string };
-    const result = SessionNameSchema.safeParse(req.body);
-    if (!result.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const body = result.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const body = parseBody(SessionNameSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id);
 
     const name = String(body.name || '').slice(0, MAX_SESSION_NAME_LENGTH);
     session.name = name;
     // Also update the mux session name if applicable
     ctx.mux.updateSessionName(id, session.name);
-    ctx.persistSessionState(session);
-    ctx.broadcast(SseEvent.SessionUpdated, ctx.getSessionStateWithRespawn(session));
+    persistAndBroadcastSession(ctx, session);
     return { success: true, name: session.name };
   });
 
@@ -234,16 +229,8 @@ export function registerSessionRoutes(
 
   app.put('/api/sessions/:id/color', async (req) => {
     const { id } = req.params as { id: string };
-    const result = SessionColorSchema.safeParse(req.body);
-    if (!result.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const body = result.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const body = parseBody(SessionColorSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id);
 
     const validColors = ['default', 'red', 'orange', 'yellow', 'green', 'blue', 'purple', 'pink'];
     if (!validColors.includes(body.color)) {
@@ -251,8 +238,7 @@ export function registerSessionRoutes(
     }
 
     session.setColor(body.color as SessionColor);
-    ctx.persistSessionState(session);
-    ctx.broadcast(SseEvent.SessionUpdated, ctx.getSessionStateWithRespawn(session));
+    persistAndBroadcastSession(ctx, session);
     return { success: true, color: session.color };
   });
 
@@ -291,11 +277,7 @@ export function registerSessionRoutes(
 
   app.get('/api/sessions/:id', async (req) => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     // Use light state (no full buffers) — terminal buffer available via /terminal endpoint.
     // Full buffers were 2-3MB and caused slowness when polled frequently (e.g. Ralph wizard).
@@ -310,11 +292,7 @@ export function registerSessionRoutes(
 
   app.get('/api/sessions/:id/output', async (req) => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     return {
       success: true,
@@ -330,11 +308,7 @@ export function registerSessionRoutes(
 
   app.get('/api/sessions/:id/ralph-state', async (req) => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     return {
       success: true,
@@ -350,11 +324,7 @@ export function registerSessionRoutes(
 
   app.get('/api/sessions/:id/run-summary', async (req) => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     const tracker = ctx.runSummaryTrackers.get(id);
     if (!tracker) {
@@ -374,11 +344,7 @@ export function registerSessionRoutes(
 
   app.get('/api/sessions/:id/active-tools', async (req) => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     return {
       success: true,
@@ -396,16 +362,8 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/run', async (req): Promise<ApiResponse> => {
     const { id } = req.params as { id: string };
-    const result = RunPromptSchema.safeParse(req.body);
-    if (!result.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, result.error.issues[0]?.message ?? 'Validation failed');
-    }
-    const { prompt } = result.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const { prompt } = parseBody(RunPromptSchema, req.body);
+    const session = findSessionOrFail(ctx, id);
 
     if (session.isBusy()) {
       return createErrorResponse(ApiErrorCode.SESSION_BUSY, 'Session is busy');
@@ -424,11 +382,7 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/interactive', async (req): Promise<ApiResponse> => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     if (session.isBusy()) {
       return createErrorResponse(ApiErrorCode.SESSION_BUSY, 'Session is busy');
@@ -468,11 +422,7 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/shell', async (req): Promise<ApiResponse> => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     if (session.isBusy()) {
       return createErrorResponse(ApiErrorCode.SESSION_BUSY, 'Session is busy');
@@ -502,16 +452,8 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/input', async (req): Promise<ApiResponse> => {
     const { id } = req.params as { id: string };
-    const result = SessionInputWithLimitSchema.safeParse(req.body);
-    if (!result.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, result.error.issues[0]?.message ?? 'Validation failed');
-    }
-    const { input, useMux } = result.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const { input, useMux } = parseBody(SessionInputWithLimitSchema, req.body);
+    const session = findSessionOrFail(ctx, id);
 
     const inputStr = String(input);
     if (inputStr.length > MAX_INPUT_LENGTH) {
@@ -547,16 +489,8 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/resize', async (req): Promise<ApiResponse> => {
     const { id } = req.params as { id: string };
-    const result = ResizeSchema.safeParse(req.body);
-    if (!result.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, result.error.issues[0]?.message ?? 'Validation failed');
-    }
-    const { cols, rows } = result.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const { cols, rows } = parseBody(ResizeSchema, req.body);
+    const session = findSessionOrFail(ctx, id);
 
     session.resize(cols, rows);
     return { success: true };
@@ -569,11 +503,7 @@ export function registerSessionRoutes(
   app.get('/api/sessions/:id/terminal', async (req) => {
     const { id } = req.params as { id: string };
     const query = req.query as { tail?: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     const tailBytes = query.tail ? parseInt(query.tail, 10) : 0;
     const fullSize = session.terminalBufferLength;
@@ -632,20 +562,11 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/auto-clear', async (req) => {
     const { id } = req.params as { id: string };
-    const acResult = AutoClearSchema.safeParse(req.body);
-    if (!acResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const body = acResult.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const body = parseBody(AutoClearSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id);
 
     session.setAutoClear(body.enabled, body.threshold);
-    ctx.persistSessionState(session);
-    ctx.broadcast(SseEvent.SessionUpdated, ctx.getSessionStateWithRespawn(session));
+    persistAndBroadcastSession(ctx, session);
 
     return {
       success: true,
@@ -662,20 +583,11 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/auto-compact', async (req) => {
     const { id } = req.params as { id: string };
-    const compactResult = AutoCompactSchema.safeParse(req.body);
-    if (!compactResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const body = compactResult.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const body = parseBody(AutoCompactSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id);
 
     session.setAutoCompact(body.enabled, body.threshold, body.prompt);
-    ctx.persistSessionState(session);
-    ctx.broadcast(SseEvent.SessionUpdated, ctx.getSessionStateWithRespawn(session));
+    persistAndBroadcastSession(ctx, session);
 
     return {
       success: true,
@@ -693,16 +605,8 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/image-watcher', async (req) => {
     const { id } = req.params as { id: string };
-    const iwResult = ImageWatcherSchema.safeParse(req.body);
-    if (!iwResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const body = iwResult.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const body = parseBody(ImageWatcherSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id);
 
     if (body.enabled) {
       imageWatcher.watchSession(session.id, session.workingDir);
@@ -726,20 +630,11 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/flicker-filter', async (req) => {
     const { id } = req.params as { id: string };
-    const ffResult = FlickerFilterSchema.safeParse(req.body);
-    if (!ffResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const body = ffResult.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const body = parseBody(FlickerFilterSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id);
 
     session.flickerFilterEnabled = body.enabled;
-    ctx.persistSessionState(session);
-    ctx.broadcast(SseEvent.SessionUpdated, ctx.getSessionStateWithRespawn(session));
+    persistAndBroadcastSession(ctx, session);
 
     return {
       success: true,
@@ -764,11 +659,7 @@ export function registerSessionRoutes(
       );
     }
 
-    const qrResult = QuickRunSchema.safeParse(req.body);
-    if (!qrResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const { prompt, workingDir } = qrResult.data;
+    const { prompt, workingDir } = parseBody(QuickRunSchema, req.body, 'Invalid request body');
 
     if (!prompt.trim()) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'prompt is required');
@@ -824,11 +715,7 @@ export function registerSessionRoutes(
       );
     }
 
-    const result = QuickStartSchema.safeParse(req.body);
-    if (!result.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, result.error.issues[0]?.message ?? 'Validation failed');
-    }
-    const { caseName = 'testcase', mode = 'claude', openCodeConfig } = result.data;
+    const { caseName = 'testcase', mode = 'claude', openCodeConfig } = parseBody(QuickStartSchema, req.body);
 
     // Check OpenCode availability if requested
     if (mode === 'opencode') {

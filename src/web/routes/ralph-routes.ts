@@ -13,7 +13,7 @@ import { Session } from '../../session.js';
 import { RespawnController } from '../../respawn-controller.js';
 import { RalphConfigSchema, FixPlanImportSchema, RalphPromptWriteSchema, RalphLoopStartSchema } from '../schemas.js';
 import { SseEvent } from '../sse-events.js';
-import { autoConfigureRalph, CASES_DIR, SETTINGS_PATH } from '../route-helpers.js';
+import { autoConfigureRalph, CASES_DIR, SETTINGS_PATH, findSessionOrFail, parseBody } from '../route-helpers.js';
 import { writeHooksConfig } from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
@@ -31,22 +31,18 @@ export function registerRalphRoutes(
   // Configure Ralph tracker for a session
   app.post('/api/sessions/:id/ralph-config', async (req) => {
     const { id } = req.params as { id: string };
-    const ralphResult = RalphConfigSchema.safeParse(req.body);
-    if (!ralphResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const { enabled, completionPhrase, maxIterations, reset, disableAutoEnable } = ralphResult.data as {
+    const { enabled, completionPhrase, maxIterations, reset, disableAutoEnable } = parseBody(
+      RalphConfigSchema,
+      req.body,
+      'Invalid request body'
+    ) as {
       enabled?: boolean;
       completionPhrase?: string;
       maxIterations?: number;
       reset?: boolean | 'full';
       disableAutoEnable?: boolean;
     };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     // Ralph tracker is not supported for opencode sessions
     if (session.mode === 'opencode') {
@@ -111,11 +107,7 @@ export function registerRalphRoutes(
   // Reset circuit breaker for Ralph tracker
   app.post('/api/sessions/:id/ralph-circuit-breaker/reset', async (req) => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     session.ralphTracker.resetCircuitBreaker();
     return { success: true };
@@ -124,11 +116,7 @@ export function registerRalphRoutes(
   // Get Ralph status block and circuit breaker state
   app.get('/api/sessions/:id/ralph-status', async (req) => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     return {
       success: true,
@@ -148,11 +136,7 @@ export function registerRalphRoutes(
   // Generate @fix_plan.md content from todos
   app.get('/api/sessions/:id/fix-plan', async (req) => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     const content = session.ralphTracker.generateFixPlanMarkdown();
     return {
@@ -167,16 +151,8 @@ export function registerRalphRoutes(
   // Import todos from @fix_plan.md content
   app.post('/api/sessions/:id/fix-plan/import', async (req) => {
     const { id } = req.params as { id: string };
-    const importResult = FixPlanImportSchema.safeParse(req.body);
-    if (!importResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const { content } = importResult.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const { content } = parseBody(FixPlanImportSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id);
 
     const importedCount = session.ralphTracker.importFixPlanMarkdown(content);
     ctx.persistSessionState(session);
@@ -193,11 +169,7 @@ export function registerRalphRoutes(
   // Write @fix_plan.md to session's working directory
   app.post('/api/sessions/:id/fix-plan/write', async (req) => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     const workingDir = session.workingDir;
     if (!workingDir) {
@@ -224,11 +196,7 @@ export function registerRalphRoutes(
   // Read @fix_plan.md from session's working directory and import
   app.post('/api/sessions/:id/fix-plan/read', async (req) => {
     const { id } = req.params as { id: string };
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const session = findSessionOrFail(ctx, id);
 
     const workingDir = session.workingDir;
     if (!workingDir) {
@@ -266,16 +234,8 @@ export function registerRalphRoutes(
   // This avoids mux input escaping issues with long multi-line prompts
   app.post('/api/sessions/:id/ralph-prompt/write', async (req) => {
     const { id } = req.params as { id: string };
-    const promptResult = RalphPromptWriteSchema.safeParse(req.body);
-    if (!promptResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const { content } = promptResult.data;
-    const session = ctx.sessions.get(id);
-
-    if (!session) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
-    }
+    const { content } = parseBody(RalphPromptWriteSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id);
 
     const workingDir = session.workingDir;
     if (!workingDir) {
@@ -308,11 +268,10 @@ export function registerRalphRoutes(
       );
     }
 
-    const rlResult = RalphLoopStartSchema.safeParse(req.body);
-    if (!rlResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, rlResult.error.issues[0]?.message ?? 'Validation failed');
-    }
-    const { caseName, taskDescription, completionPhrase, maxIterations, enableRespawn, planItems } = rlResult.data;
+    const { caseName, taskDescription, completionPhrase, maxIterations, enableRespawn, planItems } = parseBody(
+      RalphLoopStartSchema,
+      req.body
+    );
 
     const casePath = join(CASES_DIR, caseName);
 

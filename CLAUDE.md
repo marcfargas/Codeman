@@ -52,7 +52,7 @@ When user says "COM":
 4. **Sync CLAUDE.md version**: Update the `**Version**` line below to match the new version from `package.json`
 5. **Commit and deploy**: `git add -A && git commit -m "chore: version packages" && git push && npm run build && systemctl --user restart codeman-web`
 
-**Version**: 0.5.0 (must match `package.json`)
+**Version**: 0.5.1 (must match `package.json`)
 
 ## Project Overview
 
@@ -111,7 +111,7 @@ Codeman is a Claude Code session manager with web interface and autonomous Ralph
 | **Plan** | `src/plan-orchestrator.ts`, `src/prompts/*.ts`, `src/templates/claude-md.ts` | |
 | **Web** | `src/web/server.ts`, `src/web/sse-events.ts`, `src/web/routes/*.ts` (14 route modules + barrel), `src/web/route-helpers.ts`, `src/web/ports/*.ts`, `src/web/middleware/auth.ts`, `src/web/schemas.ts` | |
 | **Frontend** | `src/web/public/app.js` (~2.6K lines, core) + 5 infra modules (`constants.js`, `mobile-handlers.js`, `voice-input.js`, `notification-manager.js`, `keyboard-accessory.js`) + 7 domain modules (`terminal-ui.js`, `respawn-ui.js`, `ralph-panel.js`, `orchestrator-panel.js`, `settings-ui.js`, `panels-ui.js`, `session-ui.js`) + 4 feature modules (`ralph-wizard.js`, `api-client.js`, `subagent-windows.js`, `input-cjk.js`) + `sw.js` | |
-| **Types** | `src/types/index.ts` → 15 domain files | See `@fileoverview` in index.ts |
+| **Types** | `src/types/index.ts` → 14 domain files | See `@fileoverview` in index.ts |
 
 ★ = Large file (>50KB). All files have `@fileoverview` JSDoc — read that before diving in.
 
@@ -119,7 +119,7 @@ Codeman is a Claude Code session manager with web interface and autonomous Ralph
 
 **Config**: `src/config/` — 9 files. Import from specific files, not barrel.
 
-**Utilities**: `src/utils/` — re-exported via index. Key: `CleanupManager`, `LRUMap`, `StaleExpirationMap`, `BufferAccumulator`, `stripAnsi`, `Debouncer`, `KeyedDebouncer`. Also: `claude-cli-resolver`/`opencode-cli-resolver` (CLI path resolution), `string-similarity` (fuzzy matching), `regex-patterns` (ANSI/token/spinner patterns), `assertNever` (exhaustive checks).
+**Utilities**: `src/utils/` — re-exported via index. Key: `CleanupManager`, `LRUMap`, `StaleExpirationMap`, `BufferAccumulator`, `stripAnsi`, `Debouncer`, `KeyedDebouncer`. Also: `claude-cli-resolver`/`opencode-cli-resolver` (CLI path resolution), `string-similarity` (fuzzy matching), `regex-patterns` (ANSI/token/spinner patterns), `assertNever` (exhaustive checks), `token-validation` (auth tokens), `nice-wrapper` (process priority).
 
 ### Data Flow
 

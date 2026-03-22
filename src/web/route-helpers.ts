@@ -7,6 +7,7 @@
 
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
+import type { z } from 'zod';
 import { Session } from '../session.js';
 import { ApiErrorCode, createErrorResponse } from '../types.js';
 import { parseRalphLoopConfig, extractCompletionPhrase } from '../ralph-config.js';
@@ -48,6 +49,31 @@ export function findSessionOrFail(ctx: SessionPort, sessionId: string): Session 
     });
   }
   return session;
+}
+
+/**
+ * Parse and validate a request body against a Zod schema, or throw a structured 400 error.
+ * Replaces the repeated pattern: `const r = Schema.safeParse(body); if (!r.success) return createErrorResponse(...)`.
+ */
+export function parseBody<T>(schema: z.ZodType<T>, body: unknown, errorMessage?: string): T {
+  const result = schema.safeParse(body);
+  if (!result.success) {
+    const msg = errorMessage ?? result.error.issues[0]?.message ?? 'Validation failed';
+    throw Object.assign(new Error(msg), {
+      statusCode: 400,
+      body: createErrorResponse(ApiErrorCode.INVALID_INPUT, msg),
+    });
+  }
+  return result.data;
+}
+
+/**
+ * Persist session state and broadcast a SessionUpdated event.
+ * Replaces the repeated two-line pattern across route handlers.
+ */
+export function persistAndBroadcastSession(ctx: SessionPort & EventPort, session: Session): void {
+  ctx.persistSessionState(session);
+  ctx.broadcast(SseEvent.SessionUpdated, ctx.getSessionStateWithRespawn(session));
 }
 
 /**

@@ -380,11 +380,8 @@ class CodemanApp {
     this.flickerFilterActive = false;
     this.flickerFilterTimeout = null;
 
-    // Render debouncing
-    this.renderSessionTabsTimeout = null;
-    this.renderRalphStatePanelTimeout = null;
-    this.renderTaskPanelTimeout = null;
-    this.renderMuxSessionsTimeout = null;
+    // Render debounce timers (managed by _debouncedCall)
+    this._debounceTimers = Object.create(null);
 
     // System stats polling
     this.systemStatsInterval = null;
@@ -1544,17 +1541,26 @@ class CodemanApp {
   }
 
   // ═══════════════════════════════════════════════════════════════
+  // Debounce Utility
+  // ═══════════════════════════════════════════════════════════════
+
+  /** Debounce a method call using a named timer key. */
+  _debouncedCall(timerKey, fn, delayMs = 100) {
+    if (this._debounceTimers[timerKey]) {
+      clearTimeout(this._debounceTimers[timerKey]);
+    }
+    this._debounceTimers[timerKey] = setTimeout(() => {
+      this._debounceTimers[timerKey] = null;
+      fn.call(this);
+    }, delayMs);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
   // Session Tabs
   // ═══════════════════════════════════════════════════════════════
 
   renderSessionTabs() {
-    // Debounce renders at 100ms to prevent excessive DOM updates
-    if (this.renderSessionTabsTimeout) {
-      clearTimeout(this.renderSessionTabsTimeout);
-    }
-    this.renderSessionTabsTimeout = setTimeout(() => {
-      this._renderSessionTabsImmediate();
-    }, 100);
+    this._debouncedCall('sessionTabs', this._renderSessionTabsImmediate);
   }
 
   /** Toggle .active class on tabs immediately (no debounce). Used by selectSession(). */

@@ -8,7 +8,7 @@ import { ApiErrorCode, createErrorResponse, getErrorMessage, type PersistedRespa
 import { RespawnController, type RespawnConfig } from '../../respawn-controller.js';
 import { RespawnConfigSchema, InteractiveRespawnSchema, RespawnEnableSchema } from '../schemas.js';
 import { SseEvent } from '../sse-events.js';
-import { findSessionOrFail, autoConfigureRalph } from '../route-helpers.js';
+import { findSessionOrFail, autoConfigureRalph, parseBody } from '../route-helpers.js';
 import type { SessionPort, EventPort, RespawnPort, ConfigPort, InfraPort } from '../ports/index.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
 import {
@@ -84,11 +84,7 @@ export function registerRespawnRoutes(
     const { id } = req.params as { id: string };
     let body: Partial<RespawnConfig> | undefined;
     if (req.body) {
-      const result = RespawnConfigSchema.safeParse(req.body);
-      if (!result.success) {
-        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid respawn config');
-      }
-      body = result.data as Partial<RespawnConfig>;
+      body = parseBody(RespawnConfigSchema, req.body, 'Invalid respawn config') as Partial<RespawnConfig>;
     }
     const session = findSessionOrFail(ctx, id);
 
@@ -162,11 +158,7 @@ export function registerRespawnRoutes(
   app.put('/api/sessions/:id/respawn/config', async (req) => {
     const { id } = req.params as { id: string };
     // Validate respawn config to prevent arbitrary field injection
-    const parseResult = RespawnConfigSchema.safeParse(req.body);
-    if (!parseResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Invalid respawn config: ${parseResult.error.message}`);
-    }
-    const config = parseResult.data as Partial<RespawnConfig>;
+    const config = parseBody(RespawnConfigSchema, req.body, 'Invalid respawn config') as Partial<RespawnConfig>;
     const session = findSessionOrFail(ctx, id);
 
     const controller = ctx.respawnControllers.get(id);

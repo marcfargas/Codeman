@@ -613,13 +613,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   renderTaskPanel() {
-    // Debounce renders at 100ms to prevent excessive DOM updates
-    if (this.renderTaskPanelTimeout) {
-      clearTimeout(this.renderTaskPanelTimeout);
-    }
-    this.renderTaskPanelTimeout = setTimeout(() => {
-      this._renderTaskPanelImmediate();
-    }, 100);
+    this._debouncedCall('taskPanel', this._renderTaskPanelImmediate);
   },
 
   _renderTaskPanelImmediate() {
@@ -2974,13 +2968,7 @@ Object.assign(CodemanApp.prototype, {
 
 
   renderMuxSessions() {
-    // Debounce renders at 100ms to prevent excessive DOM updates
-    if (this.renderMuxSessionsTimeout) {
-      clearTimeout(this.renderMuxSessionsTimeout);
-    }
-    this.renderMuxSessionsTimeout = setTimeout(() => {
-      this._renderMuxSessionsImmediate();
-    }, 100);
+    this._debouncedCall('muxSessions', this._renderMuxSessionsImmediate);
   },
 
   _renderMuxSessionsImmediate() {

@@ -7,6 +7,7 @@ import { FastifyInstance } from 'fastify';
 import { statSync } from 'node:fs';
 import { ApiErrorCode, createErrorResponse, type ApiResponse } from '../../types.js';
 import { ScheduledRunSchema } from '../schemas.js';
+import { parseBody } from '../route-helpers.js';
 import type { SessionPort, EventPort, InfraPort, ScheduledRun } from '../ports/index.js';
 
 export function registerScheduledRoutes(app: FastifyInstance, ctx: SessionPort & EventPort & InfraPort): void {
@@ -15,11 +16,7 @@ export function registerScheduledRoutes(app: FastifyInstance, ctx: SessionPort &
   });
 
   app.post('/api/scheduled', async (req): Promise<{ success: boolean; run: ScheduledRun } | ApiResponse<never>> => {
-    const srResult = ScheduledRunSchema.safeParse(req.body);
-    if (!srResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const { prompt, workingDir, durationMinutes } = srResult.data;
+    const { prompt, workingDir, durationMinutes } = parseBody(ScheduledRunSchema, req.body, 'Invalid request body');
 
     // Validate workingDir exists and is a directory
     if (workingDir) {

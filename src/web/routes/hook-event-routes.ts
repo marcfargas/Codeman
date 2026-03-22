@@ -7,7 +7,7 @@
 import { FastifyInstance } from 'fastify';
 import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { HookEventSchema, isValidWorkingDir } from '../schemas.js';
-import { sanitizeHookData } from '../route-helpers.js';
+import { sanitizeHookData, parseBody } from '../route-helpers.js';
 import type { SessionPort, EventPort, RespawnPort, ConfigPort, InfraPort } from '../ports/index.js';
 
 export function registerHookEventRoutes(
@@ -15,11 +15,7 @@ export function registerHookEventRoutes(
   ctx: SessionPort & EventPort & RespawnPort & ConfigPort & InfraPort
 ): void {
   app.post('/api/hook-event', async (req) => {
-    const result = HookEventSchema.safeParse(req.body);
-    if (!result.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, result.error.issues[0]?.message ?? 'Validation failed');
-    }
-    const { event, sessionId, data } = result.data;
+    const { event, sessionId, data } = parseBody(HookEventSchema, req.body);
     if (!ctx.sessions.has(sessionId)) {
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
     }

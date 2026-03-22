@@ -471,13 +471,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   renderRalphStatePanel() {
-    // Debounce renders at 50ms to prevent excessive DOM updates
-    if (this.renderRalphStatePanelTimeout) {
-      clearTimeout(this.renderRalphStatePanelTimeout);
-    }
-    this.renderRalphStatePanelTimeout = setTimeout(() => {
-      this._renderRalphStatePanelImmediate();
-    }, 50);
+    this._debouncedCall('ralphStatePanel', this._renderRalphStatePanelImmediate, 50);
   },
 
   _renderRalphStatePanelImmediate() {

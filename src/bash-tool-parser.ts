@@ -498,10 +498,17 @@ export class BashToolParser extends EventEmitter<BashToolParserEvents> {
 
           // Enforce max tools limit
           if (this._activeTools.size >= MAX_ACTIVE_TOOLS) {
-            // Remove oldest tool
-            const oldest = Array.from(this._activeTools.entries()).sort((a, b) => a[1].startedAt - b[1].startedAt)[0];
-            if (oldest) {
-              this._activeTools.delete(oldest[0]);
+            // Remove oldest tool (O(n) min-scan instead of O(n log n) sort)
+            let oldestKey: string | undefined;
+            let oldestTime = Infinity;
+            for (const [key, entry] of this._activeTools) {
+              if (entry.startedAt < oldestTime) {
+                oldestTime = entry.startedAt;
+                oldestKey = key;
+              }
+            }
+            if (oldestKey) {
+              this._activeTools.delete(oldestKey);
             }
           }
 

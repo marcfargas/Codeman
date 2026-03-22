@@ -24,7 +24,7 @@ import {
 import { subagentWatcher } from '../../subagent-watcher.js';
 import { imageWatcher } from '../../image-watcher.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
-import { findSessionOrFail, formatUptime, SETTINGS_PATH } from '../route-helpers.js';
+import { findSessionOrFail, formatUptime, parseBody, SETTINGS_PATH } from '../route-helpers.js';
 import { SseEvent } from '../sse-events.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort, AuthPort } from '../ports/index.js';
 import { AUTH_COOKIE_NAME } from '../middleware/auth.js';
@@ -324,11 +324,8 @@ export function registerSystemRoutes(
   });
 
   app.put('/api/config', async (req) => {
-    const parseResult = ConfigUpdateSchema.safeParse(req.body);
-    if (!parseResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Invalid config: ${parseResult.error.message}`);
-    }
-    ctx.store.setConfig(parseResult.data as Partial<ReturnType<typeof ctx.store.getConfig>>);
+    const configData = parseBody(ConfigUpdateSchema, req.body, 'Invalid config');
+    ctx.store.setConfig(configData as Partial<ReturnType<typeof ctx.store.getConfig>>);
     return { success: true, config: ctx.store.getConfig() };
   });
 
@@ -408,11 +405,7 @@ export function registerSystemRoutes(
   });
 
   app.put('/api/settings', async (req) => {
-    const settingsResult = SettingsUpdateSchema.safeParse(req.body);
-    if (!settingsResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid settings');
-    }
-    const settings = settingsResult.data as Record<string, unknown>;
+    const settings = parseBody(SettingsUpdateSchema, req.body, 'Invalid settings') as Record<string, unknown>;
 
     try {
       const dir = dirname(SETTINGS_PATH);
@@ -492,11 +485,7 @@ export function registerSystemRoutes(
   });
 
   app.put('/api/execution/model-config', async (req) => {
-    const mcResult = ModelConfigUpdateSchema.safeParse(req.body);
-    if (!mcResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid model config');
-    }
-    const modelConfig = mcResult.data as Record<string, unknown>;
+    const modelConfig = parseBody(ModelConfigUpdateSchema, req.body, 'Invalid model config') as Record<string, unknown>;
 
     try {
       let existingSettings: Record<string, unknown> = {};
@@ -536,11 +525,7 @@ export function registerSystemRoutes(
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id);
 
-    const clResult = CpuLimitSchema.safeParse(req.body);
-    if (!clResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
-    }
-    const body = clResult.data as Partial<NiceConfig>;
+    const body = parseBody(CpuLimitSchema, req.body, 'Invalid request body') as Partial<NiceConfig>;
 
     session.setNice(body);
     ctx.persistSessionState(session);
@@ -572,11 +557,7 @@ export function registerSystemRoutes(
   });
 
   app.put('/api/subagent-window-states', async (req) => {
-    const swResult = SubagentWindowStatesSchema.safeParse(req.body);
-    if (!swResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid window states');
-    }
-    const states = swResult.data as Record<string, unknown>;
+    const states = parseBody(SubagentWindowStatesSchema, req.body, 'Invalid window states') as Record<string, unknown>;
     try {
       const dir = dirname(windowStatesPath);
       if (!existsSync(dir)) {
@@ -604,11 +585,7 @@ export function registerSystemRoutes(
   });
 
   app.put('/api/subagent-parents', async (req) => {
-    const spResult = SubagentParentMapSchema.safeParse(req.body);
-    if (!spResult.success) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid parent map');
-    }
-    const parentMap = spResult.data;
+    const parentMap = parseBody(SubagentParentMapSchema, req.body, 'Invalid parent map');
     try {
       const dir = dirname(parentMapPath);
       if (!existsSync(dir)) {
