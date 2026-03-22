@@ -1,5 +1,19 @@
 # aicodeman
 
+## 0.4.7
+
+### Patch Changes
+
+- feat: improve session navigability in history and monitor panel (closes #45)
+  - History items now show the first user prompt as the title with the project path as a subtitle, making it much easier to distinguish sessions from the same project
+  - The `/api/history/sessions` endpoint extracts the first user message from each transcript JSONL, stripping system-injected XML tags and command artifacts, truncating to 120 chars
+  - Monitor panel session rows are now clickable — clicking navigates directly to that session's tab via `selectSession()`; Kill button retains independent behavior via `stopPropagation()`
+  - Updated CLAUDE.md architecture tables to reflect Orchestrator Loop additions (14 route modules, 15 type files, orchestrator domain files, orchestrator-panel.js frontend module)
+  - fix: stop subagent monitor windows from auto-opening on discovery
+  - feat: add Orchestrator Loop with phased plan execution, live progress during plan generation, and toolbar button (hidden until fully tested)
+  - fix: patch 3 production bugs found during deep audit
+  - fix: restore mobile terminal scrollback using JS scrollLines() instead of broken native scroll
+
 ## 0.4.6
 
 ### Patch Changes
