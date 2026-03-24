@@ -22,14 +22,16 @@
  * Maximum terminal buffer size in characters.
  * Contains raw terminal output with ANSI escape sequences.
  * Reduced from 5MB to 2MB for better render performance.
+ * Override: CODEMAN_MAX_TERMINAL_BUFFER (bytes)
  */
-export const MAX_TERMINAL_BUFFER_SIZE = 2 * 1024 * 1024; // 2MB
+export const MAX_TERMINAL_BUFFER_SIZE = parseInt(process.env.CODEMAN_MAX_TERMINAL_BUFFER || '') || 2 * 1024 * 1024;
 
 /**
  * Size to trim terminal buffer to when max is exceeded.
  * Keeps the most recent portion to preserve context.
+ * Override: CODEMAN_TRIM_TERMINAL_TO (bytes)
  */
-export const TRIM_TERMINAL_TO = 1.5 * 1024 * 1024; // 1.5MB
+export const TRIM_TERMINAL_TO = parseInt(process.env.CODEMAN_TRIM_TERMINAL_TO || '') || 1.5 * 1024 * 1024;
 
 // ============================================================================
 // Text Output Buffer Limits
@@ -38,13 +40,15 @@ export const TRIM_TERMINAL_TO = 1.5 * 1024 * 1024; // 1.5MB
 /**
  * Maximum text output buffer size in characters.
  * Contains ANSI-stripped text for search and analysis.
+ * Override: CODEMAN_MAX_TEXT_OUTPUT (bytes)
  */
-export const MAX_TEXT_OUTPUT_SIZE = 1 * 1024 * 1024; // 1MB
+export const MAX_TEXT_OUTPUT_SIZE = parseInt(process.env.CODEMAN_MAX_TEXT_OUTPUT || '') || 1 * 1024 * 1024;
 
 /**
  * Size to trim text output buffer to when max is exceeded.
+ * Override: CODEMAN_TRIM_TEXT_TO (bytes)
  */
-export const TRIM_TEXT_TO = 768 * 1024; // 768KB
+export const TRIM_TEXT_TO = parseInt(process.env.CODEMAN_TRIM_TEXT_TO || '') || 768 * 1024;
 
 // ============================================================================
 // Message Buffer Limits
@@ -53,8 +57,9 @@ export const TRIM_TEXT_TO = 768 * 1024; // 768KB
 /**
  * Maximum number of Claude JSON messages to keep in memory per session.
  * Older messages are discarded when limit is exceeded.
+ * Override: CODEMAN_MAX_MESSAGES (count)
  */
-export const MAX_MESSAGES = 1000;
+export const MAX_MESSAGES = parseInt(process.env.CODEMAN_MAX_MESSAGES || '') || 1000;
 
 // ============================================================================
 // Line Buffer Limits
