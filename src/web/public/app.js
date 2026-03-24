@@ -886,6 +886,8 @@ class CodemanApp {
     // Server sends this after SSE backpressure clears — terminal data was dropped,
     // so reload the buffer to recover from any display corruption.
     if (!this.activeSessionId || !this.terminal) return;
+    // Skip if buffer load already in progress — avoids competing clear+rewrite cycles
+    if (this._isLoadingBuffer) return;
     try {
       const res = await fetch(`/api/sessions/${this.activeSessionId}/terminal?tail=${TERMINAL_TAIL_SIZE}`);
       const data = await res.json();
@@ -909,6 +911,12 @@ class CodemanApp {
 
   async _onSessionClearTerminal(data) {
     if (data.id === this.activeSessionId) {
+      // Skip if selectSession is already loading the buffer — clearTerminal arriving
+      // during buffer load would clear the terminal mid-write, causing visible flicker
+      // and a race between two concurrent chunkedTerminalWrite calls (especially on mobile
+      // where rAF is slower). selectSession will handle the final buffer state.
+      if (this._isLoadingBuffer) return;
+
       // Fetch buffer, clear terminal, write buffer, resize (no Ctrl+L needed)
       try {
         const res = await fetch(`/api/sessions/${data.id}/terminal`);
@@ -1299,6 +1307,16 @@ class CodemanApp {
     });
   }
 
+  /** Show/hide the CJK input textarea based on user setting or server override */
+  _updateCjkInputState() {
+    const cjkEl = document.getElementById('cjkInput');
+    if (!cjkEl) return;
+    const settings = this.loadAppSettingsFromStorage();
+    const showCjk = this._serverCjkOverride || settings.cjkInputEnabled || false;
+    cjkEl.style.display = showCjk ? 'block' : 'none';
+    if (!showCjk) window.cjkActive = false;
+  }
+
   handleInit(data) {
     // Clear the init fallback timer since we got data
     if (this._initFallbackTimer) {
@@ -1307,12 +1325,9 @@ class CodemanApp {
     }
     const gen = ++this._initGeneration;
 
-    // CJK input form: show/hide based on server env INPUT_CJK_FORM=ON
-    const cjkEl = document.getElementById('cjkInput');
-    if (cjkEl) {
-      cjkEl.style.display = data.inputCjkForm ? 'block' : 'none';
-      if (!data.inputCjkForm) window.cjkActive = false;
-    }
+    // CJK input form: controlled by user setting (with server env as override)
+    this._serverCjkOverride = data.inputCjkForm || false;
+    this._updateCjkInputState();
 
     // Update version displays (header and toolbar)
     if (data.version) {
@@ -1988,6 +2003,12 @@ class CodemanApp {
 
   async selectSession(sessionId) {
     if (this.activeSessionId === sessionId) return;
+    // Focus terminal SYNCHRONOUSLY before any await — iOS Safari only honors
+    // programmatic focus() within the user-gesture call stack (e.g. tab click).
+    // After the first await the gesture context is lost and focus() is silently
+    // ignored, leaving the keyboard unable to send input to the terminal.
+    if (this.terminal) this.terminal.focus();
+
     const _selStart = performance.now();
     const _selName = this.sessions.get(sessionId)?.name || sessionId.slice(0,8);
     _crashDiag.log(`SELECT: ${_selName}`);

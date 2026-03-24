@@ -273,6 +273,11 @@ Object.assign(CodemanApp.prototype, {
     this.terminal.clear();
     this.terminal.writeln(`\x1b[1;32m Starting ${tabCount} Claude session(s) in ${caseName}...\x1b[0m`);
     this.terminal.writeln('');
+    // Focus terminal NOW, in the synchronous user-gesture context (button click).
+    // iOS Safari ignores programmatic focus() after any await, so this must happen
+    // before the first async call. The keyboard opens here and stays open through
+    // the session creation flow; selectSession at the end inherits the focus state.
+    this.terminal.focus();
 
     try {
       // Get case path first
@@ -493,6 +498,8 @@ Object.assign(CodemanApp.prototype, {
     this.terminal.clear();
     this.terminal.writeln(`\x1b[1;32m Starting OpenCode session in ${caseName}...\x1b[0m`);
     this.terminal.writeln('');
+    // Focus in sync gesture context (see runClaude comment)
+    this.terminal.focus();
 
     try {
       // Check if OpenCode is available
