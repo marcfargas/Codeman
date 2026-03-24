@@ -64,7 +64,9 @@ Object.assign(CodemanApp.prototype, {
         const unicode11Addon = new Unicode11Addon.Unicode11Addon();
         this.terminal.loadAddon(unicode11Addon);
         this.terminal.unicode.activeVersion = '11';
-      } catch (_e) { /* Unicode11 addon failed — default Unicode handling used */ }
+      } catch (_e) {
+        /* Unicode11 addon failed — default Unicode handling used */
+      }
     }
 
     const container = document.getElementById('terminalContainer');
@@ -115,8 +117,8 @@ Object.assign(CodemanApp.prototype, {
 
     // On mobile Safari, delay initial fit() to allow layout to settle
     // This prevents 0-column terminals caused by fit() running before container is sized
-    const isMobileSafari = MobileDetection.getDeviceType() === 'mobile' &&
-                           document.body.classList.contains('safari-browser');
+    const isMobileSafari =
+      MobileDetection.getDeviceType() === 'mobile' && document.body.classList.contains('safari-browser');
     if (isMobileSafari) {
       // Wait for layout, then fit multiple times to ensure proper sizing
       requestAnimationFrame(() => {
@@ -133,11 +135,15 @@ Object.assign(CodemanApp.prototype, {
 
     // Always use mouse wheel for terminal scrollback, never forward to application.
     // Prevents Claude's Ink UI (plan mode selector) from capturing scroll as option navigation.
-    container.addEventListener('wheel', (ev) => {
-      ev.preventDefault();
-      const lines = Math.round(ev.deltaY / 25) || (ev.deltaY > 0 ? 1 : -1);
-      this.terminal.scrollLines(lines);
-    }, { passive: false });
+    container.addEventListener(
+      'wheel',
+      (ev) => {
+        ev.preventDefault();
+        const lines = Math.round(ev.deltaY / 25) || (ev.deltaY > 0 ? 1 : -1);
+        this.terminal.scrollLines(lines);
+      },
+      { passive: false }
+    );
 
     // Touch scrolling — use terminal.scrollLines() for all devices.
     // xterm.js DOM renderer doesn't populate xterm-viewport's scroll area,
@@ -145,8 +151,7 @@ Object.assign(CodemanApp.prototype, {
     // has nothing to scroll. Instead, convert touch deltas into scrollLines()
     // calls, matching the wheel handler above.
     {
-      const cellHeight = () =>
-        this.terminal._core?._renderService?.dimensions?.css?.cell?.height || 13;
+      const cellHeight = () => this.terminal._core?._renderService?.dimensions?.css?.cell?.height || 13;
       let touchLastY = 0;
       let velocity = 0;
       let lastTime = 0;
@@ -174,55 +179,65 @@ Object.assign(CodemanApp.prototype, {
       // Accumulate sub-line pixel deltas so slow swipes still scroll
       let pixelAccum = 0;
 
-      let didScroll = false; // track whether touchmove fired (tap vs scroll)
-      container.addEventListener('touchstart', (ev) => {
-        if (ev.touches.length === 1) {
-          touchLastY = ev.touches[0].clientY;
+      container.addEventListener(
+        'touchstart',
+        (ev) => {
+          if (ev.touches.length === 1) {
+            touchLastY = ev.touches[0].clientY;
+            velocity = 0;
+            pixelAccum = 0;
+            isTouching = true;
+            lastTime = 0;
+            if (scrollFrame) {
+              cancelAnimationFrame(scrollFrame);
+              scrollFrame = null;
+            }
+          }
+        },
+        { passive: true }
+      );
+
+      container.addEventListener(
+        'touchmove',
+        (ev) => {
+          if (ev.touches.length === 1 && isTouching) {
+            const touchY = ev.touches[0].clientY;
+            const delta = touchLastY - touchY; // positive = scroll down
+            pixelAccum += delta;
+            velocity = delta * 1.2;
+            touchLastY = touchY;
+            // Convert accumulated pixels to whole lines
+            const ch = cellHeight();
+            const lines = Math.trunc(pixelAccum / ch);
+            if (lines !== 0) {
+              this.terminal.scrollLines(lines);
+              pixelAccum -= lines * ch;
+            }
+          }
+        },
+        { passive: true }
+      );
+
+      container.addEventListener(
+        'touchend',
+        () => {
+          isTouching = false;
+          if (!scrollFrame && Math.abs(velocity) > 0.3) {
+            scrollFrame = requestAnimationFrame(scrollLoop);
+          }
+        },
+        { passive: true }
+      );
+
+      container.addEventListener(
+        'touchcancel',
+        () => {
+          isTouching = false;
           velocity = 0;
           pixelAccum = 0;
-          isTouching = true;
-          didScroll = false;
-          lastTime = 0;
-          if (scrollFrame) { cancelAnimationFrame(scrollFrame); scrollFrame = null; }
-        }
-      }, { passive: true });
-
-      container.addEventListener('touchmove', (ev) => {
-        if (ev.touches.length === 1 && isTouching) {
-          didScroll = true;
-          const touchY = ev.touches[0].clientY;
-          const delta = touchLastY - touchY; // positive = scroll down
-          pixelAccum += delta;
-          velocity = delta * 1.2;
-          touchLastY = touchY;
-          // Convert accumulated pixels to whole lines
-          const ch = cellHeight();
-          const lines = Math.trunc(pixelAccum / ch);
-          if (lines !== 0) {
-            this.terminal.scrollLines(lines);
-            pixelAccum -= lines * ch;
-          }
-        }
-      }, { passive: true });
-
-      container.addEventListener('touchend', () => {
-        isTouching = false;
-        if (!scrollFrame && Math.abs(velocity) > 0.3) {
-          scrollFrame = requestAnimationFrame(scrollLoop);
-        }
-        // Tap (no scroll): refocus xterm's hidden textarea so keyboard input
-        // routes back to the terminal. Without this, a tap on the terminal area
-        // consumes the touch event but xterm's textarea never regains focus.
-        if (!didScroll && this.terminal) {
-          this.terminal.focus();
-        }
-      }, { passive: true });
-
-      container.addEventListener('touchcancel', () => {
-        isTouching = false;
-        velocity = 0;
-        pixelAccum = 0;
-      }, { passive: true });
+        },
+        { passive: true }
+      );
     }
 
     // Welcome message
@@ -269,6 +284,22 @@ Object.assign(CodemanApp.prototype, {
           }
           this.flushFlickerBuffer();
         }
+        // Clear viewport + scrollback for Ink-based sessions before sending SIGWINCH.
+        // fitAddon.fit() reflows content: lines at old width may wrap to more rows,
+        // pushing overflow into scrollback. Ink's cursor-up count is based on the
+        // pre-reflow line count, so ghost renders accumulate in scrollback.
+        // Fix: \x1b[3J (Erase Saved Lines) clears scrollback reflow debris,
+        // then \x1b[H\x1b[2J clears the viewport for a clean Ink redraw.
+        const activeResizeSession = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
+        if (
+          activeResizeSession &&
+          activeResizeSession.mode !== 'shell' &&
+          !activeResizeSession._ended &&
+          this.terminal &&
+          this.isTerminalAtBottom()
+        ) {
+          this.terminal.write('\x1b[3J\x1b[H\x1b[2J');
+        }
         // Skip server resize while mobile keyboard is visible — sending SIGWINCH
         // causes Ink to re-render at the new row count, garbling terminal output.
         // Local fit() still runs so xterm knows the viewport size for scrolling.
@@ -279,27 +310,12 @@ Object.assign(CodemanApp.prototype, {
           const cols = dims ? Math.max(dims.cols, MIN_COLS) : MIN_COLS;
           const rows = dims ? Math.max(dims.rows, MIN_ROWS) : MIN_ROWS;
           // Only send resize if dimensions actually changed
-          if (!this._lastResizeDims ||
-              cols !== this._lastResizeDims.cols ||
-              rows !== this._lastResizeDims.rows) {
-            // Clear viewport + scrollback ONLY when dimensions actually change.
-            // fitAddon.fit() reflows content: lines at old width may wrap to more rows,
-            // pushing overflow into scrollback. Ink's cursor-up count is based on the
-            // pre-reflow line count, so ghost renders accumulate in scrollback.
-            // Fix: \x1b[3J (Erase Saved Lines) clears scrollback reflow debris,
-            // then \x1b[H\x1b[2J clears the viewport for a clean Ink redraw.
-            // IMPORTANT: Only clear when we're actually sending SIGWINCH (dims changed).
-            // Clearing without a subsequent Ink redraw leaves the terminal blank.
-            const activeResizeSession = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
-            if (activeResizeSession && activeResizeSession.mode !== 'shell' && !activeResizeSession._ended
-                && this.terminal && this.isTerminalAtBottom()) {
-              this.terminal.write('\x1b[3J\x1b[H\x1b[2J');
-            }
+          if (!this._lastResizeDims || cols !== this._lastResizeDims.cols || rows !== this._lastResizeDims.rows) {
             this._lastResizeDims = { cols, rows };
             fetch(`/api/sessions/${this.activeSessionId}/resize`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ cols, rows })
+              body: JSON.stringify({ cols, rows }),
             }).catch(() => {});
           }
         }
@@ -453,7 +469,11 @@ Object.assign(CodemanApp.prototype, {
                 if (p) {
                   const buf = this.terminal.buffer.active;
                   const line = buf.getLine(buf.viewportY + p.row);
-                  if (line) baseText = line.translateToString(true).slice(p.col + 2).trimEnd();
+                  if (line)
+                    baseText = line
+                      .translateToString(true)
+                      .slice(p.col + 2)
+                      .trimEnd();
                 }
               } catch {}
               this._tabCompletionBaseText = baseText;
@@ -468,7 +488,8 @@ Object.assign(CodemanApp.prototype, {
               const selfTab = this;
               this._tabCompletionFallback = setTimeout(() => {
                 selfTab._tabCompletionFallback = null;
-                if (!selfTab._tabCompletionSessionId || selfTab._tabCompletionSessionId !== selfTab.activeSessionId) return;
+                if (!selfTab._tabCompletionSessionId || selfTab._tabCompletionSessionId !== selfTab.activeSessionId)
+                  return;
                 const ov = selfTab._localEchoOverlay;
                 if (!ov || ov.pendingText) return;
                 selfTab.terminal.write('', () => {
@@ -567,7 +588,8 @@ Object.assign(CodemanApp.prototype, {
         }
 
         const buffer = self.terminal.buffer.active;
-        const line = buffer.getLine(bufferLineNumber);
+        // provideLinks passes 1-based line number, getLine expects 0-based
+        const line = buffer.getLine(bufferLineNumber - 1);
 
         if (!line) {
           callback(undefined);
@@ -584,12 +606,37 @@ Object.assign(CodemanApp.prototype, {
 
         const links = [];
 
+        // Pattern 0: URLs (https://, http://) — matched first so they take priority
+        const urlPattern = /https?:\/\/[^\s"'<>|;&)\]\x00-\x1f]+/g;
+
+        const addUrlLink = (url, matchIndex) => {
+          // Strip trailing punctuation that's likely not part of the URL
+          const cleaned = url.replace(/[.,;:!?)]+$/, '');
+          const startCol = lineText.indexOf(cleaned, matchIndex);
+          if (startCol === -1) return;
+
+          if (links.some((l) => l.range.start.x === startCol + 1)) return;
+
+          links.push({
+            text: cleaned,
+            range: {
+              start: { x: startCol + 1, y: bufferLineNumber },
+              end: { x: startCol + cleaned.length + 1, y: bufferLineNumber },
+            },
+            decorations: { pointerCursor: true, underline: true },
+            activate(_event, text) {
+              window.open(text, '_blank', 'noopener,noreferrer');
+            },
+          });
+        };
+
         // Pattern 1: Commands with file paths (tail -f, cat, head, grep pattern, etc.)
         // Handles: tail -f /path, grep pattern /path, cat -n /path
         const cmdPattern = /(tail|cat|head|less|grep|watch|vim|nano)\s+(?:[^\s\/]*\s+)*(\/[^\s"'<>|;&\n\x00-\x1f]+)/g;
 
         // Pattern 2: Paths with common extensions
-        const extPattern = /(\/(?:home|tmp|var|etc|opt)[^\s"'<>|;&\n\x00-\x1f]*\.(?:log|txt|json|md|yaml|yml|csv|xml|sh|py|ts|js))\b/g;
+        const extPattern =
+          /(\/(?:home|tmp|var|etc|opt)[^\s"'<>|;&\n\x00-\x1f]*\.(?:log|txt|json|md|yaml|yml|csv|xml|sh|py|ts|js))\b/g;
 
         // Pattern 3: Bash() tool output
         const bashPattern = /Bash\([^)]*?(\/(?:home|tmp|var|etc|opt)[^\s"'<>|;&\)\n\x00-\x1f]+)/g;
@@ -599,26 +646,31 @@ Object.assign(CodemanApp.prototype, {
           if (startCol === -1) return;
 
           // Skip if already have link at this position
-          if (links.some(l => l.range.start.x === startCol + 1)) return;
+          if (links.some((l) => l.range.start.x === startCol + 1)) return;
 
           links.push({
             text: filePath,
             range: {
-              start: { x: startCol + 1, y: bufferLineNumber },      // 1-based
-              end: { x: startCol + filePath.length + 1, y: bufferLineNumber }
+              start: { x: startCol + 1, y: bufferLineNumber }, // 1-based
+              end: { x: startCol + filePath.length + 1, y: bufferLineNumber },
             },
             decorations: {
               pointerCursor: true,
-              underline: true
+              underline: true,
             },
             activate(event, text) {
               self.openLogViewerWindow(text, self.activeSessionId);
-            }
+            },
           });
         };
 
-        // Match all patterns
+        // Match all patterns — URLs first so they take priority
         let match;
+
+        urlPattern.lastIndex = 0;
+        while ((match = urlPattern.exec(lineText)) !== null) {
+          addUrlLink(match[0], match.index);
+        }
 
         cmdPattern.lastIndex = 0;
         while ((match = cmdPattern.exec(lineText)) !== null) {
@@ -636,10 +688,13 @@ Object.assign(CodemanApp.prototype, {
         }
 
         if (links.length > 0) {
-          console.debug('[LinkProvider] Found links:', links.map(l => l.text));
+          console.debug(
+            '[LinkProvider] Found links:',
+            links.map((l) => l.text)
+          );
         }
         callback(links.length > 0 ? links : undefined);
-      }
+      },
     });
 
     console.log('[LinkProvider] File path link provider registered');
@@ -705,12 +760,17 @@ Object.assign(CodemanApp.prototype, {
       // Build DOM safely (no innerHTML with user data)
       list.replaceChildren();
       for (const s of display) {
-        const size = s.sizeBytes < 1024 ? `${s.sizeBytes}B`
-          : s.sizeBytes < 1048576 ? `${(s.sizeBytes / 1024).toFixed(0)}K`
-          : `${(s.sizeBytes / 1048576).toFixed(1)}M`;
+        const size =
+          s.sizeBytes < 1024
+            ? `${s.sizeBytes}B`
+            : s.sizeBytes < 1048576
+              ? `${(s.sizeBytes / 1024).toFixed(0)}K`
+              : `${(s.sizeBytes / 1048576).toFixed(1)}M`;
         const date = new Date(s.lastModified);
-        const timeStr = date.toLocaleDateString('en', { month: 'short', day: 'numeric' })
-          + ' ' + date.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', hour12: false });
+        const timeStr =
+          date.toLocaleDateString('en', { month: 'short', day: 'numeric' }) +
+          ' ' +
+          date.toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', hour12: false });
         const shortDir = s.workingDir.replace(/^\/home\/[^/]+\//, '~/');
 
         const item = document.createElement('div');
@@ -773,7 +833,7 @@ Object.assign(CodemanApp.prototype, {
       const createRes = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workingDir, name, resumeSessionId: sessionId })
+        body: JSON.stringify({ workingDir, name, resumeSessionId: sessionId }),
       });
       const createData = await createRes.json();
       if (!createData.success) throw new Error(createData.error);
@@ -790,7 +850,6 @@ Object.assign(CodemanApp.prototype, {
       this.terminal.writeln(`\x1b[1;31m Error: ${err.message}\x1b[0m`);
     }
   },
-
 
   // ═══════════════════════════════════════════════════════════════
   // Terminal Rendering
@@ -836,9 +895,10 @@ Object.assign(CodemanApp.prototype, {
 
     // Opt-in flicker filter: buffer screen clear patterns (for sessions that enable it)
     if (flickerFilterEnabled) {
-      const hasScreenClear = data.includes('\x1b[2J') ||
-                             data.includes('\x1b[H\x1b[J') ||
-                             (data.includes('\x1b[H') && data.includes('\x1b[?25l'));
+      const hasScreenClear =
+        data.includes('\x1b[2J') ||
+        data.includes('\x1b[H\x1b[J') ||
+        (data.includes('\x1b[H') && data.includes('\x1b[?25l'));
 
       if (hasScreenClear) {
         this.flickerFilterActive = true;
@@ -904,47 +964,49 @@ Object.assign(CodemanApp.prototype, {
    * Position is tracked dynamically by _findPrompt() on every render.
    */
   _updateLocalEchoState() {
-      const settings = this.loadAppSettingsFromStorage();
-      const session = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
-      const echoEnabled = settings.localEchoEnabled ?? MobileDetection.isTouchDevice();
-      const shouldEnable = !!(echoEnabled && session);
-      if (this._localEchoEnabled && !shouldEnable) {
-          this._localEchoOverlay?.clear();
-      }
-      this._localEchoEnabled = shouldEnable;
+    const settings = this.loadAppSettingsFromStorage();
+    const session = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
+    const echoEnabled = settings.localEchoEnabled ?? MobileDetection.isTouchDevice();
+    const shouldEnable = !!(echoEnabled && session);
+    if (this._localEchoEnabled && !shouldEnable) {
+      this._localEchoOverlay?.clear();
+    }
+    this._localEchoEnabled = shouldEnable;
 
-      // Swap prompt finder based on session mode
-      if (this._localEchoOverlay && session) {
-        if (session.mode === 'opencode') {
-          // OpenCode (Bubble Tea TUI): find the ┃ border on the cursor's row.
-          // The input area is "┃  <text>" — the ┃ is the anchor, offset 3 skips "┃  ".
-          // We use the cursor row (cursorY) to find the right line, then scan for ┃.
-          this._localEchoOverlay.setPrompt({
-            type: 'custom',
-            offset: 3,
-            find: (terminal) => {
-              try {
-                const buf = terminal.buffer.active;
-                const row = buf.cursorY;
-                const line = buf.getLine(buf.viewportY + row);
-                if (!line) return null;
-                const text = line.translateToString(true);
-                const idx = text.indexOf('\u2503'); // ┃ (BOX DRAWINGS HEAVY VERTICAL)
-                if (idx >= 0) return { row, col: idx };
-                return null;
-              } catch { return null; }
+    // Swap prompt finder based on session mode
+    if (this._localEchoOverlay && session) {
+      if (session.mode === 'opencode') {
+        // OpenCode (Bubble Tea TUI): find the ┃ border on the cursor's row.
+        // The input area is "┃  <text>" — the ┃ is the anchor, offset 3 skips "┃  ".
+        // We use the cursor row (cursorY) to find the right line, then scan for ┃.
+        this._localEchoOverlay.setPrompt({
+          type: 'custom',
+          offset: 3,
+          find: (terminal) => {
+            try {
+              const buf = terminal.buffer.active;
+              const row = buf.cursorY;
+              const line = buf.getLine(buf.viewportY + row);
+              if (!line) return null;
+              const text = line.translateToString(true);
+              const idx = text.indexOf('\u2503'); // ┃ (BOX DRAWINGS HEAVY VERTICAL)
+              if (idx >= 0) return { row, col: idx };
+              return null;
+            } catch {
+              return null;
             }
-          });
-        } else if (session.mode === 'shell') {
-          // Shell mode: the shell provides its own PTY echo so the overlay isn't needed.
-          // Disable it by clearing any pending text.
-          this._localEchoOverlay.clear();
-          this._localEchoEnabled = false;
-        } else {
-          // Claude Code: scan for ❯ prompt character
-          this._localEchoOverlay.setPrompt({ type: 'character', char: '\u276f', offset: 2 });
-        }
+          },
+        });
+      } else if (session.mode === 'shell') {
+        // Shell mode: the shell provides its own PTY echo so the overlay isn't needed.
+        // Disable it by clearing any pending text.
+        this._localEchoOverlay.clear();
+        this._localEchoEnabled = false;
+      } else {
+        // Claude Code: scan for ❯ prompt character
+        this._localEchoOverlay.setPrompt({ type: 'character', char: '\u276f', offset: 2 });
       }
+    }
   },
 
   /**
@@ -961,7 +1023,7 @@ Object.assign(CodemanApp.prototype, {
     const joined = this.pendingWrites.join('');
     this.pendingWrites = [];
     const _joinedLen = joined.length;
-    if (_joinedLen > 16384) _crashDiag.log(`FLUSH: ${(_joinedLen/1024).toFixed(0)}KB`);
+    if (_joinedLen > 16384) _crashDiag.log(`FLUSH: ${(_joinedLen / 1024).toFixed(0)}KB`);
 
     // Per-frame byte budget to prevent main thread blocking.
     // Large writes (141KB+) can freeze Chrome for 2+ minutes.
@@ -985,7 +1047,10 @@ Object.assign(CodemanApp.prototype, {
     }
     const bytesThisFrame = deferred ? MAX_FRAME_BYTES : _joinedLen;
     const _dt = performance.now() - _t0;
-    if (_dt > 100 || deferred) console.warn(`[CRASH-DIAG] flushPendingWrites: ${_dt.toFixed(0)}ms, ${(bytesThisFrame/1024).toFixed(0)}KB written${deferred ? ', rest deferred' : ''} (total ${(_joinedLen/1024).toFixed(0)}KB)`);
+    if (_dt > 100 || deferred)
+      console.warn(
+        `[CRASH-DIAG] flushPendingWrites: ${_dt.toFixed(0)}ms, ${(bytesThisFrame / 1024).toFixed(0)}KB written${deferred ? ', rest deferred' : ''} (total ${(_joinedLen / 1024).toFixed(0)}KB)`
+      );
 
     // Sticky scroll: if user was at bottom, keep them there after new output
     if (this._wasAtBottomBeforeWrite) {
@@ -1002,8 +1067,12 @@ Object.assign(CodemanApp.prototype, {
     // Use terminal.write('', callback) to defer detection until xterm.js
     // finishes processing ALL queued writes — direct buffer reads after
     // terminal.write(data) can miss text if xterm processes asynchronously.
-    if (this._tabCompletionSessionId && this._tabCompletionSessionId === this.activeSessionId
-        && this._localEchoOverlay && !this._localEchoOverlay.pendingText) {
+    if (
+      this._tabCompletionSessionId &&
+      this._tabCompletionSessionId === this.activeSessionId &&
+      this._localEchoOverlay &&
+      !this._localEchoOverlay.pendingText
+    ) {
       const overlay = this._localEchoOverlay;
       const self = this;
       this.terminal.write('', () => {
@@ -1024,7 +1093,10 @@ Object.assign(CodemanApp.prototype, {
             self._tabCompletionSessionId = null;
             self._tabCompletionRetries = 0;
             self._tabCompletionBaseText = null;
-            if (self._tabCompletionFallback) { clearTimeout(self._tabCompletionFallback); self._tabCompletionFallback = null; }
+            if (self._tabCompletionFallback) {
+              clearTimeout(self._tabCompletionFallback);
+              self._tabCompletionFallback = null;
+            }
             overlay.rerender();
           }
         } else {
@@ -1096,7 +1168,9 @@ Object.assign(CodemanApp.prototype, {
 
         if (offset >= cleanBuffer.length) {
           const _totalMs = performance.now() - _chunkStart;
-          console.log(`[CRASH-DIAG] chunkedTerminalWrite complete: ${cleanBuffer.length} bytes in ${_chunkCount} chunks, ${_totalMs.toFixed(0)}ms total`);
+          console.log(
+            `[CRASH-DIAG] chunkedTerminalWrite complete: ${cleanBuffer.length} bytes in ${_chunkCount} chunks, ${_totalMs.toFixed(0)}ms total`
+          );
           // Wait one more frame for xterm to finish rendering before resolving
           requestAnimationFrame(finish);
           return;
@@ -1107,7 +1181,10 @@ Object.assign(CodemanApp.prototype, {
         this.terminal.write(chunk);
         const _cdt = performance.now() - _ct0;
         _chunkCount++;
-        if (_cdt > 50) console.warn(`[CRASH-DIAG] chunk #${_chunkCount} write took ${_cdt.toFixed(0)}ms (${chunk.length} bytes at offset ${offset})`);
+        if (_cdt > 50)
+          console.warn(
+            `[CRASH-DIAG] chunk #${_chunkCount} write took ${_cdt.toFixed(0)}ms (${chunk.length} bytes at offset ${offset})`
+          );
         offset += chunkSize;
 
         // Schedule next chunk on next frame
@@ -1133,7 +1210,6 @@ Object.assign(CodemanApp.prototype, {
     this._isLoadingBuffer = false;
     this._loadBufferQueue = null;
   },
-
 
   // ═══════════════════════════════════════════════════════════════
   // Terminal Controls
@@ -1168,7 +1244,7 @@ Object.assign(CodemanApp.prototype, {
       await fetch(`/api/sessions/${this.activeSessionId}/input`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: '\x0c' })
+        body: JSON.stringify({ input: '\x0c' }),
       });
 
       this.showToast(`Terminal restored to ${dims.cols}x${dims.rows}`, 'success');
@@ -1195,7 +1271,7 @@ Object.assign(CodemanApp.prototype, {
       fetch(`/api/sessions/${sessionId}/input`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: '\x0c' })
+        body: JSON.stringify({ input: '\x0c' }),
       });
     });
   },
@@ -1257,7 +1333,7 @@ Object.assign(CodemanApp.prototype, {
     if (!dims) return null;
     return {
       cols: Math.max(dims.cols, MIN_COLS),
-      rows: Math.max(dims.rows, MIN_ROWS)
+      rows: Math.max(dims.rows, MIN_ROWS),
     };
   },
 
@@ -1272,10 +1348,6 @@ Object.assign(CodemanApp.prototype, {
     if (this.fitAddon) this.fitAddon.fit();
     const dims = this.getTerminalDimensions();
     if (!dims) return;
-    // Update _lastResizeDims so the throttledResize handler won't redundantly
-    // clear the terminal for the same dimensions (which would blank the screen
-    // without a subsequent Ink redraw to repaint it).
-    this._lastResizeDims = { cols: dims.cols, rows: dims.rows };
     // Fast path: WebSocket resize
     if (this._wsReady && this._wsSessionId === sessionId) {
       try {
@@ -1288,7 +1360,7 @@ Object.assign(CodemanApp.prototype, {
     await fetch(`/api/sessions/${sessionId}/resize`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(dims)
+      body: JSON.stringify(dims),
     });
   },
 
@@ -1302,10 +1374,9 @@ Object.assign(CodemanApp.prototype, {
     await fetch(`/api/sessions/${this.activeSessionId}/input`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input, useMux: true })
+      body: JSON.stringify({ input, useMux: true }),
     });
   },
-
 
   // ═══════════════════════════════════════════════════════════════
   // Directory Input

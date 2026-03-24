@@ -1,5 +1,17 @@
 # aicodeman
 
+## 0.5.2
+
+### Patch Changes
+
+- Make buffer size limits configurable via CODEMAN\_\* environment variables (MAX_TERMINAL_BUFFER, TRIM_TERMINAL_TO, MAX_TEXT_OUTPUT, TRIM_TEXT_TO, MAX_MESSAGES), falling back to existing defaults. Allows users with fewer sessions or more RAM to tune buffer sizes without patching source.
+
+  Fix duplicate terminal output on tab switch to busy sessions by clearing the terminal before writing the new buffer.
+
+  Fix stale Ink CUP frames after tab switch by sending Ctrl+L to force a clean redraw.
+
+  Fix mobile CJK input handling: resolve textarea positioning, terminal flicker during composition, and layout overflow on small screens. Improve CJK composition lifecycle with better event handling and fallback flush timers.
+
 ## 0.5.1
 
 ### Patch Changes
