@@ -3,9 +3,35 @@
  *
  * Always-visible textarea below the terminal (in index.html).
  * The browser handles IME composition natively — we just read
- * textarea.value on Enter and send it to PTY.
+ * textarea.value and send it to PTY.
  * While this textarea has focus, window.cjkActive = true blocks xterm's onData.
  * Arrow keys and function keys are forwarded to PTY directly.
+ *
+ * ## Android IME challenge
+ *
+ * Android virtual keyboards (WeChat, Sogou, Gboard in Chinese mode) use
+ * composition for EVERYTHING — including English prediction and punctuation.
+ * This means compositionstart fires even for English text, and compositionend
+ * may not fire until the user explicitly confirms (space, candidate tap).
+ *
+ * We use InputEvent.inputType to distinguish:
+ * - `insertCompositionText`: tentative text, may change (CJK candidates, pinyin)
+ * - `insertText`: final committed text (confirmed word, punctuation, space)
+ *
+ * During composition, `insertText` events are flushed immediately (punctuation,
+ * English words confirmed by IME). `insertCompositionText` waits for
+ * compositionend (CJK candidate selection).
+ *
+ * ## Phantom character for Android backspace
+ *
+ * Android virtual keyboards don't generate key-repeat keydown events for held
+ * keys. When the textarea is empty, backspace produces no `input` event either
+ * (nothing to delete). We keep a zero-width space (U+200B) "phantom" in the
+ * textarea at all times. Backspace deletes the phantom → `input` fires with
+ * `deleteContentBackward` → we send \x7f to PTY and restore the phantom.
+ * Long-press backspace generates rapid deleteContentBackward events, each
+ * handled the same way — giving continuous deletion at the keyboard's native
+ * repeat rate.
  *
  * @dependency index.html (#cjkInput textarea)
  * @globals {object} CjkInput — window.cjkActive (boolean) signals app.js to block xterm onData
@@ -17,10 +43,12 @@ const CjkInput = (() => {
   let _textarea = null;
   let _send = null;
   let _initialized = false;
-  let _onMousedown = null;
-  let _onFocus = null;
-  let _onBlur = null;
-  let _onKeydown = null;
+  let _composing = false;
+  const _listeners = {};
+
+  // Zero-width space: always present in textarea so Android backspace has
+  // something to delete, triggering the `input` event we need to detect it.
+  const PHANTOM = '\u200B';
 
   const PASSTHROUGH_KEYS = {
     ArrowUp:    '\x1b[A',
@@ -36,66 +64,176 @@ const CjkInput = (() => {
     c: '\x03', d: '\x04', l: '\x0c', z: '\x1a', a: '\x01', e: '\x05',
   };
 
+  /** Strip phantom characters from a string */
+  function _strip(str) {
+    return str.replace(/\u200B/g, '');
+  }
+
+  /** Reset textarea to phantom-only state with cursor at end */
+  function _resetToPhantom() {
+    _textarea.value = PHANTOM;
+    _textarea.setSelectionRange(1, 1);
+  }
+
+  /** Check if textarea contains only phantom(s) or is empty — no real user text */
+  function _isEffectivelyEmpty() {
+    return !_strip(_textarea.value);
+  }
+
+  /** Flush textarea: send real text to PTY and reset to phantom */
+  function _flush() {
+    const val = _strip(_textarea.value);
+    if (val) {
+      _send(val);
+    }
+    _resetToPhantom();
+  }
+
   return {
     init({ send }) {
-      // Guard against double-init: remove previous listeners
       if (_initialized) this.destroy();
 
       _send = send;
+      _composing = false;
       _textarea = document.getElementById('cjkInput');
       if (!_textarea) return this;
 
-      _onMousedown = (e) => { e.stopPropagation(); };
-      _onFocus = () => { window.cjkActive = true; };
-      _onBlur = () => { window.cjkActive = false; };
-      _textarea.addEventListener('mousedown', _onMousedown);
-      _textarea.addEventListener('focus', _onFocus);
-      _textarea.addEventListener('blur', _onBlur);
+      // Seed the phantom character
+      _resetToPhantom();
 
-      _onKeydown = (e) => {
-        if (e.isComposing || e.keyCode === 229) return;
+      _listeners.mousedown = (e) => { e.stopPropagation(); };
+      _listeners.focus = () => {
+        window.cjkActive = true;
+        // Restore phantom if textarea was emptied while blurred
+        if (!_textarea.value) _resetToPhantom();
+      };
+      _listeners.blur = () => { window.cjkActive = false; };
+      _textarea.addEventListener('mousedown', _listeners.mousedown);
+      _textarea.addEventListener('focus', _listeners.focus);
+      _textarea.addEventListener('blur', _listeners.blur);
 
-        // Enter: send accumulated text (or bare Enter if empty)
+      // ── Composition tracking ──
+      _listeners.compositionstart = () => {
+        _composing = true;
+        // Clear phantom so IME sees a clean textarea — some IMEs include
+        // existing text in the composition region which would corrupt input.
+        if (_textarea.value === PHANTOM) {
+          _textarea.value = '';
+        }
+      };
+      _listeners.compositionend = () => {
+        _composing = false;
+        // Defer flush: some Android IMEs haven't committed text to textarea
+        // when compositionend fires. setTimeout(0) ensures we read the final value.
+        setTimeout(_flush, 0);
+      };
+      _textarea.addEventListener('compositionstart', _listeners.compositionstart);
+      _textarea.addEventListener('compositionend', _listeners.compositionend);
+
+      // ── Keydown: special keys work REGARDLESS of composition state ──
+      _listeners.keydown = (e) => {
+        // Enter: flush accumulated text (or bare Enter if empty).
+        // No isComposing guard — Android IMEs set isComposing=true for English
+        // prediction, but Enter should ALWAYS send. We preventDefault to stop
+        // the IME from also handling Enter (which could double-send or do nothing).
         if (e.key === 'Enter') {
           e.preventDefault();
-          if (_textarea.value) {
-            _send(_textarea.value + '\r');
-            _textarea.value = '';
+          _composing = false;
+          const val = _strip(_textarea.value);
+          if (val) {
+            _send(val + '\r');
           } else {
             _send('\r');
           }
+          _resetToPhantom();
           return;
         }
 
-        // Escape: clear textarea
+        // Escape: clear textarea (always works)
         if (e.key === 'Escape') {
           e.preventDefault();
-          _textarea.value = '';
+          _composing = false;
+          _resetToPhantom();
           return;
         }
 
-        // Ctrl combos: forward to PTY
+        // Ctrl combos: forward to PTY (always works)
         if (e.ctrlKey && CTRL_KEYS[e.key]) {
           e.preventDefault();
           _send(CTRL_KEYS[e.key]);
           return;
         }
 
-        // Backspace: delete from textarea if has text, else forward to PTY
-        if (e.key === 'Backspace' && !_textarea.value) {
+        // Below: only when NOT composing (composing keystrokes belong to IME)
+        if (_composing) return;
+
+        // Backspace: forward to PTY when no real text in textarea
+        // (Desktop path — Android uses the input event + phantom approach)
+        if (e.key === 'Backspace' && _isEffectivelyEmpty()) {
           e.preventDefault();
           _send('\x7f');
+          _resetToPhantom();
           return;
         }
 
-        // Arrow/function keys: forward to PTY when textarea is empty
-        if (PASSTHROUGH_KEYS[e.key] && !_textarea.value) {
+        // Arrow/function keys: forward to PTY when no real text
+        if (PASSTHROUGH_KEYS[e.key] && _isEffectivelyEmpty()) {
           e.preventDefault();
           _send(PASSTHROUGH_KEYS[e.key]);
           return;
         }
+
+        // Single printable character: send immediately to PTY
+        // (Desktop keyboards with physical keys — Android sends 'Unidentified')
+        if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey && _isEffectivelyEmpty()) {
+          e.preventDefault();
+          _send(e.key);
+          return;
+        }
       };
-      _textarea.addEventListener('keydown', _onKeydown);
+      _textarea.addEventListener('keydown', _listeners.keydown);
+
+      // ── Input event: the primary path for Android virtual keyboards ──
+      // Android sends keyCode 229 + key "Unidentified" for virtual key presses,
+      // making keydown unreliable. input fires AFTER character insertion and
+      // carries inputType which tells us whether the text is final or tentative.
+      _listeners.input = (e) => {
+        // ── Backspace / delete detection ──
+        // Android long-press backspace generates rapid deleteContentBackward events.
+        // The phantom character ensures the textarea is never truly empty, so each
+        // press/repeat fires an input event that we can catch here.
+        if (e.inputType === 'deleteContentBackward' || e.inputType === 'deleteWordBackward') {
+          if (_isEffectivelyEmpty()) {
+            // No real text left — forward backspace to PTY
+            _send('\x7f');
+            _resetToPhantom();
+            return;
+          }
+          // User is editing their own text in the textarea — let it be.
+          // Ensure phantom is still present for the NEXT backspace.
+          if (!_textarea.value.startsWith(PHANTOM)) {
+            _textarea.value = PHANTOM + _textarea.value;
+            _textarea.setSelectionRange(1, 1);
+          }
+          return;
+        }
+
+        if (_composing) {
+          // insertText during composition = IME committed final text
+          // (e.g., punctuation key inserts 。directly, or IME confirms a word).
+          // Flush immediately — this text won't change.
+          if (e.inputType === 'insertText') {
+            _flush();
+            return;
+          }
+          // insertCompositionText = IME is still working (pinyin, candidates,
+          // English prediction). Wait for compositionend to flush.
+          return;
+        }
+        // Outside composition: send immediately
+        _flush();
+      };
+      _textarea.addEventListener('input', _listeners.input);
 
       _initialized = true;
       return this;
@@ -103,13 +241,13 @@ const CjkInput = (() => {
 
     destroy() {
       if (_textarea) {
-        if (_onMousedown) _textarea.removeEventListener('mousedown', _onMousedown);
-        if (_onFocus) _textarea.removeEventListener('focus', _onFocus);
-        if (_onBlur) _textarea.removeEventListener('blur', _onBlur);
-        if (_onKeydown) _textarea.removeEventListener('keydown', _onKeydown);
+        for (const [event, handler] of Object.entries(_listeners)) {
+          if (handler) _textarea.removeEventListener(event, handler);
+        }
       }
       window.cjkActive = false;
-      _onMousedown = _onFocus = _onBlur = _onKeydown = null;
+      _composing = false;
+      for (const key of Object.keys(_listeners)) delete _listeners[key];
       _initialized = false;
     },
 

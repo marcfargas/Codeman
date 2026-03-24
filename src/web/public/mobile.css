@@ -1147,6 +1147,7 @@ html.mobile-init .file-browser-panel {
 
   /* Compact welcome overlay for mobile */
   .welcome-content {
+    max-width: calc(100vw - 1.5rem);
     padding: 1rem 0.75rem;
   }
 

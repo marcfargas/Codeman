@@ -94,13 +94,25 @@ textarea:focus-visible {
   outline: none;
 }
 
-/* xterm.js hidden textarea — must never show focus ring or caret */
+/* xterm.js hidden textarea — must never show focus ring or caret.
+ * On mobile (touch devices), override xterm.css defaults that position the
+ * textarea at left:-9999em with width/height:0. iOS Safari ignores keyboard
+ * input to off-screen zero-size textareas, so we move it on-screen with a
+ * minimal size while keeping it visually invisible. */
 .xterm-helper-textarea {
   border: none !important;
   box-shadow: none !important;
   outline: none !important;
   opacity: 0 !important;
   caret-color: transparent !important;
+}
+.touch-device .xterm .xterm-helper-textarea {
+  left: 0 !important;
+  top: 0 !important;
+  width: 1px !important;
+  height: 1px !important;
+  z-index: -1 !important;
+  font-size: 16px !important; /* prevent iOS auto-zoom on focus */
 }
 
 /* Session tab focus */
