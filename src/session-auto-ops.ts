@@ -27,6 +27,57 @@ const COMPACT_COOLDOWN_MS = 10000;
 /** Cooldown after clear completes before re-enabling (5 seconds) */
 const CLEAR_COOLDOWN_MS = 5000;
 
+/**
+ * Executes an action when the session becomes idle, retrying if currently working.
+ *
+ * @param action - The async action to execute once idle
+ * @param isActive - Returns whether this operation is still active (not cancelled)
+ * @param isWorking - Returns whether the session is currently working
+ * @param isStopped - Returns whether the session has been stopped
+ * @param retryMs - Delay between retry attempts when working
+ * @param cooldownMs - Delay after action completes before calling onCooldownDone
+ * @param setTimer - Stores the timer reference for cleanup
+ * @param onCooldownDone - Called after cooldown to reset state
+ */
+async function executeWhenIdle(
+  action: () => Promise<void>,
+  isActive: () => boolean,
+  isWorking: () => boolean,
+  isStopped: () => boolean,
+  retryMs: number,
+  cooldownMs: number,
+  setTimer: (timer: NodeJS.Timeout | null) => void,
+  onCooldownDone: () => void
+): Promise<void> {
+  if (isStopped()) return;
+  if (!isActive()) return;
+
+  if (!isWorking()) {
+    if (isStopped()) return;
+
+    await action();
+
+    if (!isStopped()) {
+      setTimer(
+        setTimeout(() => {
+          if (isStopped()) return;
+          setTimer(null);
+          onCooldownDone();
+        }, cooldownMs)
+      );
+    }
+  } else {
+    if (!isStopped()) {
+      setTimer(
+        setTimeout(
+          () => executeWhenIdle(action, isActive, isWorking, isStopped, retryMs, cooldownMs, setTimer, onCooldownDone),
+          retryMs
+        )
+      );
+    }
+  }
+}
+
 /** Minimum valid threshold for auto-clear/compact (1000 tokens) */
 const MIN_AUTO_THRESHOLD = 1000;
 
@@ -181,37 +232,35 @@ export class SessionAutoOps extends EventEmitter {
         `[SessionAutoOps] Auto-compact triggered: ${totalTokens} tokens >= ${this._autoCompactThreshold} threshold`
       );
 
-      const checkAndCompact = async () => {
-        if (this.callbacks.isStopped()) return;
-        if (!this._isCompacting) return;
-
-        if (!this.callbacks.isWorking()) {
-          if (this.callbacks.isStopped()) return;
-
-          const compactCmd = this._autoCompactPrompt ? `/compact ${this._autoCompactPrompt}\r` : '/compact\r';
-          await this.callbacks.writeCommand(compactCmd);
-          this.emit('autoCompact', {
-            tokens: totalTokens,
-            threshold: this._autoCompactThreshold,
-            prompt: this._autoCompactPrompt || undefined,
-          });
-
-          if (!this.callbacks.isStopped()) {
-            this._autoCompactTimer = setTimeout(() => {
-              if (this.callbacks.isStopped()) return;
-              this._autoCompactTimer = null;
-              this._isCompacting = false;
-            }, COMPACT_COOLDOWN_MS);
-          }
-        } else {
-          if (!this.callbacks.isStopped()) {
-            this._autoCompactTimer = setTimeout(checkAndCompact, AUTO_RETRY_DELAY_MS);
-          }
-        }
+      const action = async () => {
+        const compactCmd = this._autoCompactPrompt ? `/compact ${this._autoCompactPrompt}\r` : '/compact\r';
+        await this.callbacks.writeCommand(compactCmd);
+        this.emit('autoCompact', {
+          tokens: totalTokens,
+          threshold: this._autoCompactThreshold,
+          prompt: this._autoCompactPrompt || undefined,
+        });
       };
 
       if (!this.callbacks.isStopped()) {
-        this._autoCompactTimer = setTimeout(checkAndCompact, AUTO_INITIAL_DELAY_MS);
+        this._autoCompactTimer = setTimeout(
+          () =>
+            executeWhenIdle(
+              action,
+              () => this._isCompacting,
+              () => this.callbacks.isWorking(),
+              () => this.callbacks.isStopped(),
+              AUTO_RETRY_DELAY_MS,
+              COMPACT_COOLDOWN_MS,
+              (timer) => {
+                this._autoCompactTimer = timer;
+              },
+              () => {
+                this._isCompacting = false;
+              }
+            ),
+          AUTO_INITIAL_DELAY_MS
+        );
       }
     }
   }
@@ -231,32 +280,30 @@ export class SessionAutoOps extends EventEmitter {
         `[SessionAutoOps] Auto-clear triggered: ${totalTokens} tokens >= ${this._autoClearThreshold} threshold`
       );
 
-      const checkAndClear = async () => {
-        if (this.callbacks.isStopped()) return;
-        if (!this._isClearing) return;
-
-        if (!this.callbacks.isWorking()) {
-          if (this.callbacks.isStopped()) return;
-
-          await this.callbacks.writeCommand('/clear\r');
-          this.emit('autoClear', { tokens: totalTokens, threshold: this._autoClearThreshold });
-
-          if (!this.callbacks.isStopped()) {
-            this._autoClearTimer = setTimeout(() => {
-              if (this.callbacks.isStopped()) return;
-              this._autoClearTimer = null;
-              this._isClearing = false;
-            }, CLEAR_COOLDOWN_MS);
-          }
-        } else {
-          if (!this.callbacks.isStopped()) {
-            this._autoClearTimer = setTimeout(checkAndClear, AUTO_RETRY_DELAY_MS);
-          }
-        }
+      const action = async () => {
+        await this.callbacks.writeCommand('/clear\r');
+        this.emit('autoClear', { tokens: totalTokens, threshold: this._autoClearThreshold });
       };
 
       if (!this.callbacks.isStopped()) {
-        this._autoClearTimer = setTimeout(checkAndClear, AUTO_INITIAL_DELAY_MS);
+        this._autoClearTimer = setTimeout(
+          () =>
+            executeWhenIdle(
+              action,
+              () => this._isClearing,
+              () => this.callbacks.isWorking(),
+              () => this.callbacks.isStopped(),
+              AUTO_RETRY_DELAY_MS,
+              CLEAR_COOLDOWN_MS,
+              (timer) => {
+                this._autoClearTimer = timer;
+              },
+              () => {
+                this._isClearing = false;
+              }
+            ),
+          AUTO_INITIAL_DELAY_MS
+        );
       }
     }
   }

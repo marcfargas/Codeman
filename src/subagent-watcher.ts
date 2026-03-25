@@ -223,6 +223,83 @@ export class SubagentWatcher extends EventEmitter {
   }
 
   /**
+   * Mark a subagent as completed: clear PID, set status, clean up pending tool calls, emit event.
+   */
+  private markSubagentAsCompleted(info: SubagentInfo): void {
+    info.pid = undefined;
+    info.status = 'completed';
+    this.pendingToolCalls.delete(info.agentId);
+    this.emit('subagent:completed', info);
+  }
+
+  /**
+   * Extract text from message content, handling both string and array formats.
+   * For array content, returns the text from the first 'text' block.
+   */
+  private extractFirstTextContent(
+    content: string | Array<{ type: string; text?: string }> | undefined
+  ): string | undefined {
+    if (!content) return undefined;
+    if (typeof content === 'string') {
+      const trimmed = content.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    }
+    if (Array.isArray(content)) {
+      const firstContent = content[0];
+      if (firstContent?.type === 'text' && firstContent.text) {
+        const trimmed = firstContent.text.trim();
+        return trimmed.length > 0 ? trimmed : undefined;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Process a tool_result content block: look up pending tool call, emit tool_result event.
+   */
+  private emitToolResult(
+    content: { tool_use_id: string; content?: string | Array<{ type: string; text?: string }>; is_error?: boolean },
+    agentId: string,
+    sessionId: string,
+    timestamp: string
+  ): void {
+    const resultContent = this.extractToolResultContent(content.content);
+    const agentPendingCalls = this.pendingToolCalls.get(agentId);
+    const pendingCall = agentPendingCalls?.get(content.tool_use_id);
+    const toolName = pendingCall?.toolName;
+    // Delete after lookup to prevent memory leak
+    agentPendingCalls?.delete(content.tool_use_id);
+
+    const toolResult: SubagentToolResult = {
+      agentId,
+      sessionId,
+      timestamp,
+      toolUseId: content.tool_use_id,
+      tool: toolName,
+      preview: resultContent.substring(0, MESSAGE_TEXT_LIMIT),
+      contentLength: resultContent.length,
+      isError: content.is_error || false,
+    };
+    this.emit('subagent:tool_result', toolResult);
+  }
+
+  /**
+   * Find the oldest inactive (non-active) agent for LRU eviction.
+   * Returns the agent ID of the oldest inactive agent, or null if all are active.
+   */
+  private findOldestInactiveAgent(): string | null {
+    let oldestId: string | null = null;
+    let oldestTime = Infinity;
+    for (const [id, existing] of this.agentInfo) {
+      if (existing.status !== 'active' && existing.lastActivityAt < oldestTime) {
+        oldestTime = existing.lastActivityAt;
+        oldestId = id;
+      }
+    }
+    return oldestId;
+  }
+
+  /**
    * Extract short model identifier from full model name
    */
   private extractModelShort(model: string): 'haiku' | 'sonnet' | 'opus' | undefined {
@@ -307,10 +384,7 @@ export class SubagentWatcher extends EventEmitter {
 
               const alive = this.checkSubagentAliveFromPidMap(info, pidMap);
               if (!alive) {
-                info.pid = undefined;
-                info.status = 'completed';
-                this.pendingToolCalls.delete(info.agentId);
-                this.emit('subagent:completed', info);
+                this.markSubagentAsCompleted(info);
               }
             }
           }
@@ -677,10 +751,7 @@ export class SubagentWatcher extends EventEmitter {
       const pid = await this.findSubagentProcess(info.sessionId);
       if (pid) {
         process.kill(pid, 'SIGTERM');
-        info.pid = undefined;
-        info.status = 'completed';
-        this.pendingToolCalls.delete(info.agentId);
-        this.emit('subagent:completed', info);
+        this.markSubagentAsCompleted(info);
         return true;
       }
     } catch {
@@ -688,10 +759,7 @@ export class SubagentWatcher extends EventEmitter {
     }
 
     // Mark as completed even if we couldn't find the process
-    info.pid = undefined;
-    info.status = 'completed';
-    this.pendingToolCalls.delete(info.agentId);
-    this.emit('subagent:completed', info);
+    this.markSubagentAsCompleted(info);
     return true;
   }
 
@@ -843,19 +911,9 @@ export class SubagentWatcher extends EventEmitter {
         }
       } else if (entry.type === 'user' && entry.message?.content) {
         // Handle both string and array content formats
-        if (typeof entry.message.content === 'string') {
-          const text = entry.message.content.trim();
-          if (text.length < 100 && !text.includes('{')) {
-            lines.push(`${this.formatTime(entry.timestamp)} 📥 User: ${text.substring(0, USER_TEXT_PREVIEW_LENGTH)}`);
-          }
-        } else {
-          const firstContent = entry.message.content[0];
-          if (firstContent?.type === 'text' && firstContent.text) {
-            const text = firstContent.text.trim();
-            if (text.length < 100 && !text.includes('{')) {
-              lines.push(`${this.formatTime(entry.timestamp)} 📥 User: ${text.substring(0, USER_TEXT_PREVIEW_LENGTH)}`);
-            }
-          }
+        const text = this.extractFirstTextContent(entry.message.content);
+        if (text && text.length < 100 && !text.includes('{')) {
+          lines.push(`${this.formatTime(entry.timestamp)} 📥 User: ${text.substring(0, USER_TEXT_PREVIEW_LENGTH)}`);
         }
       }
     }
@@ -1027,15 +1085,7 @@ export class SubagentWatcher extends EventEmitter {
           try {
             const entry = JSON.parse(line);
             if (entry.type === 'user' && entry.message?.content) {
-              let text: string | undefined;
-              if (typeof entry.message.content === 'string') {
-                text = entry.message.content.trim();
-              } else if (Array.isArray(entry.message.content)) {
-                const firstContent = entry.message.content[0];
-                if (firstContent?.type === 'text' && firstContent.text) {
-                  text = firstContent.text.trim();
-                }
-              }
+              const text = this.extractFirstTextContent(entry.message.content);
               if (text) {
                 resolved = true;
                 rl.close();
@@ -1286,14 +1336,7 @@ export class SubagentWatcher extends EventEmitter {
 
     // Enforce MAX_TRACKED_AGENTS during insertion — evict oldest inactive agent
     if (this.agentInfo.size >= MAX_TRACKED_AGENTS) {
-      let oldestId: string | null = null;
-      let oldestTime = Infinity;
-      for (const [id, existing] of this.agentInfo) {
-        if (existing.status !== 'active' && existing.lastActivityAt < oldestTime) {
-          oldestTime = existing.lastActivityAt;
-          oldestId = id;
-        }
-      }
+      const oldestId = this.findOldestInactiveAgent();
       if (oldestId) {
         this.removeAgent(oldestId);
       }
@@ -1386,15 +1429,7 @@ export class SubagentWatcher extends EventEmitter {
       let description = await this.extractDescriptionFromParentTranscript(info.projectHash, info.sessionId, agentId);
       // Fallback: extract smart title from the prompt content
       if (!description) {
-        let text: string | undefined;
-        if (typeof entry.message.content === 'string') {
-          text = entry.message.content.trim();
-        } else if (Array.isArray(entry.message.content)) {
-          const firstContent = entry.message.content[0];
-          if (firstContent?.type === 'text' && firstContent.text) {
-            text = firstContent.text.trim();
-          }
-        }
+        const text = this.extractFirstTextContent(entry.message.content);
         if (text) {
           description = this.extractSmartTitle(text);
         }
@@ -1480,24 +1515,12 @@ export class SubagentWatcher extends EventEmitter {
             }
           } else if (content.type === 'tool_result' && content.tool_use_id) {
             // Extract tool result
-            const resultContent = this.extractToolResultContent(content.content);
-            const agentPendingCalls = this.pendingToolCalls.get(agentId);
-            const pendingCall = agentPendingCalls?.get(content.tool_use_id);
-            const toolName = pendingCall?.toolName;
-            // Delete after lookup to prevent memory leak
-            agentPendingCalls?.delete(content.tool_use_id);
-
-            const toolResult: SubagentToolResult = {
+            this.emitToolResult(
+              { tool_use_id: content.tool_use_id, content: content.content, is_error: content.is_error },
               agentId,
               sessionId,
-              timestamp: entry.timestamp,
-              toolUseId: content.tool_use_id,
-              tool: toolName,
-              preview: resultContent.substring(0, MESSAGE_TEXT_LIMIT),
-              contentLength: resultContent.length,
-              isError: content.is_error || false,
-            };
-            this.emit('subagent:tool_result', toolResult);
+              entry.timestamp
+            );
           } else if (content.type === 'text' && content.text) {
             const text = content.text.trim();
             if (text.length > 0) {
@@ -1531,24 +1554,12 @@ export class SubagentWatcher extends EventEmitter {
         // Check for tool_result blocks in user messages (common pattern)
         for (const content of entry.message.content) {
           if (content.type === 'tool_result' && content.tool_use_id) {
-            const resultContent = this.extractToolResultContent(content.content);
-            const agentPendingCalls = this.pendingToolCalls.get(agentId);
-            const pendingCall = agentPendingCalls?.get(content.tool_use_id);
-            const toolName = pendingCall?.toolName;
-            // Delete after lookup to prevent memory leak
-            agentPendingCalls?.delete(content.tool_use_id);
-
-            const toolResult: SubagentToolResult = {
+            this.emitToolResult(
+              { tool_use_id: content.tool_use_id, content: content.content, is_error: content.is_error },
               agentId,
               sessionId,
-              timestamp: entry.timestamp,
-              toolUseId: content.tool_use_id,
-              tool: toolName,
-              preview: resultContent.substring(0, MESSAGE_TEXT_LIMIT),
-              contentLength: resultContent.length,
-              isError: content.is_error || false,
-            };
-            this.emit('subagent:tool_result', toolResult);
+              entry.timestamp
+            );
           } else if (content.type === 'text' && content.text) {
             const userText = content.text.trim();
             if (userText.length > 0 && userText.length < 500) {

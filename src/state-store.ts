@@ -195,16 +195,7 @@ export class StateStore {
    * Only dirty sessions are re-serialized; clean sessions use cached JSON fragments.
    */
   private assembleStateJson(): string {
-    // Re-serialize dirty sessions and update cache
-    for (const id of this.dirtySessions) {
-      const session = this.state.sessions[id];
-      if (session) {
-        this.cachedSessionJsons.set(id, JSON.stringify(session));
-      } else {
-        this.cachedSessionJsons.delete(id);
-      }
-    }
-    this.dirtySessions.clear();
+    this.updateDirtySessionCache();
 
     // Build sessions object from cached fragments
     const sessionParts: string[] = [];
@@ -218,6 +209,25 @@ export class StateStore {
       sessionParts.push(`${JSON.stringify(id)}:${json}`);
     }
 
+    this.pruneStaleCacheEntries();
+
+    return this.buildPartialJson(sessionParts);
+  }
+
+  private updateDirtySessionCache(): void {
+    // Re-serialize dirty sessions and update cache
+    for (const id of this.dirtySessions) {
+      const session = this.state.sessions[id];
+      if (session) {
+        this.cachedSessionJsons.set(id, JSON.stringify(session));
+      } else {
+        this.cachedSessionJsons.delete(id);
+      }
+    }
+    this.dirtySessions.clear();
+  }
+
+  private pruneStaleCacheEntries(): void {
     // Prune stale cache entries (sessions removed via direct state mutation)
     if (this.cachedSessionJsons.size > Object.keys(this.state.sessions).length) {
       for (const cachedId of this.cachedSessionJsons.keys()) {
@@ -226,7 +236,9 @@ export class StateStore {
         }
       }
     }
+  }
 
+  private buildPartialJson(sessionParts: string[]): string {
     // Build final JSON: sessions from cache, everything else re-serialized (tiny)
     const sessionsJson = `{${sessionParts.join(',')}}`;
 
@@ -249,6 +261,28 @@ export class StateStore {
     return `{${parts.join(',')}}`;
   }
 
+  private serializeState(): string | null {
+    try {
+      return this.assembleStateJson();
+    } catch (assembleErr) {
+      // Fallback to full serialization if incremental assembly fails
+      console.warn('[StateStore] assembleStateJson failed, falling back to full serialize:', assembleErr);
+      this.cachedSessionJsons.clear();
+      this.dirtySessions.clear();
+      try {
+        return JSON.stringify(this.state);
+      } catch (err) {
+        console.error('[StateStore] Failed to serialize state (circular reference or invalid data):', err);
+        this.consecutiveSaveFailures++;
+        if (this.consecutiveSaveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          console.error('[StateStore] Circuit breaker OPEN - serialization failing repeatedly');
+          this.circuitBreakerOpen = true;
+        }
+        return null;
+      }
+    }
+  }
+
   private async _doSaveAsync(): Promise<void> {
     this.saveDeb.cancel();
     if (!this.dirty) {
@@ -265,28 +299,10 @@ export class StateStore {
 
     const tempPath = this.filePath + '.tmp';
     const backupPath = this.filePath + '.bak';
-    let json: string;
 
     // Step 1: Serialize state (validates it's JSON-safe)
-    try {
-      json = this.assembleStateJson();
-    } catch (assembleErr) {
-      // Fallback to full serialization if incremental assembly fails
-      console.warn('[StateStore] assembleStateJson failed, falling back to full serialize:', assembleErr);
-      this.cachedSessionJsons.clear();
-      this.dirtySessions.clear();
-      try {
-        json = JSON.stringify(this.state);
-      } catch (err) {
-        console.error('[StateStore] Failed to serialize state (circular reference or invalid data):', err);
-        this.consecutiveSaveFailures++;
-        if (this.consecutiveSaveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          console.error('[StateStore] Circuit breaker OPEN - serialization failing repeatedly');
-          this.circuitBreakerOpen = true;
-        }
-        return;
-      }
-    }
+    const json = this.serializeState();
+    if (json === null) return;
 
     // Clear dirty flag BEFORE async I/O so mutations during write re-set it.
     // The state snapshot is already captured in `json` above.
@@ -351,27 +367,9 @@ export class StateStore {
 
     const tempPath = this.filePath + '.tmp';
     const backupPath = this.filePath + '.bak';
-    let json: string;
 
-    try {
-      json = this.assembleStateJson();
-    } catch (assembleErr) {
-      // Fallback to full serialization if incremental assembly fails
-      console.warn('[StateStore] assembleStateJson failed, falling back to full serialize:', assembleErr);
-      this.cachedSessionJsons.clear();
-      this.dirtySessions.clear();
-      try {
-        json = JSON.stringify(this.state);
-      } catch (err) {
-        console.error('[StateStore] Failed to serialize state (circular reference or invalid data):', err);
-        this.consecutiveSaveFailures++;
-        if (this.consecutiveSaveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          console.error('[StateStore] Circuit breaker OPEN - serialization failing repeatedly');
-          this.circuitBreakerOpen = true;
-        }
-        return;
-      }
-    }
+    const json = this.serializeState();
+    if (json === null) return;
 
     // Backup via atomic copy (avoids reading entire file into memory)
     try {

@@ -101,6 +101,18 @@ const TODO_CLEANUP_INTERVAL_MS = INACTIVITY_TIMEOUT_MS;
 const TODO_SIMILARITY_THRESHOLD = 0.85;
 
 /**
+ * Similarity threshold for short todo content (<30 chars).
+ * Higher threshold reduces false positive deduplication of short strings.
+ */
+const SIMILARITY_THRESHOLD_SHORT = 0.95;
+
+/**
+ * Similarity threshold for medium-length todo content (30-60 chars).
+ * Slightly relaxed compared to short strings.
+ */
+const SIMILARITY_THRESHOLD_MEDIUM = 0.9;
+
+/**
  * Debounce interval for event emissions (milliseconds).
  * Prevents UI jitter from rapid consecutive updates.
  * Default: 50ms
@@ -1300,6 +1312,24 @@ export class RalphTracker extends EventEmitter {
   }
 
   /**
+   * Mark all tracked todos as completed and emit todoUpdate if any changed.
+   * @returns true if any todo was updated
+   */
+  private completeAllTodos(): boolean {
+    let updated = false;
+    for (const todo of this._todos.values()) {
+      if (todo.status !== 'completed') {
+        todo.status = 'completed';
+        updated = true;
+      }
+    }
+    if (updated) {
+      this.emit('todoUpdate', this.todos);
+    }
+    return updated;
+  }
+
+  /**
    * Detect "all tasks complete" messages.
    */
   private detectAllTasksComplete(line: string): void {
@@ -1318,16 +1348,7 @@ export class RalphTracker extends EventEmitter {
       return;
     }
 
-    let updated = false;
-    for (const todo of this._todos.values()) {
-      if (todo.status !== 'completed') {
-        todo.status = 'completed';
-        updated = true;
-      }
-    }
-    if (updated) {
-      this.emit('todoUpdate', this.todos);
-    }
+    this.completeAllTodos();
 
     if (this._loopState.completionPhrase) {
       this._loopState.active = false;
@@ -1425,16 +1446,7 @@ export class RalphTracker extends EventEmitter {
 
     if (bareCount > 1) return;
 
-    let updated = false;
-    for (const todo of this._todos.values()) {
-      if (todo.status !== 'completed') {
-        todo.status = 'completed';
-        updated = true;
-      }
-    }
-    if (updated) {
-      this.emit('todoUpdate', this.todos);
-    }
+    this.completeAllTodos();
 
     this._loopState.active = false;
     this._loopState.lastActivity = Date.now();
@@ -1480,16 +1492,7 @@ export class RalphTracker extends EventEmitter {
       if (canonicalCount >= 2 || this._loopState.active) {
         this._loopState.active = false;
         this._loopState.lastActivity = Date.now();
-        let updated = false;
-        for (const todo of this._todos.values()) {
-          if (todo.status !== 'completed') {
-            todo.status = 'completed';
-            updated = true;
-          }
-        }
-        if (updated) {
-          this.emit('todoUpdate', this.todos);
-        }
+        this.completeAllTodos();
         this.emit('completionDetected', matchedPhrase);
         this.emit('loopUpdate', this.loopState);
         return;
@@ -1497,16 +1500,7 @@ export class RalphTracker extends EventEmitter {
     }
 
     if (this._loopState.active || count >= 2) {
-      let updated = false;
-      for (const todo of this._todos.values()) {
-        if (todo.status !== 'completed') {
-          todo.status = 'completed';
-          updated = true;
-        }
-      }
-      if (updated) {
-        this.emit('todoUpdate', this.todos);
-      }
+      this.completeAllTodos();
 
       this._loopState.active = false;
       this._loopState.lastActivity = Date.now();
@@ -1532,39 +1526,37 @@ export class RalphTracker extends EventEmitter {
     const suggestedPhrase = `${phrase}_${uniqueSuffix}`;
 
     if (COMMON_COMPLETION_PHRASES.has(normalized)) {
-      console.warn(
-        `[RalphTracker] Warning: Completion phrase "${phrase}" is very common and may cause false positives. Consider using: "${suggestedPhrase}"`
-      );
-      this.emit('phraseValidationWarning', {
-        phrase,
-        reason: 'common',
-        suggestedPhrase,
-      });
+      this.emitValidationWarning(phrase, 'common', suggestedPhrase);
       return;
     }
 
     if (normalized.length < MIN_RECOMMENDED_PHRASE_LENGTH) {
-      console.warn(
-        `[RalphTracker] Warning: Completion phrase "${phrase}" is too short (${normalized.length} chars). Consider using: "${suggestedPhrase}"`
-      );
-      this.emit('phraseValidationWarning', {
-        phrase,
-        reason: 'short',
-        suggestedPhrase,
-      });
+      this.emitValidationWarning(phrase, 'short', suggestedPhrase);
       return;
     }
 
     if (/^\d+$/.test(normalized)) {
-      console.warn(
-        `[RalphTracker] Warning: Completion phrase "${phrase}" is numeric-only and may cause false positives. Consider using: "${suggestedPhrase}"`
-      );
-      this.emit('phraseValidationWarning', {
-        phrase,
-        reason: 'numeric',
-        suggestedPhrase,
-      });
+      this.emitValidationWarning(phrase, 'numeric', suggestedPhrase);
     }
+  }
+
+  /**
+   * Emit a phrase validation warning with a console message and event.
+   */
+  private emitValidationWarning(phrase: string, reason: 'common' | 'short' | 'numeric', suggestedPhrase: string): void {
+    const descriptions: Record<'common' | 'short' | 'numeric', string> = {
+      common: 'is very common and may cause false positives',
+      short: `is too short (${phrase.toUpperCase().replace(/[\s_\-.]+/g, '').length} chars)`,
+      numeric: 'is numeric-only and may cause false positives',
+    };
+    console.warn(
+      `[RalphTracker] Warning: Completion phrase "${phrase}" ${descriptions[reason]}. Consider using: "${suggestedPhrase}"`
+    );
+    this.emit('phraseValidationWarning', {
+      phrase,
+      reason,
+      suggestedPhrase,
+    });
   }
 
   /**
@@ -1977,9 +1969,9 @@ export class RalphTracker extends EventEmitter {
 
     let threshold: number;
     if (normalized.length < 30) {
-      threshold = 0.95;
+      threshold = SIMILARITY_THRESHOLD_SHORT;
     } else if (normalized.length < 60) {
-      threshold = 0.9;
+      threshold = SIMILARITY_THRESHOLD_MEDIUM;
     } else {
       threshold = TODO_SIMILARITY_THRESHOLD;
     }

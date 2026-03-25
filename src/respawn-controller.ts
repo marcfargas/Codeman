@@ -551,6 +551,14 @@ export interface RespawnEvents {
   respawnBlocked: (data: { reason: string; details: string }) => void;
 }
 
+/**
+ * Convert milliseconds to a non-negative whole number of seconds for countdown display.
+ * Rounds up so that e.g. 1200 ms shows as 2 s (never under-reports remaining time).
+ */
+function formatRemainingSeconds(ms: number): number {
+  return Math.max(0, Math.ceil(ms / 1000));
+}
+
 /** Default configuration values */
 const DEFAULT_CONFIG: RespawnConfig = {
   idleTimeoutMs: 10000, // 10 seconds of no activity after prompt (legacy, still used as fallback)
@@ -839,12 +847,25 @@ export class RespawnController extends EventEmitter {
   private validateConfig(): void {
     const c = this.config;
 
+    /**
+     * Validate that a timeout value is positive (or non-negative when allowZero is true).
+     * Falls back to the DEFAULT_CONFIG value if invalid.
+     */
+    const validatePositiveTimeout = (field: keyof RespawnConfig, allowZero = false): void => {
+      const value = c[field] as number;
+      const invalid = allowZero ? value < 0 : value <= 0;
+      if (invalid) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (c as any)[field] = DEFAULT_CONFIG[field];
+      }
+    };
+
     // Ensure timeouts are positive
-    if (c.idleTimeoutMs <= 0) c.idleTimeoutMs = DEFAULT_CONFIG.idleTimeoutMs;
-    if (c.completionConfirmMs <= 0) c.completionConfirmMs = DEFAULT_CONFIG.completionConfirmMs;
-    if (c.noOutputTimeoutMs <= 0) c.noOutputTimeoutMs = DEFAULT_CONFIG.noOutputTimeoutMs;
-    if (c.autoAcceptDelayMs < 0) c.autoAcceptDelayMs = DEFAULT_CONFIG.autoAcceptDelayMs;
-    if (c.interStepDelayMs <= 0) c.interStepDelayMs = DEFAULT_CONFIG.interStepDelayMs;
+    validatePositiveTimeout('idleTimeoutMs');
+    validatePositiveTimeout('completionConfirmMs');
+    validatePositiveTimeout('noOutputTimeoutMs');
+    validatePositiveTimeout('autoAcceptDelayMs', true);
+    validatePositiveTimeout('interStepDelayMs');
 
     // Ensure completion confirm doesn't exceed no-output timeout
     if (c.completionConfirmMs > c.noOutputTimeoutMs) {
@@ -852,14 +873,14 @@ export class RespawnController extends EventEmitter {
     }
 
     // Ensure AI check timeouts are positive
-    if (c.aiIdleCheckTimeoutMs <= 0) c.aiIdleCheckTimeoutMs = DEFAULT_CONFIG.aiIdleCheckTimeoutMs;
-    if (c.aiIdleCheckCooldownMs < 0) c.aiIdleCheckCooldownMs = DEFAULT_CONFIG.aiIdleCheckCooldownMs;
-    if (c.aiIdleCheckMaxContext <= 0) c.aiIdleCheckMaxContext = DEFAULT_CONFIG.aiIdleCheckMaxContext;
+    validatePositiveTimeout('aiIdleCheckTimeoutMs');
+    validatePositiveTimeout('aiIdleCheckCooldownMs', true);
+    validatePositiveTimeout('aiIdleCheckMaxContext');
 
     // Ensure plan check timeouts are positive
-    if (c.aiPlanCheckTimeoutMs <= 0) c.aiPlanCheckTimeoutMs = DEFAULT_CONFIG.aiPlanCheckTimeoutMs;
-    if (c.aiPlanCheckCooldownMs < 0) c.aiPlanCheckCooldownMs = DEFAULT_CONFIG.aiPlanCheckCooldownMs;
-    if (c.aiPlanCheckMaxContext <= 0) c.aiPlanCheckMaxContext = DEFAULT_CONFIG.aiPlanCheckMaxContext;
+    validatePositiveTimeout('aiPlanCheckTimeoutMs');
+    validatePositiveTimeout('aiPlanCheckCooldownMs', true);
+    validatePositiveTimeout('aiPlanCheckMaxContext');
   }
 
   /** Wire up AI checker events to controller events (removes existing listeners first to prevent duplicates) */
@@ -987,11 +1008,11 @@ export class RespawnController extends EventEmitter {
       waitingFor = 'AI verdict (IDLE or WORKING)';
     } else if (this._state === 'confirming_idle') {
       statusText = `Confirming idle (${confidence}% confidence)`;
-      waitingFor = `${Math.max(0, Math.ceil((this.config.completionConfirmMs - msSinceLastOutput) / 1000))}s more silence`;
+      waitingFor = `${formatRemainingSeconds(this.config.completionConfirmMs - msSinceLastOutput)}s more silence`;
     } else if (this._state === 'watching') {
       const aiState = this.aiChecker.getState();
       if (aiState.status === 'cooldown') {
-        const remaining = Math.ceil(this.aiChecker.getCooldownRemainingMs() / 1000);
+        const remaining = formatRemainingSeconds(this.aiChecker.getCooldownRemainingMs());
         statusText = `AI Check: WORKING (cooldown ${remaining}s)`;
         waitingFor = 'Cooldown to expire';
       } else if (completionMessageDetected) {
@@ -1798,24 +1819,28 @@ export class RespawnController extends EventEmitter {
       case 'sending_init':
       case 'sending_kickstart':
         // For sending states, retry the send
-        this.log('Recovery: returning to watching state');
-        this.setState('watching');
-        this.startNoOutputTimer();
-        this.startPreFilterTimer();
-        if (this.config.autoAcceptPrompts) {
-          this.startAutoAcceptTimer();
-        }
+        this.recoveryResetToWatching('returning to watching state');
         break;
 
       default:
         // Fallback: reset to watching
-        this.log('Recovery: fallback to watching state');
-        this.setState('watching');
-        this.startNoOutputTimer();
-        this.startPreFilterTimer();
-        if (this.config.autoAcceptPrompts) {
-          this.startAutoAcceptTimer();
-        }
+        this.recoveryResetToWatching('fallback to watching state');
+    }
+  }
+
+  /**
+   * Reset the controller to watching state during stuck-state recovery.
+   * Sets state to watching and restarts all detection timers.
+   *
+   * @param reason - Human-readable reason for the reset (logged)
+   */
+  private recoveryResetToWatching(reason: string): void {
+    this.log(`Recovery: ${reason}`);
+    this.setState('watching');
+    this.startNoOutputTimer();
+    this.startPreFilterTimer();
+    if (this.config.autoAcceptPrompts) {
+      this.startAutoAcceptTimer();
     }
   }
 
@@ -2051,7 +2076,7 @@ export class RespawnController extends EventEmitter {
     // If on cooldown, don't start check - wait for cooldown to expire
     if (this.aiChecker.isOnCooldown()) {
       this.log(
-        `AI check on cooldown (${Math.ceil(this.aiChecker.getCooldownRemainingMs() / 1000)}s remaining), waiting...`
+        `AI check on cooldown (${formatRemainingSeconds(this.aiChecker.getCooldownRemainingMs())}s remaining), waiting...`
       );
       return;
     }
@@ -2198,36 +2223,15 @@ export class RespawnController extends EventEmitter {
    * @fires planCheckStarted
    */
   private tryAutoAccept(): void {
-    // Only auto-accept in watching state (not during a respawn cycle)
-    if (this._state !== 'watching') return;
+    if (!this.canAutoAccept()) return;
 
-    // Don't auto-accept if a completion message was detected (normal idle handles it)
-    if (this.completionMessageTime !== null) return;
-
-    // Don't auto-accept if disabled
-    if (!this.config.autoAcceptPrompts) return;
-
-    // Don't auto-accept if we haven't received any output yet (prevents spurious Enter on fresh start)
-    if (!this.hasReceivedOutput) return;
-
-    // Don't auto-accept if an elicitation dialog (AskUserQuestion) was detected
-    if (this.elicitationDetected) {
-      this.log('Skipping auto-accept: elicitation dialog detected (AskUserQuestion)');
-      return;
-    }
-
-    // Stage 1: Pre-filter — check if buffer looks like plan mode
     const buffer = this.terminalBuffer.value;
-    if (!this.isPlanModePreFilterMatch(buffer)) {
-      this.log('Skipping auto-accept: pre-filter did not match plan mode patterns');
-      return;
-    }
 
     // Stage 2: AI confirmation (if enabled and available)
     if (this.config.aiPlanCheckEnabled && this.planChecker.status !== 'disabled') {
       if (this.planChecker.isOnCooldown()) {
         this.log(
-          `Skipping auto-accept: plan checker on cooldown (${Math.ceil(this.planChecker.getCooldownRemainingMs() / 1000)}s remaining)`
+          `Skipping auto-accept: plan checker on cooldown (${formatRemainingSeconds(this.planChecker.getCooldownRemainingMs())}s remaining)`
         );
         return;
       }
@@ -2242,6 +2246,40 @@ export class RespawnController extends EventEmitter {
 
     // AI plan check disabled — pre-filter passed, send Enter directly
     this.sendAutoAcceptEnter();
+  }
+
+  /**
+   * Check whether all preconditions for auto-accept are met.
+   * Validates state, config, and pre-filter conditions before attempting auto-accept.
+   *
+   * @returns True if auto-accept should proceed to the AI confirmation stage
+   */
+  private canAutoAccept(): boolean {
+    // Only auto-accept in watching state (not during a respawn cycle)
+    if (this._state !== 'watching') return false;
+
+    // Don't auto-accept if a completion message was detected (normal idle handles it)
+    if (this.completionMessageTime !== null) return false;
+
+    // Don't auto-accept if disabled
+    if (!this.config.autoAcceptPrompts) return false;
+
+    // Don't auto-accept if we haven't received any output yet (prevents spurious Enter on fresh start)
+    if (!this.hasReceivedOutput) return false;
+
+    // Don't auto-accept if an elicitation dialog (AskUserQuestion) was detected
+    if (this.elicitationDetected) {
+      this.log('Skipping auto-accept: elicitation dialog detected (AskUserQuestion)');
+      return false;
+    }
+
+    // Stage 1: Pre-filter — check if buffer looks like plan mode
+    if (!this.isPlanModePreFilterMatch(this.terminalBuffer.value)) {
+      this.log('Skipping auto-accept: pre-filter did not match plan mode patterns');
+      return false;
+    }
+
+    return true;
   }
 
   /**

@@ -98,6 +98,9 @@ const LEGACY_MUX_NAME_PATTERN = /^claudeman-[a-f0-9-]+$/;
 /** Regex to validate tmux pane targets (e.g., "%0", "%1", "0", "1") */
 const SAFE_PANE_TARGET_PATTERN = /^(%\d+|\d+)$/;
 
+/** Characters unsafe in paths — shell metacharacters, quotes, and control chars */
+const UNSAFE_PATH_CHARS = /[;&|$`(){}<>'"\n\r]/;
+
 /**
  * Validates that a session name contains only safe characters.
  * Prevents command injection via malformed session IDs.
@@ -111,23 +114,7 @@ function isValidMuxName(name: string): boolean {
  * Prevents command injection via malformed paths.
  */
 function isValidPath(path: string): boolean {
-  if (
-    path.includes(';') ||
-    path.includes('&') ||
-    path.includes('|') ||
-    path.includes('$') ||
-    path.includes('`') ||
-    path.includes('(') ||
-    path.includes(')') ||
-    path.includes('{') ||
-    path.includes('}') ||
-    path.includes('<') ||
-    path.includes('>') ||
-    path.includes("'") ||
-    path.includes('"') ||
-    path.includes('\n') ||
-    path.includes('\r')
-  ) {
+  if (UNSAFE_PATH_CHARS.test(path)) {
     return false;
   }
   if (path.includes('..')) {

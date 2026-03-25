@@ -876,13 +876,7 @@ export class Session extends EventEmitter {
       throw new Error('Session already has a running process');
     }
 
-    this._status = 'busy';
-    this._terminalBuffer.clear();
-    this._textOutput.clear();
-    this._errorBuffer = '';
-    this._messages = [];
-    this._lineBuffer = '';
-    this._lastActivityAt = Date.now();
+    this._resetBuffers();
 
     const modeLabel = this.mode === 'opencode' ? 'OpenCode' : 'Claude';
     console.log(
@@ -1257,13 +1251,7 @@ export class Session extends EventEmitter {
       throw new Error('Session already has a running process');
     }
 
-    this._status = 'busy';
-    this._terminalBuffer.clear();
-    this._textOutput.clear();
-    this._errorBuffer = '';
-    this._messages = [];
-    this._lineBuffer = '';
-    this._lastActivityAt = Date.now();
+    this._resetBuffers();
 
     // Use user's default shell or bash
     const shell = process.env.SHELL || '/bin/bash';
@@ -1448,13 +1436,7 @@ export class Session extends EventEmitter {
         return;
       }
 
-      this._status = 'busy';
-      this._terminalBuffer.clear();
-      this._textOutput.clear();
-      this._errorBuffer = '';
-      this._messages = [];
-      this._lineBuffer = '';
-      this._lastActivityAt = Date.now();
+      this._resetBuffers();
       this._promptResolved = false; // Reset race condition guard
 
       this.resolvePromise = resolve;
@@ -1565,6 +1547,117 @@ export class Session extends EventEmitter {
     });
   }
 
+  private _resetBuffers(): void {
+    this._status = 'busy';
+    this._terminalBuffer.clear();
+    this._textOutput.clear();
+    this._errorBuffer = '';
+    this._messages = [];
+    this._lineBuffer = '';
+    this._lastActivityAt = Date.now();
+  }
+
+  private _clearAllTimers(): void {
+    // Clear activity timeout to prevent memory leak
+    if (this.activityTimeout) {
+      clearTimeout(this.activityTimeout);
+      this.activityTimeout = null;
+    }
+
+    // Clear line buffer flush timer
+    if (this._lineBufferFlushTimer) {
+      clearTimeout(this._lineBufferFlushTimer);
+      this._lineBufferFlushTimer = null;
+    }
+
+    // Destroy auto-compact/auto-clear automation (clears its timers)
+    this._autoOps.destroy();
+
+    // Clear prompt check timers
+    if (this._promptCheckInterval) {
+      clearInterval(this._promptCheckInterval);
+      this._promptCheckInterval = null;
+    }
+    if (this._promptCheckTimeout) {
+      clearTimeout(this._promptCheckTimeout);
+      this._promptCheckTimeout = null;
+    }
+
+    // Clear shell idle timer
+    if (this._shellIdleTimer) {
+      clearTimeout(this._shellIdleTimer);
+      this._shellIdleTimer = null;
+    }
+
+    // Clear expensive processing timer
+    if (this._expensiveProcessTimer) {
+      clearTimeout(this._expensiveProcessTimer);
+      this._expensiveProcessTimer = null;
+    }
+    this._pendingCleanData = '';
+  }
+
+  private _handleJsonMessage(cleanLine: string, rawLine: string): void {
+    try {
+      const msg = JSON.parse(cleanLine) as ClaudeMessage;
+      this._messages.push(msg);
+      this.emit('message', msg);
+
+      // Trim messages array for long-running sessions
+      if (this._messages.length > MAX_MESSAGES) {
+        this._messages = this._messages.slice(-Math.floor(MAX_MESSAGES * 0.8));
+      }
+
+      // Extract Claude session ID from messages (can be in any message type)
+      // Support both sessionId (camelCase) and session_id (snake_case)
+      const msgSessionId =
+        ((msg as unknown as Record<string, unknown>).sessionId as string | undefined) ?? msg.session_id;
+      if (msgSessionId && !this._claudeSessionId) {
+        this._claudeSessionId = msgSessionId;
+      }
+
+      // Process message for task tracking
+      this._taskTracker.processMessage(msg);
+
+      if (msg.type === 'assistant' && msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block.type === 'text' && block.text) {
+            this._textOutput.append(block.text);
+          }
+        }
+        // Track tokens from usage (with validation)
+        if (msg.message.usage) {
+          const inputDelta = msg.message.usage.input_tokens || 0;
+          const outputDelta = msg.message.usage.output_tokens || 0;
+
+          // Sanity check: max 100k tokens per message (generous limit)
+          const MAX_TOKENS_PER_MESSAGE = 100_000;
+          if (inputDelta > 0 && inputDelta <= MAX_TOKENS_PER_MESSAGE) {
+            this._totalInputTokens += inputDelta;
+          }
+          if (outputDelta > 0 && outputDelta <= MAX_TOKENS_PER_MESSAGE) {
+            this._totalOutputTokens += outputDelta;
+          }
+
+          // Check if we should auto-compact or auto-clear
+          this._autoOps.checkAutoCompact();
+          this._autoOps.checkAutoClear();
+        }
+      }
+
+      if (msg.type === 'result' && msg.total_cost_usd) {
+        this._totalCost = msg.total_cost_usd;
+      }
+    } catch (parseErr) {
+      // Not JSON, just regular output - this is expected for non-JSON lines
+      console.debug(
+        '[Session] Line not JSON (expected for text output):',
+        parseErr instanceof Error ? parseErr.message : parseErr
+      );
+      this._textOutput.append(rawLine + '\n');
+    }
+  }
+
   private processOutput(data: string): void {
     // Early return if session is stopped to prevent any processing or timer creation
     if (this._isStopped) return;
@@ -1606,64 +1699,7 @@ export class Session extends EventEmitter {
       const cleanLine = trimmed.replace(ANSI_ESCAPE_PATTERN_FULL, '');
 
       if (cleanLine.startsWith('{') && cleanLine.endsWith('}')) {
-        try {
-          const msg = JSON.parse(cleanLine) as ClaudeMessage;
-          this._messages.push(msg);
-          this.emit('message', msg);
-
-          // Trim messages array for long-running sessions
-          if (this._messages.length > MAX_MESSAGES) {
-            this._messages = this._messages.slice(-Math.floor(MAX_MESSAGES * 0.8));
-          }
-
-          // Extract Claude session ID from messages (can be in any message type)
-          // Support both sessionId (camelCase) and session_id (snake_case)
-          const msgSessionId =
-            ((msg as unknown as Record<string, unknown>).sessionId as string | undefined) ?? msg.session_id;
-          if (msgSessionId && !this._claudeSessionId) {
-            this._claudeSessionId = msgSessionId;
-          }
-
-          // Process message for task tracking
-          this._taskTracker.processMessage(msg);
-
-          if (msg.type === 'assistant' && msg.message?.content) {
-            for (const block of msg.message.content) {
-              if (block.type === 'text' && block.text) {
-                this._textOutput.append(block.text);
-              }
-            }
-            // Track tokens from usage (with validation)
-            if (msg.message.usage) {
-              const inputDelta = msg.message.usage.input_tokens || 0;
-              const outputDelta = msg.message.usage.output_tokens || 0;
-
-              // Sanity check: max 100k tokens per message (generous limit)
-              const MAX_TOKENS_PER_MESSAGE = 100_000;
-              if (inputDelta > 0 && inputDelta <= MAX_TOKENS_PER_MESSAGE) {
-                this._totalInputTokens += inputDelta;
-              }
-              if (outputDelta > 0 && outputDelta <= MAX_TOKENS_PER_MESSAGE) {
-                this._totalOutputTokens += outputDelta;
-              }
-
-              // Check if we should auto-compact or auto-clear
-              this._autoOps.checkAutoCompact();
-              this._autoOps.checkAutoClear();
-            }
-          }
-
-          if (msg.type === 'result' && msg.total_cost_usd) {
-            this._totalCost = msg.total_cost_usd;
-          }
-        } catch (parseErr) {
-          // Not JSON, just regular output - this is expected for non-JSON lines
-          console.debug(
-            '[Session] Line not JSON (expected for text output):',
-            parseErr instanceof Error ? parseErr.message : parseErr
-          );
-          this._textOutput.append(line + '\n');
-        }
+        this._handleJsonMessage(cleanLine, line);
       } else if (trimmed) {
         this._textOutput.append(line + '\n');
       }
@@ -2030,43 +2066,7 @@ export class Session extends EventEmitter {
     // Set stopped flag first to prevent new timers from being created
     this._isStopped = true;
 
-    // Clear activity timeout to prevent memory leak
-    if (this.activityTimeout) {
-      clearTimeout(this.activityTimeout);
-      this.activityTimeout = null;
-    }
-
-    // Clear line buffer flush timer
-    if (this._lineBufferFlushTimer) {
-      clearTimeout(this._lineBufferFlushTimer);
-      this._lineBufferFlushTimer = null;
-    }
-
-    // Destroy auto-compact/auto-clear automation (clears its timers)
-    this._autoOps.destroy();
-
-    // Clear prompt check timers
-    if (this._promptCheckInterval) {
-      clearInterval(this._promptCheckInterval);
-      this._promptCheckInterval = null;
-    }
-    if (this._promptCheckTimeout) {
-      clearTimeout(this._promptCheckTimeout);
-      this._promptCheckTimeout = null;
-    }
-
-    // Clear shell idle timer
-    if (this._shellIdleTimer) {
-      clearTimeout(this._shellIdleTimer);
-      this._shellIdleTimer = null;
-    }
-
-    // Clear expensive processing timer
-    if (this._expensiveProcessTimer) {
-      clearTimeout(this._expensiveProcessTimer);
-      this._expensiveProcessTimer = null;
-    }
-    this._pendingCleanData = '';
+    this._clearAllTimers();
 
     // Immediately cleanup Promise callbacks to prevent orphaned references
     // during the rest of stop() processing (e.g., if mux kill times out)
