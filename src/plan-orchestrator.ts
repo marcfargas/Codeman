@@ -414,9 +414,24 @@ export class PlanOrchestrator {
 
       const durationMs = Date.now() - startTime;
 
-      // Extract JSON from response
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
+      console.log(
+        `[PlanOrchestrator] Research response length: ${response.length}, first 500 chars:`,
+        response.substring(0, 500)
+      );
+
+      // Extract JSON from response — try multiple strategies
+      let jsonMatch = response.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+      if (jsonMatch) {
+        jsonMatch = [jsonMatch[1]]; // Use captured group (inside code block)
+      } else {
+        jsonMatch = response.match(/\{[\s\S]*\}/);
+      }
+
       if (!jsonMatch) {
+        console.error(
+          `[PlanOrchestrator] No JSON found in research response. Full response:`,
+          response.substring(0, 2000)
+        );
         onSubagent?.({
           type: 'failed',
           agentId,
@@ -587,9 +602,24 @@ export class PlanOrchestrator {
 
       const durationMs = Date.now() - startTime;
 
-      // Extract JSON from response
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
+      console.log(
+        `[PlanOrchestrator] Planner response length: ${response.length}, first 500 chars:`,
+        response.substring(0, 500)
+      );
+
+      // Extract JSON from response — try multiple strategies
+      let jsonMatch = response.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+      if (jsonMatch) {
+        jsonMatch = [jsonMatch[1]]; // Use captured group (inside code block)
+      } else {
+        jsonMatch = response.match(/\{[\s\S]*\}/);
+      }
+
       if (!jsonMatch) {
+        console.error(
+          `[PlanOrchestrator] No JSON found in planner response. Full response:`,
+          response.substring(0, 2000)
+        );
         onSubagent?.({
           type: 'failed',
           agentId,

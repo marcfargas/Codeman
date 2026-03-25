@@ -1516,9 +1516,11 @@ export class Session extends EventEmitter {
             this._status = 'idle';
             const cost = resultMsg.total_cost_usd || 0;
             this._totalCost += cost;
-            this.emit('completion', resultMsg.result || '', cost);
+            // Claude CLI stream-json may return empty result field — fall back to accumulated text output
+            const result = resultMsg.result || this._textOutput.value || '';
+            this.emit('completion', result, cost);
             if (resolve) {
-              resolve({ result: resultMsg.result || '', cost });
+              resolve({ result, cost });
             }
           } else if (exitCode !== 0 || (resultMsg && resultMsg.is_error)) {
             this._status = 'error';
