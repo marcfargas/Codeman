@@ -1,0 +1,392 @@
+/**
+ * @fileoverview Session event listener wiring — creates, attaches, and detaches session listeners.
+ *
+ * Extracted from server.ts for modularity. Provides:
+ * - `SessionListenerRefs` interface (named listener references for leak-free cleanup)
+ * - `createSessionListeners()` — builds all 25 listener handlers via dependency injection
+ * - `attachSessionListeners()` / `detachSessionListeners()` — symmetric attach/detach
+ *
+ * The detach function deduplicates a pattern that was previously copy-pasted 3 times
+ * in server.ts (_doCleanupSession, exit handler, stop()).
+ *
+ * @dependencies session.ts (Session, event types), sse-events.ts, types.ts
+ * @consumedby web/server.ts (WebServer delegates listener lifecycle here)
+ *
+ * @module web/session-listener-wiring
+ */
+
+import type {
+  Session,
+  ClaudeMessage,
+  BackgroundTask,
+  RalphTrackerState,
+  RalphTodoItem,
+  ActiveBashTool,
+} from '../session.js';
+import type { RalphStatusBlock, CircuitBreakerStatus } from '../types.js';
+import { SseEvent } from './sse-events.js';
+import { getLifecycleLog } from '../session-lifecycle-log.js';
+import { fileStreamManager } from '../file-stream-manager.js';
+
+/** Stored listener references for session cleanup (prevents memory leaks) */
+export interface SessionListenerRefs {
+  terminal: (data: string) => void;
+  clearTerminal: () => void;
+  needsRefresh: () => void;
+  message: (msg: ClaudeMessage) => void;
+  error: (error: string) => void;
+  completion: (result: string, cost: number) => void;
+  exit: (code: number | null) => void;
+  working: () => void;
+  idle: () => void;
+  taskCreated: (task: BackgroundTask) => void;
+  taskUpdated: (task: BackgroundTask) => void;
+  taskCompleted: (task: BackgroundTask) => void;
+  taskFailed: (task: BackgroundTask, error: string) => void;
+  autoClear: (data: { tokens: number; threshold: number }) => void;
+  autoCompact: (data: { tokens: number; threshold: number; prompt?: string }) => void;
+  cliInfoUpdated: (data: { version?: string; model?: string; accountType?: string; latestVersion?: string }) => void;
+  ralphLoopUpdate: (state: RalphTrackerState) => void;
+  ralphTodoUpdate: (todos: RalphTodoItem[]) => void;
+  ralphCompletionDetected: (phrase: string) => void;
+  ralphStatusBlockDetected: (block: RalphStatusBlock) => void;
+  ralphCircuitBreakerUpdate: (status: CircuitBreakerStatus) => void;
+  ralphExitGateMet: (data: { completionIndicators: number; exitSignal: boolean }) => void;
+  bashToolStart: (tool: ActiveBashTool) => void;
+  bashToolEnd: (tool: ActiveBashTool) => void;
+  bashToolsUpdate: (tools: ActiveBashTool[]) => void;
+}
+
+/** Dependencies injected by WebServer — keeps listener creation decoupled from server internals. */
+export interface SessionListenerDeps {
+  broadcast(event: string, data: unknown): void;
+  batchTerminalData(sessionId: string, data: string): void;
+  batchTaskUpdate(sessionId: string, task: BackgroundTask): void;
+  broadcastSessionStateDebounced(sessionId: string): void;
+  sendPushNotifications(event: string, data: Record<string, unknown>): void;
+  persistSessionState(session: Session): void;
+  getSessionStateWithRespawn(session: Session): unknown;
+  getRunSummaryTracker(sessionId: string): import('../run-summary.js').RunSummaryTracker | undefined;
+  stopTranscriptWatcher(sessionId: string): void;
+  cleanupSessionBatches(sessionId: string): void;
+  cancelPersistDebounce(sessionId: string): void;
+  removeRunSummaryTracker(sessionId: string): void;
+  removeSessionListenerRefs(sessionId: string): void;
+  cleanupRespawnOnExit(sessionId: string): void;
+  getStore(): import('../state-store.js').StateStore;
+}
+
+/**
+ * Creates all 25 session listener handlers, capturing dependencies via closure.
+ * Call `attachSessionListeners()` after to wire them to the session.
+ */
+export function createSessionListeners(session: Session, deps: SessionListenerDeps): SessionListenerRefs {
+  return {
+    // ─── Terminal Output ─────────────────────────────────────
+
+    /** Batches PTY output → broadcasts `session:terminal` at 16-50ms intervals */
+    terminal: (data) => {
+      deps.batchTerminalData(session.id, data);
+    },
+
+    /** Broadcasts `session:clearTerminal` — tells clients to wipe their xterm buffer (after mux attach) */
+    clearTerminal: () => {
+      deps.broadcast(SseEvent.SessionClearTerminal, { id: session.id });
+    },
+
+    /** Broadcasts `session:needsRefresh` — tells clients to reload buffer */
+    needsRefresh: () => {
+      deps.broadcast(SseEvent.SessionNeedsRefresh, { id: session.id });
+    },
+
+    // ─── Session Messages & Errors ──────────────────────────
+
+    /** Broadcasts `session:message` — structured Claude JSON messages (assistant, tool_use, etc.) */
+    message: (msg: ClaudeMessage) => {
+      deps.broadcast(SseEvent.SessionMessage, { id: session.id, message: msg });
+    },
+
+    /** Broadcasts `session:error` + sends push notification */
+    error: (error) => {
+      deps.broadcast(SseEvent.SessionError, { id: session.id, error });
+      deps.sendPushNotifications(SseEvent.SessionError, {
+        sessionId: session.id,
+        sessionName: session.name,
+        error: String(error),
+      });
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker) tracker.recordError('Session error', String(error));
+    },
+
+    /** Broadcasts `session:completion` + `session:updated` — prompt finished, persists state */
+    completion: (result, cost) => {
+      deps.broadcast(SseEvent.SessionCompletion, { id: session.id, result, cost });
+      deps.broadcast(SseEvent.SessionUpdated, deps.getSessionStateWithRespawn(session));
+      deps.persistSessionState(session);
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker) tracker.recordTokens(session.inputTokens, session.outputTokens);
+    },
+
+    // ─── Session Lifecycle ──────────────────────────────────
+
+    /** Broadcasts `session:exit` + `session:updated` — PTY process exited; cleans up respawn, timers, listeners */
+    exit: (code) => {
+      getLifecycleLog().log({
+        event: 'exit',
+        sessionId: session.id,
+        name: session.name,
+        exitCode: code,
+      });
+      // Wrap in try/catch to ensure cleanup always happens
+      try {
+        deps.broadcast(SseEvent.SessionExit, { id: session.id, code });
+        deps.broadcast(SseEvent.SessionUpdated, deps.getSessionStateWithRespawn(session));
+        deps.persistSessionState(session);
+      } catch (err) {
+        console.error(`[Server] Error broadcasting session exit for ${session.id}:`, err);
+      }
+
+      // Always clean up respawn controller, even if broadcast failed
+      try {
+        deps.cleanupRespawnOnExit(session.id);
+      } catch (err) {
+        console.error(`[Server] Error cleaning up respawn controller for ${session.id}:`, err);
+      }
+
+      // Clean up per-session resources that are stale after PTY exit.
+      try {
+        // Transcript watcher is tied to the specific PTY run
+        deps.stopTranscriptWatcher(session.id);
+
+        // Finalize run summary tracker
+        deps.removeRunSummaryTracker(session.id);
+
+        // Flush/clear terminal batching state (no more output coming)
+        deps.cleanupSessionBatches(session.id);
+
+        // Clear pending persist-debounce timer
+        deps.cancelPersistDebounce(session.id);
+
+        // Close any active file streams
+        fileStreamManager.closeSessionStreams(session.id);
+
+        // Remove stored listener refs to break closure references (prevents memory leak).
+        deps.removeSessionListenerRefs(session.id);
+      } catch (err) {
+        console.error(`[Server] Error cleaning up session resources on exit for ${session.id}:`, err);
+      }
+    },
+
+    // ─── Activity State ─────────────────────────────────────
+
+    /** Broadcasts `session:working` — Claude started processing */
+    working: () => {
+      deps.broadcast(SseEvent.SessionWorking, { id: session.id });
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker) {
+        tracker.recordWorking();
+        tracker.recordTokens(session.inputTokens, session.outputTokens);
+      }
+    },
+
+    /** Broadcasts `session:idle` — Claude finished processing, waiting for input */
+    idle: () => {
+      deps.broadcast(SseEvent.SessionIdle, { id: session.id });
+      deps.broadcastSessionStateDebounced(session.id);
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker) {
+        tracker.recordIdle();
+        tracker.recordTokens(session.inputTokens, session.outputTokens);
+      }
+    },
+
+    // ─── Background Task Events ──────────────────────────────
+
+    /** Broadcasts `task:created` — new background task discovered */
+    taskCreated: (task: BackgroundTask) => {
+      deps.broadcast(SseEvent.TaskCreated, { sessionId: session.id, task });
+      deps.broadcastSessionStateDebounced(session.id);
+    },
+
+    /** Batched broadcast of `task:updated` — high-frequency progress updates */
+    taskUpdated: (task: BackgroundTask) => {
+      deps.batchTaskUpdate(session.id, task);
+    },
+
+    /** Broadcasts `task:completed` — background task finished successfully */
+    taskCompleted: (task: BackgroundTask) => {
+      deps.broadcast(SseEvent.TaskCompleted, { sessionId: session.id, task });
+      deps.broadcastSessionStateDebounced(session.id);
+    },
+
+    /** Broadcasts `task:failed` — background task errored */
+    taskFailed: (task: BackgroundTask, error: string) => {
+      deps.broadcast(SseEvent.TaskFailed, { sessionId: session.id, task, error });
+      deps.broadcastSessionStateDebounced(session.id);
+    },
+
+    // ─── Auto-Operations ────────────────────────────────────
+
+    /** Broadcasts `session:autoClear` — context window auto-cleared at token threshold */
+    autoClear: (data: { tokens: number; threshold: number }) => {
+      deps.broadcast(SseEvent.SessionAutoClear, { sessionId: session.id, ...data });
+      deps.broadcastSessionStateDebounced(session.id);
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker) tracker.recordAutoClear(data.tokens, data.threshold);
+    },
+
+    /** Broadcasts `session:autoCompact` — context window auto-compacted at token threshold */
+    autoCompact: (data: { tokens: number; threshold: number; prompt?: string }) => {
+      deps.broadcast(SseEvent.SessionAutoCompact, { sessionId: session.id, ...data });
+      deps.broadcastSessionStateDebounced(session.id);
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker) tracker.recordAutoCompact(data.tokens, data.threshold);
+    },
+
+    // ─── CLI Info ────────────────────────────────────────────
+
+    /** Broadcasts `session:cliInfo` — Claude Code version, model, account type parsed from terminal */
+    cliInfoUpdated: (data: { version?: string; model?: string; accountType?: string; latestVersion?: string }) => {
+      deps.broadcast(SseEvent.SessionCliInfo, { sessionId: session.id, ...data });
+      deps.broadcastSessionStateDebounced(session.id);
+    },
+
+    // ─── Ralph Tracking Events ──────────────────────────────
+
+    /** Broadcasts `session:ralphLoopUpdate` — Ralph tracker loop state changed (iteration, phase) */
+    ralphLoopUpdate: (state: RalphTrackerState) => {
+      deps.broadcast(SseEvent.SessionRalphLoopUpdate, { sessionId: session.id, state });
+      deps.getStore().updateRalphState(session.id, { loop: state });
+    },
+
+    /** Broadcasts `session:ralphTodoUpdate` — todo items added, completed, or modified */
+    ralphTodoUpdate: (todos: RalphTodoItem[]) => {
+      deps.broadcast(SseEvent.SessionRalphTodoUpdate, { sessionId: session.id, todos });
+      deps.getStore().updateRalphState(session.id, { todos });
+    },
+
+    /** Broadcasts `session:ralphCompletionDetected` + push notification — completion phrase matched */
+    ralphCompletionDetected: (phrase: string) => {
+      deps.broadcast(SseEvent.SessionRalphCompletionDetected, { sessionId: session.id, phrase });
+      deps.sendPushNotifications(SseEvent.SessionRalphCompletionDetected, {
+        sessionId: session.id,
+        sessionName: session.name,
+        phrase,
+      });
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker) tracker.recordRalphCompletion(phrase);
+    },
+
+    /** Broadcasts `session:ralphStatusUpdate` — RALPH_STATUS block parsed from output */
+    ralphStatusBlockDetected: (block: RalphStatusBlock) => {
+      deps.broadcast(SseEvent.SessionRalphStatusUpdate, { sessionId: session.id, block });
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker) {
+        tracker.addEvent(
+          block.status === 'BLOCKED' ? 'warning' : 'idle_detected',
+          block.status === 'BLOCKED' ? 'warning' : 'info',
+          `Ralph Status: ${block.status}`,
+          `Tasks: ${block.tasksCompletedThisLoop}, Files: ${block.filesModified}, Tests: ${block.testsStatus}`
+        );
+      }
+    },
+
+    /** Broadcasts `session:circuitBreakerUpdate` — circuit breaker state changed (CLOSED/HALF_OPEN/OPEN) */
+    ralphCircuitBreakerUpdate: (status: CircuitBreakerStatus) => {
+      deps.broadcast(SseEvent.SessionCircuitBreakerUpdate, { sessionId: session.id, status });
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker && status.state === 'OPEN') {
+        tracker.addEvent('warning', 'warning', 'Circuit Breaker Opened', status.reason);
+      }
+    },
+
+    /** Broadcasts `session:exitGateMet` — all completion indicators met, ready to exit */
+    ralphExitGateMet: (data: { completionIndicators: number; exitSignal: boolean }) => {
+      deps.broadcast(SseEvent.SessionExitGateMet, { sessionId: session.id, ...data });
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker) {
+        tracker.addEvent(
+          'ralph_completion',
+          'success',
+          'Exit Gate Met',
+          `Indicators: ${data.completionIndicators}, EXIT_SIGNAL: ${data.exitSignal}`
+        );
+      }
+    },
+
+    // ─── Bash Tool Tracking ────────────────────────────────
+
+    /** Broadcasts `session:bashToolStart` — bash tool invocation started */
+    bashToolStart: (tool: ActiveBashTool) => {
+      deps.broadcast(SseEvent.SessionBashToolStart, { sessionId: session.id, tool });
+    },
+
+    /** Broadcasts `session:bashToolEnd` — bash tool invocation completed */
+    bashToolEnd: (tool: ActiveBashTool) => {
+      deps.broadcast(SseEvent.SessionBashToolEnd, { sessionId: session.id, tool });
+    },
+
+    /** Broadcasts `session:bashToolsUpdate` — full active bash tools list refreshed */
+    bashToolsUpdate: (tools: ActiveBashTool[]) => {
+      deps.broadcast(SseEvent.SessionBashToolsUpdate, { sessionId: session.id, tools });
+    },
+  };
+}
+
+/** Attach all listeners to a session. */
+export function attachSessionListeners(session: Session, refs: SessionListenerRefs): void {
+  session.on('terminal', refs.terminal);
+  session.on('clearTerminal', refs.clearTerminal);
+  session.on('needsRefresh', refs.needsRefresh);
+  session.on('message', refs.message);
+  session.on('error', refs.error);
+  session.on('completion', refs.completion);
+  session.on('exit', refs.exit);
+  session.on('working', refs.working);
+  session.on('idle', refs.idle);
+  session.on('taskCreated', refs.taskCreated);
+  session.on('taskUpdated', refs.taskUpdated);
+  session.on('taskCompleted', refs.taskCompleted);
+  session.on('taskFailed', refs.taskFailed);
+  session.on('autoClear', refs.autoClear);
+  session.on('autoCompact', refs.autoCompact);
+  session.on('cliInfoUpdated', refs.cliInfoUpdated);
+  session.on('ralphLoopUpdate', refs.ralphLoopUpdate);
+  session.on('ralphTodoUpdate', refs.ralphTodoUpdate);
+  session.on('ralphCompletionDetected', refs.ralphCompletionDetected);
+  session.on('ralphStatusBlockDetected', refs.ralphStatusBlockDetected);
+  session.on('ralphCircuitBreakerUpdate', refs.ralphCircuitBreakerUpdate);
+  session.on('ralphExitGateMet', refs.ralphExitGateMet);
+  session.on('bashToolStart', refs.bashToolStart);
+  session.on('bashToolEnd', refs.bashToolEnd);
+  session.on('bashToolsUpdate', refs.bashToolsUpdate);
+}
+
+/** Detach all listeners from a session (prevents memory leaks from closure references). */
+export function detachSessionListeners(session: Session, refs: SessionListenerRefs): void {
+  session.off('terminal', refs.terminal);
+  session.off('clearTerminal', refs.clearTerminal);
+  session.off('needsRefresh', refs.needsRefresh);
+  session.off('message', refs.message);
+  session.off('error', refs.error);
+  session.off('completion', refs.completion);
+  session.off('exit', refs.exit);
+  session.off('working', refs.working);
+  session.off('idle', refs.idle);
+  session.off('taskCreated', refs.taskCreated);
+  session.off('taskUpdated', refs.taskUpdated);
+  session.off('taskCompleted', refs.taskCompleted);
+  session.off('taskFailed', refs.taskFailed);
+  session.off('autoClear', refs.autoClear);
+  session.off('autoCompact', refs.autoCompact);
+  session.off('cliInfoUpdated', refs.cliInfoUpdated);
+  session.off('ralphLoopUpdate', refs.ralphLoopUpdate);
+  session.off('ralphTodoUpdate', refs.ralphTodoUpdate);
+  session.off('ralphCompletionDetected', refs.ralphCompletionDetected);
+  session.off('ralphStatusBlockDetected', refs.ralphStatusBlockDetected);
+  session.off('ralphCircuitBreakerUpdate', refs.ralphCircuitBreakerUpdate);
+  session.off('ralphExitGateMet', refs.ralphExitGateMet);
+  session.off('bashToolStart', refs.bashToolStart);
+  session.off('bashToolEnd', refs.bashToolEnd);
+  session.off('bashToolsUpdate', refs.bashToolsUpdate);
+}

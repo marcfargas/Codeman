@@ -29,6 +29,7 @@ import {
   RESTART_DELAY_MS,
   FORCE_KILL_MS,
 } from './config/tunnel-config.js';
+import { getErrorMessage } from './types.js';
 
 // ========== Types ==========
 
@@ -164,7 +165,7 @@ export class TunnelManager extends EventEmitter {
         detached: false,
       });
     } catch (err) {
-      this.emit('error', `Failed to spawn cloudflared: ${err instanceof Error ? err.message : String(err)}`);
+      this.emit('error', `Failed to spawn cloudflared: ${getErrorMessage(err)}`);
       return;
     }
 

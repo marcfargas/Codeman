@@ -20,7 +20,13 @@
  */
 
 import type { Session } from './session.js';
-import type { OrchestratorPhase, OrchestratorConfig, VerificationResult, VerificationCheck } from './types.js';
+import {
+  getErrorMessage,
+  type OrchestratorPhase,
+  type OrchestratorConfig,
+  type VerificationResult,
+  type VerificationCheck,
+} from './types.js';
 
 // ═══════════════════════════════════════════════════════════════
 // Constants
@@ -111,7 +117,7 @@ export class OrchestratorVerifier {
           type: 'test_command',
           description: `Run: ${command}`,
           passed: false,
-          output: err instanceof Error ? err.message : String(err),
+          output: getErrorMessage(err),
         });
       }
     }
@@ -164,7 +170,7 @@ export class OrchestratorVerifier {
         type: 'ai_review',
         description: `AI review of "${phase.name}"`,
         passed: false,
-        output: `AI review timed out or failed: ${err instanceof Error ? err.message : String(err)}`,
+        output: `AI review timed out or failed: ${getErrorMessage(err)}`,
       };
     }
   }

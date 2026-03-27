@@ -16,6 +16,7 @@ import { existsSync, statSync, realpathSync } from 'node:fs';
 import { resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { EventEmitter } from 'node:events';
+import { getErrorMessage } from './types.js';
 import { CLEANUP_CHECK_INTERVAL_MS, INACTIVITY_TIMEOUT_MS } from './config/server-timing.js';
 
 // ========== Configuration Constants ==========
@@ -172,10 +173,7 @@ export class FileStreamManager extends EventEmitter {
       }
     } catch (err) {
       const errorCode = err instanceof Error && 'code' in err ? (err as NodeJS.ErrnoException).code : 'UNKNOWN';
-      console.warn(
-        `[FileStreamManager] Failed to stat file "${absolutePath}" (${errorCode}):`,
-        err instanceof Error ? err.message : String(err)
-      );
+      console.warn(`[FileStreamManager] Failed to stat file "${absolutePath}" (${errorCode}):`, getErrorMessage(err));
       return { success: false, error: 'File not found or not accessible' };
     }
 

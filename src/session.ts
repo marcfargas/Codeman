@@ -40,6 +40,7 @@ import {
   ActiveBashTool,
   NiceConfig,
   DEFAULT_NICE_CONFIG,
+  getErrorMessage,
   type ClaudeMode,
   type SessionMode,
   type OpenCodeConfig,
@@ -1955,7 +1956,7 @@ export class Session extends EventEmitter {
     this._status = 'busy';
     this._lastActivityAt = Date.now();
     this.runPrompt(input).catch((err) => {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorMsg = getErrorMessage(err);
       // Clean up task state so the task queue doesn't get stuck
       if (this._currentTaskId) {
         const taskId = this._currentTaskId;

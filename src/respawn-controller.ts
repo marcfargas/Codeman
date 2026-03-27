@@ -70,12 +70,13 @@ import {
   AI_PLAN_CHECK_TIMEOUT_MS,
   AI_PLAN_CHECK_COOLDOWN_MS,
 } from './config/ai-defaults.js';
-import type {
-  RespawnCycleMetrics,
-  RespawnAggregateMetrics,
-  RalphLoopHealthScore,
-  TimingHistory,
-  CycleOutcome,
+import {
+  getErrorMessage,
+  type RespawnCycleMetrics,
+  type RespawnAggregateMetrics,
+  type RalphLoopHealthScore,
+  type TimingHistory,
+  type CycleOutcome,
 } from './types.js';
 
 // ========== Constants ==========
@@ -2172,7 +2173,7 @@ export class RespawnController extends EventEmitter {
         }
         if (this._state === 'stopped') return; // Guard against stopped state
         if (this._state === 'ai_checking') {
-          const errorMsg = err instanceof Error ? err.message : String(err);
+          const errorMsg = getErrorMessage(err);
           this.logAction('ai-check', `Failed: ${errorMsg.substring(0, 50)}`);
           this.emit('aiCheckFailed', errorMsg);
           this.setState('watching');
@@ -2371,7 +2372,7 @@ export class RespawnController extends EventEmitter {
         }
       })
       .catch((err) => {
-        const errorMsg = err instanceof Error ? err.message : String(err);
+        const errorMsg = getErrorMessage(err);
         this.emit('planCheckFailed', errorMsg);
         this.logAction('plan-check', `Failed: ${errorMsg.substring(0, 50)}`);
       });

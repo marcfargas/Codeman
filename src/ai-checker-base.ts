@@ -30,6 +30,7 @@ import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { getAugmentedPath, ANSI_ESCAPE_PATTERN_SIMPLE } from './utils/index.js';
 import { AI_CHECK_MAX_BACKOFF_MS } from './config/ai-defaults.js';
+import { getErrorMessage } from './types.js';
 
 // ========== Security Validation ==========
 
@@ -293,7 +294,7 @@ export abstract class AiCheckerBase<
       this.emit('checkCompleted', result);
       return result;
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      const errorMsg = getErrorMessage(err);
       this.handleError(errorMsg);
       const result = this.createErrorResult(errorMsg, Date.now() - this.checkStartTime);
       this.emit('checkFailed', errorMsg);
@@ -412,9 +413,7 @@ export abstract class AiCheckerBase<
       });
       muxProcess.unref();
     } catch (err) {
-      throw new Error(
-        `Failed to spawn ${this.checkDescription} tmux session: ${err instanceof Error ? err.message : String(err)}`
-      );
+      throw new Error(`Failed to spawn ${this.checkDescription} tmux session: ${getErrorMessage(err)}`);
     }
 
     // Poll the temp file for completion

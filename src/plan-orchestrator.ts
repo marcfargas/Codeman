@@ -20,7 +20,7 @@ import type { TerminalMultiplexer } from './mux-interface.js';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { RESEARCH_AGENT_PROMPT, PLANNER_PROMPT } from './prompts/index.js';
-import type { PlanItem } from './types.js';
+import { getErrorMessage, type PlanItem } from './types.js';
 
 // Re-export for backward compatibility
 export type { PlanItem };
@@ -355,7 +355,7 @@ export class PlanOrchestrator {
     } catch (err) {
       return {
         success: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: getErrorMessage(err),
       };
     }
   }
@@ -523,7 +523,7 @@ export class PlanOrchestrator {
       return result;
     } catch (err) {
       const durationMs = Date.now() - startTime;
-      const error = err instanceof Error ? err.message : String(err);
+      const error = getErrorMessage(err);
       this._emitAgentFailure(onSubagent, agentId, 'research', this.researchModel, error, durationMs);
       return {
         success: false,
@@ -651,7 +651,7 @@ export class PlanOrchestrator {
       return { success: true, items, gaps, warnings };
     } catch (err) {
       const durationMs = Date.now() - startTime;
-      const error = err instanceof Error ? err.message : String(err);
+      const error = getErrorMessage(err);
       this._emitAgentFailure(onSubagent, agentId, 'planner', this.plannerModel, error, durationMs);
       return { success: false, error };
     } finally {

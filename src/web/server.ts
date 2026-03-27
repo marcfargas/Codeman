@@ -27,7 +27,7 @@
  * @module web/server
  */
 
-import Fastify, { FastifyInstance, FastifyReply } from 'fastify';
+import Fastify, { FastifyInstance } from 'fastify';
 import fastifyCompress from '@fastify/compress';
 import fastifyCookie from '@fastify/cookie';
 import fastifyStatic from '@fastify/static';
@@ -39,16 +39,9 @@ import fs from 'node:fs/promises';
 import { execSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { EventEmitter } from 'node:events';
-import {
-  Session,
-  ClaudeMessage,
-  type BackgroundTask,
-  type RalphTrackerState,
-  type RalphTodoItem,
-  type ActiveBashTool,
-} from '../session.js';
+import { Session, type BackgroundTask } from '../session.js';
 import type { ClaudeMode } from '../types.js';
-import { RespawnController, RespawnConfig, RespawnState } from '../respawn-controller.js';
+import { RespawnController, RespawnConfig } from '../respawn-controller.js';
 import type { TerminalMultiplexer } from '../mux-interface.js';
 import { createMultiplexer } from '../mux-factory.js';
 import { getStore } from '../state-store.js';
@@ -74,6 +67,20 @@ import { OrchestratorLoop } from '../orchestrator-loop.js';
 import { getLifecycleLog } from '../session-lifecycle-log.js';
 import { PushSubscriptionStore } from '../push-store.js';
 import webpush from 'web-push';
+import { SseStreamManager } from './sse-stream-manager.js';
+import {
+  type SessionListenerRefs,
+  createSessionListeners,
+  attachSessionListeners,
+  detachSessionListeners,
+} from './session-listener-wiring.js';
+import {
+  wireRespawnListeners,
+  setupTimedRespawn,
+  restoreRespawnController,
+  saveRespawnConfig,
+  type RespawnWiringDeps,
+} from './respawn-event-wiring.js';
 
 // Load version from package.json
 const require = createRequire(import.meta.url);
@@ -112,26 +119,15 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 import {
-  TERMINAL_BATCH_INTERVAL,
-  TASK_UPDATE_BATCH_INTERVAL,
-  STATE_UPDATE_DEBOUNCE_INTERVAL,
   SESSIONS_LIST_CACHE_TTL,
   SCHEDULED_CLEANUP_INTERVAL,
   SCHEDULED_RUN_MAX_AGE,
   SSE_HEARTBEAT_INTERVAL,
-  SSE_PADDING_SIZE,
   SESSION_LIMIT_WAIT_MS,
   ITERATION_PAUSE_MS,
-  BATCH_FLUSH_THRESHOLD,
   STATS_COLLECTION_INTERVAL_MS,
   INACTIVITY_TIMEOUT_MS,
 } from '../config/server-timing.js';
-
-// SSE padding for Cloudflare tunnel buffer flushing.
-// Cloudflare quick tunnels buffer small SSE responses, causing lag for real-time events.
-// Appending SSE comment padding (ignored by EventSource) forces the proxy to flush.
-// Pre-computed once at startup to avoid repeated string allocation.
-const SSE_PADDING = ':' + 'p'.repeat(SSE_PADDING_SIZE) + '\n';
 
 /**
  * Get or generate a self-signed TLS certificate for HTTPS.
@@ -169,35 +165,6 @@ function getOrCreateSelfSignedCert(): { key: string; cert: string } {
   };
 }
 
-/** Stored listener references for session cleanup (prevents memory leaks) */
-interface SessionListenerRefs {
-  terminal: (data: string) => void;
-  clearTerminal: () => void;
-  needsRefresh: () => void;
-  message: (msg: ClaudeMessage) => void;
-  error: (error: string) => void;
-  completion: (result: string, cost: number) => void;
-  exit: (code: number | null) => void;
-  working: () => void;
-  idle: () => void;
-  taskCreated: (task: BackgroundTask) => void;
-  taskUpdated: (task: BackgroundTask) => void;
-  taskCompleted: (task: BackgroundTask) => void;
-  taskFailed: (task: BackgroundTask, error: string) => void;
-  autoClear: (data: { tokens: number; threshold: number }) => void;
-  autoCompact: (data: { tokens: number; threshold: number; prompt?: string }) => void;
-  cliInfoUpdated: (data: { version?: string; model?: string; accountType?: string; latestVersion?: string }) => void;
-  ralphLoopUpdate: (state: RalphTrackerState) => void;
-  ralphTodoUpdate: (todos: RalphTodoItem[]) => void;
-  ralphCompletionDetected: (phrase: string) => void;
-  ralphStatusBlockDetected: (block: import('../types.js').RalphStatusBlock) => void;
-  ralphCircuitBreakerUpdate: (status: import('../types.js').CircuitBreakerStatus) => void;
-  ralphExitGateMet: (data: { completionIndicators: number; exitSignal: boolean }) => void;
-  bashToolStart: (tool: ActiveBashTool) => void;
-  bashToolEnd: (tool: ActiveBashTool) => void;
-  bashToolsUpdate: (tools: ActiveBashTool[]) => void;
-}
-
 export class WebServer extends EventEmitter {
   private app: FastifyInstance;
   private sessions: Map<string, Session> = new Map();
@@ -208,41 +175,14 @@ export class WebServer extends EventEmitter {
   // Store session listener references for explicit cleanup (prevents memory leaks)
   private sessionListenerRefs: Map<string, SessionListenerRefs> = new Map();
   private scheduledRuns: Map<string, ScheduledRun> = new Map();
-  /**
-   * SSE clients mapped to their session subscription filter.
-   * Value is a Set of session IDs the client wants events for,
-   * or `null` meaning "receive all events" (backwards-compatible default).
-   */
-  private sseClients: Map<FastifyReply, Set<string> | null> = new Map();
-  /** SSE clients connecting from non-localhost (i.e. through tunnel) */
-  private remoteSseClients: Set<FastifyReply> = new Set();
-  /** Clients with backpressure — skip writes until 'drain' fires */
-  private backpressuredClients: Set<FastifyReply> = new Set();
+  private sse: SseStreamManager;
   private store = getStore();
   private port: number;
   private https: boolean;
   private testMode: boolean;
   private mux: TerminalMultiplexer;
-  // Terminal batching for performance
-  private terminalBatches: Map<string, string[]> = new Map();
-  private terminalBatchSizes: Map<string, number> = new Map(); // Running total avoids O(n) reduce per push
-  private terminalBatchTimers: Map<string, NodeJS.Timeout> = new Map(); // Per-session timers (staggered flushes)
-  // Adaptive batching: track rapid events to extend batch window (per-session)
-  // StaleExpirationMap auto-cleans entries for sessions that stop generating output
-  private lastTerminalEventTime: StaleExpirationMap<string, number> = new StaleExpirationMap({
-    ttlMs: INACTIVITY_TIMEOUT_MS, // 5 minutes - auto-expire stale session timing data
-    refreshOnGet: false, // Don't refresh on reads, only on explicit sets
-  });
   // Centralized cleanup for standalone timers (intervals + resettable timeouts)
   private cleanup = new CleanupManager();
-  // SSE event batching
-  private taskUpdateBatches: Map<string, { sessionId: string; task: BackgroundTask }> = new Map();
-  private taskUpdateBatchTimerId: string | null = null;
-  // State update batching (reduce expensive toDetailedState() serialization)
-  private stateUpdatePending: Set<string> = new Set();
-  private stateUpdateTimerId: string | null = null;
-  // Flag to prevent new timers during shutdown
-  private _isStopping: boolean = false;
   // Cached light state for SSE init (avoids rebuilding on every reconnect)
   private cachedLightState: { data: Record<string, unknown>; timestamp: number } | null = null;
   private static readonly LIGHT_STATE_CACHE_TTL_MS = 1000;
@@ -257,8 +197,6 @@ export class WebServer extends EventEmitter {
   // Active plan orchestrators (for cancellation via API)
   private activePlanOrchestrators: Map<string, PlanOrchestrator> = new Map();
   private persistDeb = new KeyedDebouncer(100);
-  // Grace period before starting restored respawn controllers (2 minutes)
-  private static readonly RESPAWN_RESTORE_GRACE_PERIOD_MS = 2 * 60 * 1000;
   // Stored listener handlers for cleanup
   private subagentWatcherHandlers: {
     discovered: (info: SubagentInfo) => void;
@@ -275,8 +213,6 @@ export class WebServer extends EventEmitter {
     error: (error: Error, sessionId?: string) => void;
   } | null = null;
   private tunnelManager: TunnelManager = new TunnelManager();
-  /** Cached tunnel active state — updated on TunnelStarted/TunnelStopped to avoid getUrl() on every broadcast */
-  private _isTunnelActive: boolean = false;
   private authSessions: StaleExpirationMap<string, import('./ports/auth-port.js').AuthSessionRecord> | null = null;
   private authFailures: StaleExpirationMap<string, number> | null = null;
   private qrAuthFailures: StaleExpirationMap<string, number> | null = null;
@@ -303,6 +239,15 @@ export class WebServer extends EventEmitter {
       this.app = Fastify({ logger: false });
     }
     this.mux = createMultiplexer();
+    this.sse = new SseStreamManager(
+      {
+        getSessionStateWithRespawn: (sessionId) => {
+          const session = this.sessions.get(sessionId);
+          return session ? this.getSessionStateWithRespawn(session) : null;
+        },
+      },
+      this.cleanup
+    );
 
     // Set up mux event listeners
     this.mux.on('sessionCreated', (session) => {
@@ -334,11 +279,11 @@ export class WebServer extends EventEmitter {
 
     // Set up tunnel manager listeners
     this.tunnelManager.on('started', (data: { url: string }) => {
-      this._isTunnelActive = true;
+      this.sse.setTunnelActive(true);
       this.broadcast(SseEvent.TunnelStarted, data);
     });
     this.tunnelManager.on('stopped', () => {
-      this._isTunnelActive = false;
+      this.sse.setTunnelActive(false);
       this.broadcast(SseEvent.TunnelStopped, {});
     });
     this.tunnelManager.on('error', (message: string) => {
@@ -507,7 +452,7 @@ export class WebServer extends EventEmitter {
       batchTerminalData: this.batchTerminalData.bind(this),
       broadcastSessionStateDebounced: this.broadcastSessionStateDebounced.bind(this),
       batchTaskUpdate: this.batchTaskUpdate.bind(this),
-      getSseClientCount: () => this.remoteSseClients.size,
+      getSseClientCount: () => this.sse.remoteClientCount,
       // RespawnPort
       respawnControllers: this.respawnControllers,
       respawnTimers: this.respawnTimers,
@@ -610,7 +555,7 @@ export class WebServer extends EventEmitter {
     // SSE endpoint for real-time updates
     this.app.get('/api/events', (req, reply) => {
       // Enforce SSE client limit to prevent memory exhaustion from too many connections
-      if (this.sseClients.size >= MAX_SSE_CLIENTS) {
+      if (this.sse.clientCount >= MAX_SSE_CLIENTS) {
         reply.code(503).send('Too many SSE connections');
         return;
       }
@@ -637,32 +582,21 @@ export class WebServer extends EventEmitter {
         'X-Accel-Buffering': 'no', // Disable nginx buffering
       });
 
-      this.sseClients.set(reply, sessionFilter);
-
       // Track tunnel clients — cloudflared proxies locally so req.ip is always
       // 127.0.0.1; detect tunnel traffic via Cf-Connecting-Ip header instead.
-      if (req.headers['cf-connecting-ip']) {
-        this.remoteSseClients.add(reply);
-      }
+      const isRemote = !!req.headers['cf-connecting-ip'];
+      this.sse.addClient(reply, sessionFilter, isRemote);
 
       // Send initial state
       // Use light state for SSE init to avoid sending 2MB+ terminal buffers
       // Buffers are fetched on-demand when switching tabs
-      this.sendSSE(reply, SseEvent.Init, this.getLightState());
+      this.sse.sendSSE(reply, SseEvent.Init, this.getLightState());
       // Flush Cloudflare tunnel buffer with padding — ensures the init event
       // (and any immediately following events) are delivered without proxy delay.
-      if (this._isTunnelActive) {
-        try {
-          reply.raw.write(SSE_PADDING);
-        } catch {
-          /* client gone */
-        }
-      }
+      this.sse.sendPadding(reply);
 
       req.raw.on('close', () => {
-        this.sseClients.delete(reply);
-        this.remoteSseClients.delete(reply);
-        this.backpressuredClients.delete(reply);
+        this.sse.removeClient(reply);
       });
     });
 
@@ -818,33 +752,8 @@ export class WebServer extends EventEmitter {
     this.store.setSession(session.id, state);
   }
 
-  // Helper to save respawn config to mux session for persistence
   private saveRespawnConfig(sessionId: string, config: RespawnConfig, durationMinutes?: number): void {
-    const persistedConfig: PersistedRespawnConfig = {
-      enabled: config.enabled,
-      idleTimeoutMs: config.idleTimeoutMs,
-      updatePrompt: config.updatePrompt,
-      interStepDelayMs: config.interStepDelayMs,
-      sendClear: config.sendClear,
-      sendInit: config.sendInit,
-      kickstartPrompt: config.kickstartPrompt,
-      autoAcceptPrompts: config.autoAcceptPrompts,
-      autoAcceptDelayMs: config.autoAcceptDelayMs,
-      completionConfirmMs: config.completionConfirmMs,
-      noOutputTimeoutMs: config.noOutputTimeoutMs,
-      aiIdleCheckEnabled: config.aiIdleCheckEnabled,
-      aiIdleCheckModel: config.aiIdleCheckModel,
-      aiIdleCheckMaxContext: config.aiIdleCheckMaxContext,
-      aiIdleCheckTimeoutMs: config.aiIdleCheckTimeoutMs,
-      aiIdleCheckCooldownMs: config.aiIdleCheckCooldownMs,
-      aiPlanCheckEnabled: config.aiPlanCheckEnabled,
-      aiPlanCheckModel: config.aiPlanCheckModel,
-      aiPlanCheckMaxContext: config.aiPlanCheckMaxContext,
-      aiPlanCheckTimeoutMs: config.aiPlanCheckTimeoutMs,
-      aiPlanCheckCooldownMs: config.aiPlanCheckCooldownMs,
-      durationMinutes,
-    };
-    this.mux.updateRespawnConfig(sessionId, persistedConfig);
+    saveRespawnConfig(sessionId, config, this.mux, durationMinutes);
   }
 
   // Clean up all resources associated with a session
@@ -933,16 +842,7 @@ export class WebServer extends EventEmitter {
     this.persistDeb.cancelKey(sessionId);
 
     // Clear batches, per-session timers, and pending state updates
-    this.terminalBatches.delete(sessionId);
-    this.terminalBatchSizes.delete(sessionId);
-    const batchTimer = this.terminalBatchTimers.get(sessionId);
-    if (batchTimer) {
-      clearTimeout(batchTimer);
-      this.terminalBatchTimers.delete(sessionId);
-    }
-    this.taskUpdateBatches.delete(sessionId);
-    this.stateUpdatePending.delete(sessionId);
-    this.lastTerminalEventTime.delete(sessionId);
+    this.sse.cleanupSessionBatches(sessionId);
 
     // Reset Ralph tracker on the session before cleanup
     if (session) {
@@ -994,31 +894,7 @@ export class WebServer extends EventEmitter {
       // Explicitly remove stored listeners to break closure references (prevents memory leak)
       const listeners = this.sessionListenerRefs.get(sessionId);
       if (listeners) {
-        session.off('terminal', listeners.terminal);
-        session.off('clearTerminal', listeners.clearTerminal);
-        session.off('needsRefresh', listeners.needsRefresh);
-        session.off('message', listeners.message);
-        session.off('error', listeners.error);
-        session.off('completion', listeners.completion);
-        session.off('exit', listeners.exit);
-        session.off('working', listeners.working);
-        session.off('idle', listeners.idle);
-        session.off('taskCreated', listeners.taskCreated);
-        session.off('taskUpdated', listeners.taskUpdated);
-        session.off('taskCompleted', listeners.taskCompleted);
-        session.off('taskFailed', listeners.taskFailed);
-        session.off('autoClear', listeners.autoClear);
-        session.off('autoCompact', listeners.autoCompact);
-        session.off('cliInfoUpdated', listeners.cliInfoUpdated);
-        session.off('ralphLoopUpdate', listeners.ralphLoopUpdate);
-        session.off('ralphTodoUpdate', listeners.ralphTodoUpdate);
-        session.off('ralphCompletionDetected', listeners.ralphCompletionDetected);
-        session.off('ralphStatusBlockDetected', listeners.ralphStatusBlockDetected);
-        session.off('ralphCircuitBreakerUpdate', listeners.ralphCircuitBreakerUpdate);
-        session.off('ralphExitGateMet', listeners.ralphExitGateMet);
-        session.off('bashToolStart', listeners.bashToolStart);
-        session.off('bashToolEnd', listeners.bashToolEnd);
-        session.off('bashToolsUpdate', listeners.bashToolsUpdate);
+        detachSessionListeners(session, listeners);
         this.sessionListenerRefs.delete(sessionId);
       }
 
@@ -1055,609 +931,87 @@ export class WebServer extends EventEmitter {
       imageWatcher.watchSession(session.id, session.workingDir);
     }
 
-    // Store all listener references for explicit cleanup on session delete.
-    // This prevents memory leaks from closure references keeping objects alive.
-    const listeners: SessionListenerRefs = {
-      // ─── Terminal Output ─────────────────────────────────────
-      // These listeners handle raw PTY output streaming to SSE clients.
-
-      /** Batches PTY output → broadcasts `session:terminal` at 16-50ms intervals */
-      terminal: (data) => {
-        this.batchTerminalData(session.id, data);
-      },
-
-      /** Broadcasts `session:clearTerminal` — tells clients to wipe their xterm buffer (after mux attach) */
-      clearTerminal: () => {
-        this.broadcast(SseEvent.SessionClearTerminal, { id: session.id });
-      },
-
-      /** Broadcasts `session:needsRefresh` — tells clients to reload buffer (e.g., after OpenCode TUI stabilizes) */
-      needsRefresh: () => {
-        this.broadcast(SseEvent.SessionNeedsRefresh, { id: session.id });
-      },
-
-      // ─── Session Messages & Errors ──────────────────────────
-
-      /** Broadcasts `session:message` — structured Claude JSON messages (assistant, tool_use, etc.) */
-      message: (msg: ClaudeMessage) => {
-        this.broadcast(SseEvent.SessionMessage, { id: session.id, message: msg });
-      },
-
-      /** Broadcasts `session:error` + sends push notification */
-      error: (error) => {
-        this.broadcast(SseEvent.SessionError, { id: session.id, error });
-        this.sendPushNotifications(SseEvent.SessionError, {
-          sessionId: session.id,
-          sessionName: session.name,
-          error: String(error),
-        });
-        const tracker = this.runSummaryTrackers.get(session.id);
-        if (tracker) tracker.recordError('Session error', String(error));
-      },
-
-      /** Broadcasts `session:completion` + `session:updated` — prompt finished, persists state */
-      completion: (result, cost) => {
-        this.broadcast(SseEvent.SessionCompletion, { id: session.id, result, cost });
-        this.broadcast(SseEvent.SessionUpdated, this.getSessionStateWithRespawn(session));
-        this.persistSessionState(session);
-        const tracker = this.runSummaryTrackers.get(session.id);
-        if (tracker) tracker.recordTokens(session.inputTokens, session.outputTokens);
-      },
-
-      // ─── Session Lifecycle ──────────────────────────────────
-
-      /** Broadcasts `session:exit` + `session:updated` — PTY process exited; cleans up respawn, timers, listeners */
-      exit: (code) => {
-        getLifecycleLog().log({
-          event: 'exit',
-          sessionId: session.id,
-          name: session.name,
-          exitCode: code,
-        });
-        // Wrap in try/catch to ensure cleanup always happens
-        try {
-          this.broadcast(SseEvent.SessionExit, { id: session.id, code });
-          this.broadcast(SseEvent.SessionUpdated, this.getSessionStateWithRespawn(session));
-          this.persistSessionState(session);
-        } catch (err) {
-          console.error(`[Server] Error broadcasting session exit for ${session.id}:`, err);
-        }
-
-        // Always clean up respawn controller, even if broadcast failed
-        try {
-          const controller = this.respawnControllers.get(session.id);
-          if (controller) {
-            controller.stop();
-            controller.removeAllListeners();
-            this.respawnControllers.delete(session.id);
-          }
-          // Also clean up the respawn timer to prevent orphaned timers
-          const timerInfo = this.respawnTimers.get(session.id);
-          if (timerInfo) {
-            clearTimeout(timerInfo.timer);
-            this.respawnTimers.delete(session.id);
-          }
-        } catch (err) {
-          console.error(`[Server] Error cleaning up respawn controller for ${session.id}:`, err);
-        }
-
-        // Clean up per-session resources that are stale after PTY exit.
-        // These are only cleaned by cleanupSession() on explicit delete,
-        // so without this they leak when a session exits without deletion.
-        try {
-          // Transcript watcher is tied to the specific PTY run
-          this.stopTranscriptWatcher(session.id);
-
-          // Finalize run summary tracker
-          const summaryTracker = this.runSummaryTrackers.get(session.id);
-          if (summaryTracker) {
-            summaryTracker.recordSessionStopped();
-            summaryTracker.stop();
-            this.runSummaryTrackers.delete(session.id);
-          }
-
-          // Flush/clear terminal batching state (no more output coming)
-          this.terminalBatches.delete(session.id);
-          this.terminalBatchSizes.delete(session.id);
-          const batchTimer = this.terminalBatchTimers.get(session.id);
-          if (batchTimer) {
-            clearTimeout(batchTimer);
-            this.terminalBatchTimers.delete(session.id);
-          }
-          this.taskUpdateBatches.delete(session.id);
-          this.stateUpdatePending.delete(session.id);
-          this.lastTerminalEventTime.delete(session.id);
-
-          // Clear pending persist-debounce timer
-          this.persistDeb.cancelKey(session.id);
-
-          // Close any active file streams
-          fileStreamManager.closeSessionStreams(session.id);
-
-          // Remove stored listener refs to break closure references (prevents memory leak).
-          // Without this, the closures capture the Session object (including up to 2MB terminal buffer)
-          // and keep it alive even after the PTY exits.
-          const listenerRefs = this.sessionListenerRefs.get(session.id);
-          if (listenerRefs) {
-            session.off('terminal', listenerRefs.terminal);
-            session.off('clearTerminal', listenerRefs.clearTerminal);
-            session.off('needsRefresh', listenerRefs.needsRefresh);
-            session.off('message', listenerRefs.message);
-            session.off('error', listenerRefs.error);
-            session.off('completion', listenerRefs.completion);
-            session.off('exit', listenerRefs.exit);
-            session.off('working', listenerRefs.working);
-            session.off('idle', listenerRefs.idle);
-            session.off('taskCreated', listenerRefs.taskCreated);
-            session.off('taskUpdated', listenerRefs.taskUpdated);
-            session.off('taskCompleted', listenerRefs.taskCompleted);
-            session.off('taskFailed', listenerRefs.taskFailed);
-            session.off('autoClear', listenerRefs.autoClear);
-            session.off('autoCompact', listenerRefs.autoCompact);
-            session.off('cliInfoUpdated', listenerRefs.cliInfoUpdated);
-            session.off('ralphLoopUpdate', listenerRefs.ralphLoopUpdate);
-            session.off('ralphTodoUpdate', listenerRefs.ralphTodoUpdate);
-            session.off('ralphCompletionDetected', listenerRefs.ralphCompletionDetected);
-            session.off('ralphStatusBlockDetected', listenerRefs.ralphStatusBlockDetected);
-            session.off('ralphCircuitBreakerUpdate', listenerRefs.ralphCircuitBreakerUpdate);
-            session.off('ralphExitGateMet', listenerRefs.ralphExitGateMet);
-            session.off('bashToolStart', listenerRefs.bashToolStart);
-            session.off('bashToolEnd', listenerRefs.bashToolEnd);
-            session.off('bashToolsUpdate', listenerRefs.bashToolsUpdate);
-            this.sessionListenerRefs.delete(session.id);
-          }
-        } catch (err) {
-          console.error(`[Server] Error cleaning up session resources on exit for ${session.id}:`, err);
-        }
-      },
-
-      // ─── Activity State ─────────────────────────────────────
-
-      /** Broadcasts `session:working` — Claude started processing */
-      working: () => {
-        this.broadcast(SseEvent.SessionWorking, { id: session.id });
-        const tracker = this.runSummaryTrackers.get(session.id);
-        if (tracker) {
-          tracker.recordWorking();
-          tracker.recordTokens(session.inputTokens, session.outputTokens);
-        }
-      },
-
-      /** Broadcasts `session:idle` — Claude finished processing, waiting for input */
-      idle: () => {
-        this.broadcast(SseEvent.SessionIdle, { id: session.id });
-        this.broadcastSessionStateDebounced(session.id);
-        const tracker = this.runSummaryTrackers.get(session.id);
-        if (tracker) {
-          tracker.recordIdle();
-          tracker.recordTokens(session.inputTokens, session.outputTokens);
-        }
-      },
-
-      // ─── Background Task Events ──────────────────────────────
-      // Debounced state updates to reduce serialization overhead.
-
-      /** Broadcasts `task:created` — new background task discovered */
-      taskCreated: (task: BackgroundTask) => {
-        this.broadcast(SseEvent.TaskCreated, { sessionId: session.id, task });
-        this.broadcastSessionStateDebounced(session.id);
-      },
-
-      /** Batched broadcast of `task:updated` — high-frequency progress updates */
-      taskUpdated: (task: BackgroundTask) => {
-        this.batchTaskUpdate(session.id, task);
-      },
-
-      /** Broadcasts `task:completed` — background task finished successfully */
-      taskCompleted: (task: BackgroundTask) => {
-        this.broadcast(SseEvent.TaskCompleted, { sessionId: session.id, task });
-        this.broadcastSessionStateDebounced(session.id);
-      },
-
-      /** Broadcasts `task:failed` — background task errored */
-      taskFailed: (task: BackgroundTask, error: string) => {
-        this.broadcast(SseEvent.TaskFailed, { sessionId: session.id, task, error });
-        this.broadcastSessionStateDebounced(session.id);
-      },
-
-      // ─── Auto-Operations ────────────────────────────────────
-
-      /** Broadcasts `session:autoClear` — context window auto-cleared at token threshold */
-      autoClear: (data: { tokens: number; threshold: number }) => {
-        this.broadcast(SseEvent.SessionAutoClear, { sessionId: session.id, ...data });
-        this.broadcastSessionStateDebounced(session.id);
-        const tracker = this.runSummaryTrackers.get(session.id);
-        if (tracker) tracker.recordAutoClear(data.tokens, data.threshold);
-      },
-
-      /** Broadcasts `session:autoCompact` — context window auto-compacted at token threshold */
-      autoCompact: (data: { tokens: number; threshold: number; prompt?: string }) => {
-        this.broadcast(SseEvent.SessionAutoCompact, { sessionId: session.id, ...data });
-        this.broadcastSessionStateDebounced(session.id);
-        const tracker = this.runSummaryTrackers.get(session.id);
-        if (tracker) tracker.recordAutoCompact(data.tokens, data.threshold);
-      },
-
-      // ─── CLI Info ────────────────────────────────────────────
-
-      /** Broadcasts `session:cliInfo` — Claude Code version, model, account type parsed from terminal */
-      cliInfoUpdated: (data: { version?: string; model?: string; accountType?: string; latestVersion?: string }) => {
-        this.broadcast(SseEvent.SessionCliInfo, { sessionId: session.id, ...data });
-        this.broadcastSessionStateDebounced(session.id);
-      },
-
-      // ─── Ralph Tracking Events ──────────────────────────────
-
-      /** Broadcasts `session:ralphLoopUpdate` — Ralph tracker loop state changed (iteration, phase) */
-      ralphLoopUpdate: (state: RalphTrackerState) => {
-        this.broadcast(SseEvent.SessionRalphLoopUpdate, { sessionId: session.id, state });
-        this.store.updateRalphState(session.id, { loop: state });
-      },
-
-      /** Broadcasts `session:ralphTodoUpdate` — todo items added, completed, or modified */
-      ralphTodoUpdate: (todos: RalphTodoItem[]) => {
-        this.broadcast(SseEvent.SessionRalphTodoUpdate, { sessionId: session.id, todos });
-        this.store.updateRalphState(session.id, { todos });
-      },
-
-      /** Broadcasts `session:ralphCompletionDetected` + push notification — completion phrase matched */
-      ralphCompletionDetected: (phrase: string) => {
-        this.broadcast(SseEvent.SessionRalphCompletionDetected, { sessionId: session.id, phrase });
-        this.sendPushNotifications(SseEvent.SessionRalphCompletionDetected, {
-          sessionId: session.id,
-          sessionName: session.name,
-          phrase,
-        });
-        const tracker = this.runSummaryTrackers.get(session.id);
-        if (tracker) tracker.recordRalphCompletion(phrase);
-      },
-
-      /** Broadcasts `session:ralphStatusUpdate` — RALPH_STATUS block parsed from output */
-      ralphStatusBlockDetected: (block: import('../types.js').RalphStatusBlock) => {
-        this.broadcast(SseEvent.SessionRalphStatusUpdate, { sessionId: session.id, block });
-        const tracker = this.runSummaryTrackers.get(session.id);
-        if (tracker) {
-          tracker.addEvent(
-            block.status === 'BLOCKED' ? 'warning' : 'idle_detected',
-            block.status === 'BLOCKED' ? 'warning' : 'info',
-            `Ralph Status: ${block.status}`,
-            `Tasks: ${block.tasksCompletedThisLoop}, Files: ${block.filesModified}, Tests: ${block.testsStatus}`
-          );
-        }
-      },
-
-      /** Broadcasts `session:circuitBreakerUpdate` — circuit breaker state changed (CLOSED/HALF_OPEN/OPEN) */
-      ralphCircuitBreakerUpdate: (status: import('../types.js').CircuitBreakerStatus) => {
-        this.broadcast(SseEvent.SessionCircuitBreakerUpdate, { sessionId: session.id, status });
-        const tracker = this.runSummaryTrackers.get(session.id);
-        if (tracker && status.state === 'OPEN') {
-          tracker.addEvent('warning', 'warning', 'Circuit Breaker Opened', status.reason);
-        }
-      },
-
-      /** Broadcasts `session:exitGateMet` — all completion indicators met, ready to exit */
-      ralphExitGateMet: (data: { completionIndicators: number; exitSignal: boolean }) => {
-        this.broadcast(SseEvent.SessionExitGateMet, { sessionId: session.id, ...data });
-        const tracker = this.runSummaryTrackers.get(session.id);
-        if (tracker) {
-          tracker.addEvent(
-            'ralph_completion',
-            'success',
-            'Exit Gate Met',
-            `Indicators: ${data.completionIndicators}, EXIT_SIGNAL: ${data.exitSignal}`
-          );
-        }
-      },
-
-      // ─── Bash Tool Tracking ────────────────────────────────
-      // Used for clickable file paths in the UI.
-
-      /** Broadcasts `session:bashToolStart` — bash tool invocation started */
-      bashToolStart: (tool: ActiveBashTool) => {
-        this.broadcast(SseEvent.SessionBashToolStart, { sessionId: session.id, tool });
-      },
-
-      /** Broadcasts `session:bashToolEnd` — bash tool invocation completed */
-      bashToolEnd: (tool: ActiveBashTool) => {
-        this.broadcast(SseEvent.SessionBashToolEnd, { sessionId: session.id, tool });
-      },
-
-      /** Broadcasts `session:bashToolsUpdate` — full active bash tools list refreshed */
-      bashToolsUpdate: (tools: ActiveBashTool[]) => {
-        this.broadcast(SseEvent.SessionBashToolsUpdate, { sessionId: session.id, tools });
-      },
-    };
-
-    // Store listener refs for cleanup
+    // Create and attach all listener handlers via dependency injection
+    const listeners = createSessionListeners(session, this.buildSessionListenerDeps());
     this.sessionListenerRefs.set(session.id, listeners);
-
-    // Attach all listeners to the session
-    session.on('terminal', listeners.terminal);
-    session.on('clearTerminal', listeners.clearTerminal);
-    session.on('needsRefresh', listeners.needsRefresh);
-    session.on('message', listeners.message);
-    session.on('error', listeners.error);
-    session.on('completion', listeners.completion);
-    session.on('exit', listeners.exit);
-    session.on('working', listeners.working);
-    session.on('idle', listeners.idle);
-    session.on('taskCreated', listeners.taskCreated);
-    session.on('taskUpdated', listeners.taskUpdated);
-    session.on('taskCompleted', listeners.taskCompleted);
-    session.on('taskFailed', listeners.taskFailed);
-    session.on('autoClear', listeners.autoClear);
-    session.on('autoCompact', listeners.autoCompact);
-    session.on('cliInfoUpdated', listeners.cliInfoUpdated);
-    session.on('ralphLoopUpdate', listeners.ralphLoopUpdate);
-    session.on('ralphTodoUpdate', listeners.ralphTodoUpdate);
-    session.on('ralphCompletionDetected', listeners.ralphCompletionDetected);
-    session.on('ralphStatusBlockDetected', listeners.ralphStatusBlockDetected);
-    session.on('ralphCircuitBreakerUpdate', listeners.ralphCircuitBreakerUpdate);
-    session.on('ralphExitGateMet', listeners.ralphExitGateMet);
-    session.on('bashToolStart', listeners.bashToolStart);
-    session.on('bashToolEnd', listeners.bashToolEnd);
-    session.on('bashToolsUpdate', listeners.bashToolsUpdate);
+    attachSessionListeners(session, listeners);
   }
 
-  private setupRespawnListeners(sessionId: string, controller: RespawnController): void {
-    // Wire team watcher for team-aware idle detection
-    controller.setTeamWatcher(this.teamWatcher);
-
-    // Helper to get tracker lazily (may not exist at setup time for restored sessions)
-    const getTracker = () => this.runSummaryTrackers.get(sessionId);
-
-    // ─── Respawn State Machine ──────────────────────────────
-
-    /** Broadcasts `respawn:stateChanged` — state machine transition (e.g., IDLE → DETECTING → RESPAWNING) */
-    controller.on('stateChanged', (state: RespawnState, prevState: RespawnState) => {
-      this.broadcast(SseEvent.RespawnStateChanged, { sessionId, state, prevState });
-      const tracker = getTracker();
-      if (tracker) tracker.recordStateChange(state, `${prevState} → ${state}`);
-    });
-
-    // ─── Respawn Cycle Lifecycle ────────────────────────────
-
-    /** Broadcasts `respawn:cycleStarted` — new respawn cycle begins */
-    controller.on('respawnCycleStarted', (cycleNumber: number) => {
-      this.broadcast(SseEvent.RespawnCycleStarted, { sessionId, cycleNumber });
-    });
-
-    /** Broadcasts `respawn:cycleCompleted` — respawn cycle finished */
-    controller.on('respawnCycleCompleted', (cycleNumber: number) => {
-      this.broadcast(SseEvent.RespawnCycleCompleted, { sessionId, cycleNumber });
-    });
-
-    /** Broadcasts `respawn:blocked` + push notification — respawn blocked by error/circuit breaker */
-    controller.on('respawnBlocked', (data: { reason: string; details: string }) => {
-      this.broadcast(SseEvent.RespawnBlocked, { sessionId, reason: data.reason, details: data.details });
-      const sessionForPush = this.sessions.get(sessionId);
-      this.sendPushNotifications(SseEvent.RespawnBlocked, {
-        sessionId,
-        sessionName: sessionForPush?.name ?? sessionId.slice(0, 8),
-        reason: data.reason,
-      });
-      const tracker = getTracker();
-      if (tracker) tracker.recordWarning(`Respawn blocked: ${data.reason}`, data.details);
-    });
-
-    // ─── Respawn Step Progress ──────────────────────────────
-
-    /** Broadcasts `respawn:stepSent` — respawn step input sent (e.g., /clear, kickstart prompt) */
-    controller.on('stepSent', (step: string, input: string) => {
-      this.broadcast(SseEvent.RespawnStepSent, { sessionId, step, input });
-    });
-
-    /** Broadcasts `respawn:stepCompleted` — respawn step finished */
-    controller.on('stepCompleted', (step: string) => {
-      this.broadcast(SseEvent.RespawnStepCompleted, { sessionId, step });
-    });
-
-    /** Broadcasts `respawn:detectionUpdate` — idle/completion detection state changed */
-    controller.on('detectionUpdate', (detection: unknown) => {
-      this.broadcast(SseEvent.RespawnDetectionUpdate, { sessionId, detection });
-    });
-
-    /** Broadcasts `respawn:autoAcceptSent` — auto-accepted a permission prompt */
-    controller.on('autoAcceptSent', () => {
-      this.broadcast(SseEvent.RespawnAutoAcceptSent, { sessionId });
-    });
-
-    // ─── AI Checker Events ──────────────────────────────────
-
-    /** Broadcasts `respawn:aiCheckStarted` — AI idle checker invoked */
-    controller.on('aiCheckStarted', () => {
-      this.broadcast(SseEvent.RespawnAiCheckStarted, { sessionId });
-    });
-
-    /** Broadcasts `respawn:aiCheckCompleted` — AI idle check returned verdict (idle/working/stuck) */
-    controller.on('aiCheckCompleted', (result: { verdict: string; reasoning: string; durationMs: number }) => {
-      this.broadcast(SseEvent.RespawnAiCheckCompleted, {
-        sessionId,
-        verdict: result.verdict,
-        reasoning: result.reasoning,
-        durationMs: result.durationMs,
-      });
-      const tracker = getTracker();
-      if (tracker) tracker.recordAiCheckResult(result.verdict);
-    });
-
-    /** Broadcasts `respawn:aiCheckFailed` — AI idle check errored */
-    controller.on('aiCheckFailed', (error: string) => {
-      this.broadcast(SseEvent.RespawnAiCheckFailed, { sessionId, error });
-      const tracker = getTracker();
-      if (tracker) tracker.recordError('AI check failed', error);
-    });
-
-    /** Broadcasts `respawn:aiCheckCooldown` — AI check on cooldown after failure */
-    controller.on('aiCheckCooldown', (active: boolean, endsAt: number | null) => {
-      this.broadcast(SseEvent.RespawnAiCheckCooldown, { sessionId, active, endsAt });
-    });
-
-    // ─── Plan Checker Events ────────────────────────────────
-
-    /** Broadcasts `respawn:planCheckStarted` — AI plan completion checker invoked */
-    controller.on('planCheckStarted', () => {
-      this.broadcast(SseEvent.RespawnPlanCheckStarted, { sessionId });
-    });
-
-    /** Broadcasts `respawn:planCheckCompleted` — plan check returned verdict */
-    controller.on('planCheckCompleted', (result: { verdict: string; reasoning: string; durationMs: number }) => {
-      this.broadcast(SseEvent.RespawnPlanCheckCompleted, {
-        sessionId,
-        verdict: result.verdict,
-        reasoning: result.reasoning,
-        durationMs: result.durationMs,
-      });
-    });
-
-    /** Broadcasts `respawn:planCheckFailed` — plan check errored */
-    controller.on('planCheckFailed', (error: string) => {
-      this.broadcast(SseEvent.RespawnPlanCheckFailed, { sessionId, error });
-    });
-
-    // ─── Timer Events (UI countdown display) ────────────────
-
-    /** Broadcasts `respawn:timerStarted` — countdown timer started (idle, cooldown, etc.) */
-    controller.on('timerStarted', (timer) => {
-      this.broadcast(SseEvent.RespawnTimerStarted, { sessionId, timer });
-    });
-
-    /** Broadcasts `respawn:timerCancelled` — timer cancelled before expiry */
-    controller.on('timerCancelled', (timerName, reason) => {
-      this.broadcast(SseEvent.RespawnTimerCancelled, { sessionId, timerName, reason });
-    });
-
-    /** Broadcasts `respawn:timerCompleted` — timer expired */
-    controller.on('timerCompleted', (timerName) => {
-      this.broadcast(SseEvent.RespawnTimerCompleted, { sessionId, timerName });
-    });
-
-    // ─── Logging & Errors ───────────────────────────────────
-
-    /** Broadcasts `respawn:actionLog` — respawn action logged for audit/debugging */
-    controller.on('actionLog', (action) => {
-      this.broadcast(SseEvent.RespawnActionLog, { sessionId, action });
-    });
-
-    /** Broadcasts `respawn:log` — general respawn log message */
-    controller.on('log', (message: string) => {
-      this.broadcast(SseEvent.RespawnLog, { sessionId, message });
-    });
-
-    /** Broadcasts `respawn:error` — respawn controller error */
-    controller.on('error', (error: Error) => {
-      this.broadcast(SseEvent.RespawnError, { sessionId, error: error.message });
-      const tracker = getTracker();
-      if (tracker) tracker.recordError('Respawn error', error.message);
-    });
-  }
-
-  private setupTimedRespawn(sessionId: string, durationMinutes: number): void {
-    // Clear existing timer if any
-    const existing = this.respawnTimers.get(sessionId);
-    if (existing) {
-      clearTimeout(existing.timer);
-    }
-
-    const now = Date.now();
-    const endAt = now + durationMinutes * 60 * 1000;
-
-    const timer = setTimeout(
-      () => {
-        // Stop respawn when time is up
-        const controller = this.respawnControllers.get(sessionId);
+  /** Build the deps object for session listener wiring. */
+  private buildSessionListenerDeps() {
+    return {
+      broadcast: this.broadcast.bind(this),
+      batchTerminalData: this.batchTerminalData.bind(this),
+      batchTaskUpdate: this.batchTaskUpdate.bind(this),
+      broadcastSessionStateDebounced: this.broadcastSessionStateDebounced.bind(this),
+      sendPushNotifications: this.sendPushNotifications.bind(this),
+      persistSessionState: this.persistSessionState.bind(this),
+      getSessionStateWithRespawn: this.getSessionStateWithRespawn.bind(this),
+      getRunSummaryTracker: (id: string) => this.runSummaryTrackers.get(id),
+      stopTranscriptWatcher: this.stopTranscriptWatcher.bind(this),
+      cleanupSessionBatches: (id: string) => this.sse.cleanupSessionBatches(id),
+      cancelPersistDebounce: (id: string) => this.persistDeb.cancelKey(id),
+      removeRunSummaryTracker: (id: string) => {
+        const tracker = this.runSummaryTrackers.get(id);
+        if (tracker) {
+          tracker.recordSessionStopped();
+          tracker.stop();
+          this.runSummaryTrackers.delete(id);
+        }
+      },
+      removeSessionListenerRefs: (id: string) => {
+        const refs = this.sessionListenerRefs.get(id);
+        const sess = this.sessions.get(id);
+        if (refs && sess) {
+          detachSessionListeners(sess, refs);
+        }
+        this.sessionListenerRefs.delete(id);
+      },
+      cleanupRespawnOnExit: (id: string) => {
+        const controller = this.respawnControllers.get(id);
         if (controller) {
           controller.stop();
           controller.removeAllListeners();
-          this.respawnControllers.delete(sessionId);
-          this.broadcast(SseEvent.RespawnStopped, { sessionId, reason: 'duration_expired' });
+          this.respawnControllers.delete(id);
         }
-        this.respawnTimers.delete(sessionId);
-        // Update persisted state (respawn no longer active)
-        const session = this.sessions.get(sessionId);
-        if (session) {
-          this.persistSessionState(session);
+        const timerInfo = this.respawnTimers.get(id);
+        if (timerInfo) {
+          clearTimeout(timerInfo.timer);
+          this.respawnTimers.delete(id);
         }
       },
-      durationMinutes * 60 * 1000
-    );
-
-    this.respawnTimers.set(sessionId, { timer, endAt, startedAt: now });
-    this.broadcast(SseEvent.RespawnTimerStarted, { sessionId, durationMinutes, endAt, startedAt: now });
+      getStore: () => this.store,
+    };
   }
 
-  /**
-   * Restore a RespawnController from persisted configuration.
-   * Creates the controller, sets up listeners, but does NOT start it.
-   *
-   * @param session - The session to attach the controller to
-   * @param config - The persisted respawn configuration
-   * @param source - Source of the config for logging (e.g., 'state.json' or 'mux-sessions.json')
-   */
+  private setupRespawnListeners(sessionId: string, controller: RespawnController): void {
+    wireRespawnListeners(sessionId, controller, this.buildRespawnWiringDeps());
+  }
+
+  private setupTimedRespawn(sessionId: string, durationMinutes: number): void {
+    setupTimedRespawn(sessionId, durationMinutes, this.buildRespawnWiringDeps());
+  }
+
   private restoreRespawnController(session: Session, config: PersistedRespawnConfig, source: string): void {
-    const controller = new RespawnController(session, {
-      idleTimeoutMs: config.idleTimeoutMs,
-      updatePrompt: config.updatePrompt,
-      interStepDelayMs: config.interStepDelayMs,
-      enabled: true,
-      sendClear: config.sendClear,
-      sendInit: config.sendInit,
-      kickstartPrompt: config.kickstartPrompt,
-      completionConfirmMs: config.completionConfirmMs,
-      noOutputTimeoutMs: config.noOutputTimeoutMs,
-      autoAcceptPrompts: config.autoAcceptPrompts,
-      autoAcceptDelayMs: config.autoAcceptDelayMs,
-      aiIdleCheckEnabled: config.aiIdleCheckEnabled,
-      aiIdleCheckModel: config.aiIdleCheckModel,
-      aiIdleCheckMaxContext: config.aiIdleCheckMaxContext,
-      aiIdleCheckTimeoutMs: config.aiIdleCheckTimeoutMs,
-      aiIdleCheckCooldownMs: config.aiIdleCheckCooldownMs,
-      aiPlanCheckEnabled: config.aiPlanCheckEnabled,
-      aiPlanCheckModel: config.aiPlanCheckModel,
-      aiPlanCheckMaxContext: config.aiPlanCheckMaxContext,
-      aiPlanCheckTimeoutMs: config.aiPlanCheckTimeoutMs,
-      aiPlanCheckCooldownMs: config.aiPlanCheckCooldownMs,
-    });
+    restoreRespawnController(session, config, source, this.buildRespawnWiringDeps());
+  }
 
-    this.respawnControllers.set(session.id, controller);
-    this.setupRespawnListeners(session.id, controller);
-
-    // Calculate delay: wait until 2 minutes after server start before starting respawn
-    // This prevents false idle detection immediately after a server restart/rebuild
-    const timeSinceStart = Date.now() - this.serverStartTime;
-    const delayMs = Math.max(0, WebServer.RESPAWN_RESTORE_GRACE_PERIOD_MS - timeSinceStart);
-
-    if (delayMs > 0) {
-      console.log(
-        `[Server] Restored respawn controller for session ${session.id} from ${source} (will start in ${Math.ceil(delayMs / 1000)}s)`
-      );
-      const timer = setTimeout(() => {
-        this.pendingRespawnStarts.delete(session.id);
-        // Verify session still exists (may have been deleted during grace period)
-        if (!this.sessions.has(session.id)) {
-          console.log(`[Server] Skipping restored respawn start - session ${session.id} no longer exists`);
-          return;
-        }
-        // Double-check controller still exists and is stopped
-        const ctrl = this.respawnControllers.get(session.id);
-        if (ctrl && ctrl.state === 'stopped') {
-          ctrl.start();
-          this.broadcast(SseEvent.RespawnStarted, { sessionId: session.id });
-          console.log(`[Server] Restored respawn controller started for session ${session.id}`);
-        }
-      }, delayMs);
-      this.pendingRespawnStarts.set(session.id, timer);
-    } else {
-      // Grace period has passed, start immediately
-      controller.start();
-      console.log(
-        `[Server] Restored respawn controller for session ${session.id} from ${source} (started immediately)`
-      );
-    }
-
-    if (config.durationMinutes && config.durationMinutes > 0) {
-      this.setupTimedRespawn(session.id, config.durationMinutes);
-    }
+  private buildRespawnWiringDeps(): RespawnWiringDeps {
+    return {
+      broadcast: this.broadcast.bind(this),
+      sendPushNotifications: this.sendPushNotifications.bind(this),
+      persistSessionState: this.persistSessionState.bind(this),
+      getSession: (id) => this.sessions.get(id),
+      sessionExists: (id) => this.sessions.has(id),
+      getRunSummaryTracker: (id) => this.runSummaryTrackers.get(id),
+      getRespawnControllers: () => this.respawnControllers,
+      getRespawnTimers: () => this.respawnTimers,
+      getPendingRespawnStarts: () => this.pendingRespawnStarts,
+      teamWatcher: this.teamWatcher,
+      serverStartTime: this.serverStartTime,
+      respawnRestoreGracePeriodMs: 2 * 60 * 1000,
+      mux: this.mux,
+    };
   }
 
   // Helper to get custom CLAUDE.md template path from settings
@@ -1763,7 +1117,7 @@ export class WebServer extends EventEmitter {
       const failedRun = this.scheduledRuns.get(id);
       if (failedRun && failedRun.status === 'running') {
         failedRun.status = 'stopped';
-        failedRun.logs.push(`[${new Date().toISOString()}] Error: ${err instanceof Error ? err.message : String(err)}`);
+        failedRun.logs.push(`[${new Date().toISOString()}] Error: ${getErrorMessage(err)}`);
         this.broadcast(SseEvent.ScheduledStopped, { id, reason: 'error' });
       }
     });
@@ -1971,265 +1325,27 @@ export class WebServer extends EventEmitter {
     return result;
   }
 
-  private sendSSE(reply: FastifyReply, event: string, data: unknown): void {
-    try {
-      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-    } catch {
-      this.sseClients.delete(reply);
-      this.remoteSseClients.delete(reply);
-    }
-  }
-
-  // Optimized: send pre-formatted SSE message to a client
-  // Returns false if client is backpressured or dead
-  private sendSSEPreformatted(reply: FastifyReply, message: string): void {
-    // Skip backpressured clients to prevent unbounded memory growth.
-    // Terminal data dropped here is recovered via session:needsRefresh on drain.
-    if (this.backpressuredClients.has(reply)) return;
-
-    try {
-      const ok = reply.raw.write(message);
-      if (!ok) {
-        // Buffer is full — mark as backpressured, resume on drain
-        this.backpressuredClients.add(reply);
-        reply.raw.once('drain', () => {
-          this.backpressuredClients.delete(reply);
-          // Client may have missed terminal data during backpressure.
-          // Tell it to reload the active session's buffer to recover.
-          try {
-            const drainPadding = this._isTunnelActive ? SSE_PADDING : '';
-            reply.raw.write(`event: ${SseEvent.SessionNeedsRefresh}\ndata: {}\n\n${drainPadding}`);
-          } catch {
-            /* client gone */
-          }
-        });
-      }
-    } catch {
-      this.sseClients.delete(reply);
-      this.remoteSseClients.delete(reply);
-      this.backpressuredClients.delete(reply);
-    }
-  }
+  // ========== SSE Delegates (SseStreamManager) ==========
 
   private broadcast(event: string, data: unknown): void {
-    // Skip serialization entirely when no clients are listening
-    if (this.sseClients.size === 0) return;
-
-    // Invalidate caches only on structural changes (creation/deletion).
-    // SessionUpdated fires too frequently (working/idle transitions, completion)
-    // and makes the 1s TTL cache useless — the debounced session:updated follows
-    // within 500ms anyway, and these caches serve /api/sessions and SSE init
-    // which aren't polled rapidly.
+    // Invalidate caches on structural changes (creation/deletion)
     if (event === SseEvent.SessionCreated || event === SseEvent.SessionDeleted) {
       this.cachedLightState = null;
       this.cachedSessionsList = null;
     }
-    // Performance optimization: serialize JSON once for all clients.
-    // Only append Cloudflare tunnel padding for latency-sensitive events —
-    // Recovery events need immediate proxy flush; low-frequency metadata events
-    // (session:created, ralph:*, respawn:*, etc.) don't need padding.
-    // Note: session:terminal has its own padding in flushSessionTerminalBatch().
-    const needsPadding = this._isTunnelActive && event === SseEvent.SessionNeedsRefresh;
-    const padding = needsPadding ? SSE_PADDING : '';
-    let message: string;
-    try {
-      message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n` + padding;
-    } catch (err) {
-      // Handle circular references or non-serializable values
-      console.error(`[Server] Failed to serialize SSE event "${event}":`, err);
-      return;
-    }
-    // Extract sessionId from event data for subscription filtering.
-    const eventSessionId = this.extractSessionId(event, data);
-
-    for (const [client, filter] of this.sseClients) {
-      // No filter (null) = receive everything. Otherwise, skip if event is
-      // session-scoped and the session isn't in the client's subscription set.
-      if (filter && eventSessionId && !filter.has(eventSessionId)) continue;
-      this.sendSSEPreformatted(client, message);
-    }
+    this.sse.broadcast(event, data);
   }
 
-  /**
-   * Extract the session ID from an event's data payload for subscription filtering.
-   * Returns the sessionId string if the event is session-scoped, or null for global events.
-   */
-  private extractSessionId(event: string, data: unknown): string | null {
-    if (data == null || typeof data !== 'object') return null;
-    const record = data as Record<string, unknown>;
-
-    // Most session-scoped events use `sessionId`
-    if (typeof record.sessionId === 'string') return record.sessionId;
-
-    // Session lifecycle events (session:*) use `id` from the session state object
-    if (typeof record.id === 'string' && event.startsWith('session:')) return record.id;
-
-    // No session ID found — treat as global event (sent to all clients)
-    return null;
-  }
-
-  // Batch terminal data for better performance (60fps)
-  // Uses per-session timers with adaptive intervals to prevent thundering herd:
-  // each session flushes independently rather than all sessions flushing in one burst.
   private batchTerminalData(sessionId: string, data: string): void {
-    // Skip if server is stopping
-    if (this._isStopping) return;
-
-    let chunks = this.terminalBatches.get(sessionId);
-    if (!chunks) {
-      chunks = [];
-      this.terminalBatches.set(sessionId, chunks);
-    }
-    chunks.push(data);
-    const prevSize = this.terminalBatchSizes.get(sessionId) ?? 0;
-    const totalLength = prevSize + data.length;
-    this.terminalBatchSizes.set(sessionId, totalLength);
-
-    // Adaptive batching: detect rapid events and extend batch window (per-session)
-    const now = Date.now();
-    const lastEvent = this.lastTerminalEventTime.get(sessionId) ?? 0;
-    const eventGap = now - lastEvent;
-    this.lastTerminalEventTime.set(sessionId, now);
-
-    // Adjust batch interval based on event frequency (per-session)
-    // Rapid events (<10ms gap) = 50ms batch, moderate (<20ms) = 32ms, else 16ms
-    let sessionInterval: number;
-    if (eventGap > 0 && eventGap < 10) {
-      sessionInterval = 50;
-    } else if (eventGap > 0 && eventGap < 20) {
-      sessionInterval = 32;
-    } else {
-      sessionInterval = TERMINAL_BATCH_INTERVAL;
-    }
-
-    // Flush immediately if batch is large for responsiveness
-    if (totalLength > BATCH_FLUSH_THRESHOLD) {
-      const existingTimer = this.terminalBatchTimers.get(sessionId);
-      if (existingTimer) {
-        clearTimeout(existingTimer);
-        this.terminalBatchTimers.delete(sessionId);
-      }
-      this.flushSessionTerminalBatch(sessionId);
-      return;
-    }
-
-    // Start per-session batch timer if not already running
-    // Each session flushes independently — prevents one busy session from
-    // forcing all sessions to flush at its rate (thundering herd)
-    if (!this.terminalBatchTimers.has(sessionId)) {
-      this.terminalBatchTimers.set(
-        sessionId,
-        setTimeout(() => {
-          this.terminalBatchTimers.delete(sessionId);
-          this.flushSessionTerminalBatch(sessionId);
-        }, sessionInterval)
-      );
-    }
+    this.sse.batchTerminalData(sessionId, data);
   }
 
-  /** Flush a single session's batched terminal data */
-  private flushSessionTerminalBatch(sessionId: string): void {
-    if (this._isStopping) {
-      this.terminalBatches.delete(sessionId);
-      this.terminalBatchSizes.delete(sessionId);
-      return;
-    }
-    const chunks = this.terminalBatches.get(sessionId);
-    if (chunks && chunks.length > 0) {
-      // Join chunks only at flush time (avoids O(n^2) string concatenation in batchTerminalData)
-      const data = chunks.join('');
-      // xterm.js 6.0+ handles DEC 2026 synchronized output natively.
-      // Claude CLI (Ink) already emits its own DEC 2026 markers around redraws.
-      // Do NOT add an outer wrapper — DEC 2026 is not reference-counted, so
-      // the inner 2026l would prematurely exit sync mode, defeating the purpose.
-      // Fast path: build SSE message directly without JSON.stringify on wrapper object.
-      // Only the terminal data string needs escaping; sessionId is a UUID (safe to template).
-      const escapedData = JSON.stringify(data);
-      // Append tunnel padding for immediate Cloudflare proxy flush —
-      // terminal data is high-frequency and latency-sensitive.
-      const padding = this._isTunnelActive ? SSE_PADDING : '';
-      const message = `event: session:terminal\ndata: {"id":"${sessionId}","data":${escapedData}}\n\n` + padding;
-      for (const [client, filter] of this.sseClients) {
-        // Skip clients that have a session filter and aren't subscribed to this session
-        if (filter && !filter.has(sessionId)) continue;
-        this.sendSSEPreformatted(client, message);
-      }
-    }
-    this.terminalBatches.delete(sessionId);
-    this.terminalBatchSizes.delete(sessionId);
-  }
-
-  // Batch task:updated events at 100ms - only send latest update per task
-  // Key is sessionId:taskId to avoid collisions when multiple tasks update concurrently
   private batchTaskUpdate(sessionId: string, task: BackgroundTask): void {
-    // Skip if server is stopping
-    if (this._isStopping) return;
-
-    // Use composite key to avoid losing updates when multiple tasks update in same batch window
-    const key = `${sessionId}:${task.id}`;
-    this.taskUpdateBatches.set(key, { sessionId, task });
-
-    if (!this.taskUpdateBatchTimerId) {
-      this.taskUpdateBatchTimerId = this.cleanup.setTimeout(
-        () => {
-          this.taskUpdateBatchTimerId = null;
-          this.flushTaskUpdateBatches();
-        },
-        TASK_UPDATE_BATCH_INTERVAL,
-        { description: 'task update batch flush' }
-      );
-    }
+    this.sse.batchTaskUpdate(sessionId, task);
   }
 
-  private flushTaskUpdateBatches(): void {
-    // Skip if server is stopping (timer may have been queued before stop() was called)
-    if (this._isStopping) {
-      this.taskUpdateBatches.clear();
-      return;
-    }
-    for (const [, { sessionId, task }] of this.taskUpdateBatches) {
-      this.broadcast(SseEvent.TaskUpdated, { sessionId, task });
-    }
-    this.taskUpdateBatches.clear();
-  }
-
-  /**
-   * Debounce expensive session:updated broadcasts.
-   * Instead of calling toDetailedState() on every event, batch requests
-   * and only serialize once per STATE_UPDATE_DEBOUNCE_INTERVAL.
-   */
   private broadcastSessionStateDebounced(sessionId: string): void {
-    // Skip if server is stopping
-    if (this._isStopping) return;
-
-    this.stateUpdatePending.add(sessionId);
-
-    if (!this.stateUpdateTimerId) {
-      this.stateUpdateTimerId = this.cleanup.setTimeout(
-        () => {
-          this.stateUpdateTimerId = null;
-          this.flushStateUpdates();
-        },
-        STATE_UPDATE_DEBOUNCE_INTERVAL,
-        { description: 'state update debounce flush' }
-      );
-    }
-  }
-
-  private flushStateUpdates(): void {
-    // Skip if server is stopping (timer may have been queued before stop() was called)
-    if (this._isStopping) {
-      this.stateUpdatePending.clear();
-      return;
-    }
-    for (const sessionId of this.stateUpdatePending) {
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        // Single expensive serialization per batch interval
-        this.broadcast(SseEvent.SessionUpdated, this.getSessionStateWithRespawn(session));
-      }
-    }
-    this.stateUpdatePending.clear();
+    this.sse.broadcastSessionStateDebounced(sessionId);
   }
 
   // ========== Web Push ==========
@@ -2316,43 +1432,8 @@ export class WebServer extends EventEmitter {
     }
   }
 
-  /**
-   * Clean up dead SSE clients and send keep-alive comments.
-   * Keep-alive prevents proxy/load-balancer timeouts on idle connections.
-   * Dead client cleanup prevents memory leaks from abruptly terminated connections.
-   */
   private cleanupDeadSSEClients(): void {
-    const deadClients: FastifyReply[] = [];
-
-    for (const [client] of this.sseClients) {
-      try {
-        // Check if the underlying socket is still writable
-        const socket = client.raw.socket;
-        if (!socket || socket.destroyed || !socket.writable) {
-          deadClients.push(client);
-        } else {
-          // Send SSE comment as keep-alive. Only add padding when tunnel is
-          // active — it flushes Cloudflare proxy buffers but wastes bandwidth
-          // for direct/Tailscale connections.
-          const ka = this._isTunnelActive ? ':keepalive\n' + SSE_PADDING : ':keepalive\n\n';
-          client.raw.write(ka);
-        }
-      } catch {
-        // Error accessing socket means client is dead
-        deadClients.push(client);
-      }
-    }
-
-    // Remove dead clients
-    for (const client of deadClients) {
-      this.sseClients.delete(client);
-      this.remoteSseClients.delete(client);
-      this.backpressuredClients.delete(client);
-    }
-
-    if (deadClients.length > 0) {
-      console.log(`[Server] Cleaned up ${deadClients.length} dead SSE client(s)`);
-    }
+    this.sse.cleanupDeadClients();
   }
 
   /**
@@ -2726,35 +1807,14 @@ export class WebServer extends EventEmitter {
   async stop(): Promise<void> {
     getLifecycleLog().log({ event: 'server_stopped', sessionId: '*' });
     // Set stopping flag to prevent new timer creation during shutdown
-    this._isStopping = true;
+    this.sse.setStopping();
 
     // Dispose all managed timers (intervals + resettable timeouts)
     this.cleanup.dispose();
 
-    // Gracefully close all SSE connections before clearing
-    for (const [client] of this.sseClients) {
-      try {
-        // Send a final event to notify clients of shutdown
-        this.sendSSE(client, 'server:shutdown', { reason: 'Server stopping' });
-        client.raw.end();
-      } catch {
-        // Client may already be disconnected
-      }
-    }
-    this.sseClients.clear();
-    this.remoteSseClients.clear();
-    this.backpressuredClients.clear();
+    // Gracefully close all SSE connections and clear batching state
+    this.sse.stop();
 
-    // Clear per-session batch timers
-    for (const timer of this.terminalBatchTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.terminalBatchTimers.clear();
-    this.terminalBatches.clear();
-    this.terminalBatchSizes.clear();
-
-    this.taskUpdateBatches.clear();
-    this.stateUpdatePending.clear();
     this.lastRecordedTokens.clear();
 
     // Stop multiplexer and flush pending saves
@@ -2805,31 +1865,7 @@ export class WebServer extends EventEmitter {
       // Remove listeners to avoid spurious events during teardown
       const listeners = this.sessionListenerRefs.get(sessionId);
       if (listeners) {
-        session.off('terminal', listeners.terminal);
-        session.off('clearTerminal', listeners.clearTerminal);
-        session.off('needsRefresh', listeners.needsRefresh);
-        session.off('message', listeners.message);
-        session.off('error', listeners.error);
-        session.off('completion', listeners.completion);
-        session.off('exit', listeners.exit);
-        session.off('working', listeners.working);
-        session.off('idle', listeners.idle);
-        session.off('taskCreated', listeners.taskCreated);
-        session.off('taskUpdated', listeners.taskUpdated);
-        session.off('taskCompleted', listeners.taskCompleted);
-        session.off('taskFailed', listeners.taskFailed);
-        session.off('autoClear', listeners.autoClear);
-        session.off('autoCompact', listeners.autoCompact);
-        session.off('cliInfoUpdated', listeners.cliInfoUpdated);
-        session.off('ralphLoopUpdate', listeners.ralphLoopUpdate);
-        session.off('ralphTodoUpdate', listeners.ralphTodoUpdate);
-        session.off('ralphCompletionDetected', listeners.ralphCompletionDetected);
-        session.off('ralphStatusBlockDetected', listeners.ralphStatusBlockDetected);
-        session.off('ralphCircuitBreakerUpdate', listeners.ralphCircuitBreakerUpdate);
-        session.off('ralphExitGateMet', listeners.ralphExitGateMet);
-        session.off('bashToolStart', listeners.bashToolStart);
-        session.off('bashToolEnd', listeners.bashToolEnd);
-        session.off('bashToolsUpdate', listeners.bashToolsUpdate);
+        detachSessionListeners(session, listeners);
         this.sessionListenerRefs.delete(sessionId);
       }
       session.removeAllListeners();
@@ -2885,7 +1921,6 @@ export class WebServer extends EventEmitter {
     this.sessionListenerRefs.clear();
     this.scheduledRuns.clear();
     // Dispose StaleExpirationMaps (stops internal cleanup timers)
-    this.lastTerminalEventTime.dispose();
     if (this.authSessions) {
       this.authSessions.dispose();
       this.authSessions = null;
