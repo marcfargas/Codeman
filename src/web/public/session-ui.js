@@ -324,6 +324,8 @@ Object.assign(CodemanApp.prototype, {
         envOverrides.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = '1';
       }
       const hasEnvOverrides = Object.keys(envOverrides).length > 0;
+      const useOpus1m = caseSettings.opusContext1m || globalSettings.opusContext1mEnabled;
+      const modelOverride = useOpus1m ? 'opus[1m]' : '';
 
       // Step 1: Create all sessions in parallel
       this.terminal.writeln(`\x1b[90m Creating ${tabCount} session(s)...\x1b[0m`);
@@ -331,7 +333,11 @@ Object.assign(CodemanApp.prototype, {
         fetch('/api/sessions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ workingDir, name, ...(hasEnvOverrides ? { envOverrides } : {}) })
+          body: JSON.stringify({
+            workingDir, name,
+            ...(hasEnvOverrides ? { envOverrides } : {}),
+            ...(modelOverride !== undefined ? { modelOverride } : {}),
+          })
         }).then(r => r.json())
       );
       const createResults = await Promise.all(createPromises);
@@ -913,6 +919,7 @@ Object.assign(CodemanApp.prototype, {
       const caseName = document.getElementById('quickStartCase').value || 'testcase';
       const settings = this.getCaseSettings(caseName);
       document.getElementById('caseAgentTeams').checked = settings.agentTeams;
+      document.getElementById('caseOpusContext1m').checked = settings.opusContext1m;
       popover.classList.remove('hidden');
 
       // Close on outside click (one-shot listener)
@@ -934,7 +941,7 @@ Object.assign(CodemanApp.prototype, {
       const stored = localStorage.getItem('caseSettings_' + caseName);
       if (stored) return JSON.parse(stored);
     } catch { /* ignore */ }
-    return { agentTeams: false };
+    return { agentTeams: false, opusContext1m: false };
   },
 
   saveCaseSettings(caseName, settings) {
@@ -945,10 +952,13 @@ Object.assign(CodemanApp.prototype, {
     const caseName = document.getElementById('quickStartCase').value || 'testcase';
     const settings = this.getCaseSettings(caseName);
     settings.agentTeams = document.getElementById('caseAgentTeams').checked;
+    settings.opusContext1m = document.getElementById('caseOpusContext1m').checked;
     this.saveCaseSettings(caseName, settings);
-    // Sync mobile checkbox
+    // Sync mobile checkboxes
     const mobileCheckbox = document.getElementById('caseAgentTeamsMobile');
     if (mobileCheckbox) mobileCheckbox.checked = settings.agentTeams;
+    const mobileOpusCheckbox = document.getElementById('caseOpusContext1mMobile');
+    if (mobileOpusCheckbox) mobileOpusCheckbox.checked = settings.opusContext1m;
   },
 
   toggleCaseSettingsMobile() {
@@ -957,6 +967,7 @@ Object.assign(CodemanApp.prototype, {
       const caseName = document.getElementById('quickStartCase').value || 'testcase';
       const settings = this.getCaseSettings(caseName);
       document.getElementById('caseAgentTeamsMobile').checked = settings.agentTeams;
+      document.getElementById('caseOpusContext1mMobile').checked = settings.opusContext1m;
       popover.classList.remove('hidden');
 
       const closeHandler = (e) => {
@@ -975,10 +986,13 @@ Object.assign(CodemanApp.prototype, {
     const caseName = document.getElementById('quickStartCase').value || 'testcase';
     const settings = this.getCaseSettings(caseName);
     settings.agentTeams = document.getElementById('caseAgentTeamsMobile').checked;
+    settings.opusContext1m = document.getElementById('caseOpusContext1mMobile').checked;
     this.saveCaseSettings(caseName, settings);
-    // Sync desktop checkbox
+    // Sync desktop checkboxes
     const desktopCheckbox = document.getElementById('caseAgentTeams');
     if (desktopCheckbox) desktopCheckbox.checked = settings.agentTeams;
+    const desktopOpusCheckbox = document.getElementById('caseOpusContext1m');
+    if (desktopOpusCheckbox) desktopOpusCheckbox.checked = settings.opusContext1m;
   },
 
   // ═══════════════════════════════════════════════════════════════

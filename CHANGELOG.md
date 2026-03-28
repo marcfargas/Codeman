@@ -1,5 +1,11 @@
 # aicodeman
 
+## 0.5.5
+
+### Patch Changes
+
+- Add 1M Opus context quick setting — per-case and global toggle that writes `model: "opus[1m]"` to `.claude/settings.local.json` when creating new sessions. Fix mobile layout: banners (respawn, timer, orchestrator) between header and main content now visible by switching from margin-top on `.main` to padding-top on `.app`. Add tablet-optimized respawn banner styles and mobile phone banner refinements.
+
 ## 0.5.4
 
 ### Patch Changes

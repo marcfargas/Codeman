@@ -117,6 +117,34 @@ export async function updateCaseEnvVars(casePath: string, envVars: Record<string
 }
 
 /**
+ * Updates the `model` field in .claude/settings.local.json for the given case path.
+ * Pass a non-empty string to set, or empty/null to remove.
+ */
+export async function updateCaseModel(casePath: string, model: string | null): Promise<void> {
+  const claudeDir = join(casePath, '.claude');
+  if (!existsSync(claudeDir)) {
+    await mkdir(claudeDir, { recursive: true });
+  }
+
+  const settingsPath = join(claudeDir, 'settings.local.json');
+  let existing: Record<string, unknown> = {};
+
+  try {
+    existing = JSON.parse(await readFile(settingsPath, 'utf-8'));
+  } catch {
+    existing = {};
+  }
+
+  if (model) {
+    existing.model = model;
+  } else {
+    delete existing.model;
+  }
+
+  await writeFile(settingsPath, JSON.stringify(existing, null, 2) + '\n');
+}
+
+/**
  * Writes hooks config to .claude/settings.local.json in the given case path.
  * Merges with existing file content, only touching the `hooks` key.
  */

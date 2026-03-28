@@ -384,6 +384,11 @@
                 <span>Agent Teams</span>
               </label>
               <span class="form-hint">Enable experimental Agent Teams for new sessions in this case</span>
+              <label class="checkbox-inline" style="margin-top: 6px;">
+                <input type="checkbox" id="caseOpusContext1m" onchange="app.onCaseSettingChanged()">
+                <span>1M Opus Context</span>
+              </label>
+              <span class="form-hint">Use 1M token context window for new sessions</span>
             </div>
           </div>
           <!-- Mobile-only case button + gear -->
@@ -408,6 +413,11 @@
               <span>Agent Teams</span>
             </label>
             <span class="form-hint">Enable Agent Teams for new sessions</span>
+            <label class="checkbox-inline" style="margin-top: 6px;">
+              <input type="checkbox" id="caseOpusContext1mMobile" onchange="app.onCaseSettingChangedMobile()">
+              <span>1M Opus Context</span>
+            </label>
+            <span class="form-hint">Use 1M token context window</span>
           </div>
         </div>
 
@@ -1045,6 +1055,14 @@
                 <span class="slider"></span>
               </label>
               <span class="form-hint">Enable experimental Agent Teams for all new Claude sessions (disabled by default)</span>
+            </div>
+            <div class="form-row form-row-switch">
+              <label>1M Opus Context</label>
+              <label class="switch">
+                <input type="checkbox" id="appSettingsOpusContext1m">
+                <span class="slider"></span>
+              </label>
+              <span class="form-hint">Use 1M token context window (model: opus[1m]) for all new sessions</span>
             </div>
             <!-- Nice Priority Section -->
             <div class="form-section-header">Nice Priority</div>

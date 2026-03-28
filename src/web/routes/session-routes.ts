@@ -42,7 +42,7 @@ import {
   validatePathWithinBase,
 } from '../route-helpers.js';
 import { AUTH_COOKIE_NAME } from '../middleware/auth.js';
-import { writeHooksConfig, updateCaseEnvVars } from '../../hooks-config.js';
+import { writeHooksConfig, updateCaseEnvVars, updateCaseModel } from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { imageWatcher } from '../../image-watcher.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
@@ -164,6 +164,11 @@ export function registerSessionRoutes(
     // Write env overrides to .claude/settings.local.json if provided
     if (body.envOverrides && Object.keys(body.envOverrides).length > 0) {
       await updateCaseEnvVars(workingDir, body.envOverrides);
+    }
+
+    // Write model override to .claude/settings.local.json if provided
+    if (body.modelOverride !== undefined) {
+      await updateCaseModel(workingDir, body.modelOverride || null);
     }
 
     // Check OpenCode availability if requested

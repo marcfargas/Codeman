@@ -124,6 +124,8 @@ export const CreateSessionSchema = z.object({
   mode: z.enum(['claude', 'shell', 'opencode']).optional(),
   name: z.string().max(100).optional(),
   envOverrides: safeEnvOverridesSchema,
+  /** Model override to write to .claude/settings.local.json (e.g., "opus[1m]"). Empty string clears. */
+  modelOverride: z.string().max(50).optional(),
   openCodeConfig: OpenCodeConfigSchema,
   /** Resume a previous Claude conversation by its session ID (used for reboot recovery) */
   resumeSessionId: z
