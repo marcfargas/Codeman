@@ -2078,6 +2078,15 @@ export class RespawnController extends EventEmitter {
       return;
     }
 
+    // Check for active child processes (bash tools, test suites, builds, etc.)
+    const activeProcesses = this.session.getActiveChildProcesses();
+    if (activeProcesses.length > 0) {
+      const names = activeProcesses.map((p) => p.command).join(', ');
+      this.log(`Skipping AI check - ${activeProcesses.length} active child process(es): ${names}`);
+      this.logAction('detection', `Skipped AI check: child processes running (${names})`);
+      return;
+    }
+
     // If AI check is disabled or errored out, fall back to direct idle confirmation
     if (!this.config.aiIdleCheckEnabled || this.aiChecker.status === 'disabled') {
       this.log(`AI check unavailable (${this.aiChecker.status}), confirming idle directly via: ${reason}`);
@@ -2676,6 +2685,18 @@ export class RespawnController extends EventEmitter {
     if (this.session.isWorking) {
       this.log(`Idle confirmation rejected - Session reports isWorking=true (reason was: ${reason})`);
       this.logAction('detection', 'Rejected: Session still working');
+      this.setState('watching');
+      this.startNoOutputTimer();
+      this.startPreFilterTimer();
+      return;
+    }
+
+    // Safety check: if child processes are running (bash tools, test suites, builds, etc.)
+    const activeProcesses = this.session.getActiveChildProcesses();
+    if (activeProcesses.length > 0) {
+      const names = activeProcesses.map((p) => p.command).join(', ');
+      this.log(`Idle confirmation rejected - ${activeProcesses.length} active child process(es): ${names}`);
+      this.logAction('detection', `Rejected: child processes running (${names})`);
       this.setState('watching');
       this.startNoOutputTimer();
       this.startPreFilterTimer();

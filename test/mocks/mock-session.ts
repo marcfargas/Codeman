@@ -17,6 +17,7 @@ export class MockSession extends EventEmitter {
   status: 'idle' | 'working' = 'idle';
   pid: number = 12345;
   isWorking: boolean = false;
+  private _activeChildProcesses: { pid: number; command: string }[] = [];
   ralphTracker: null = null;
   writeBuffer: string[] = [];
   terminalBuffer: string = '';
@@ -52,9 +53,7 @@ export class MockSession extends EventEmitter {
 
   /** Check if a specific command was written */
   hasWritten(pattern: string | RegExp): boolean {
-    return this.writeBuffer.some((data) =>
-      typeof pattern === 'string' ? data.includes(pattern) : pattern.test(data),
-    );
+    return this.writeBuffer.some((data) => (typeof pattern === 'string' ? data.includes(pattern) : pattern.test(data)));
   }
 
   // ========== Terminal Output Simulation ==========
@@ -113,10 +112,7 @@ export class MockSession extends EventEmitter {
    */
   simulatePlanModePrompt(): void {
     this.simulateTerminalOutput(
-      'Would you like to proceed with this plan?\n' +
-        '\u276f 1. Yes\n' +
-        '  2. No\n' +
-        '  3. Type your own\n',
+      'Would you like to proceed with this plan?\n' + '\u276f 1. Yes\n' + '  2. No\n' + '  3. Type your own\n'
     );
   }
 
@@ -131,11 +127,7 @@ export class MockSession extends EventEmitter {
   /** Simulate token count display */
   simulateTokenCount(tokens: number | string): void {
     const formatted =
-      typeof tokens === 'number'
-        ? tokens >= 1000
-          ? `${(tokens / 1000).toFixed(1)}k`
-          : String(tokens)
-        : tokens;
+      typeof tokens === 'number' ? (tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens)) : tokens;
     this.simulateTerminalOutput(`${formatted} tokens used`);
   }
 
@@ -165,6 +157,16 @@ export class MockSession extends EventEmitter {
   /** Get mux name (for mux-based operations) */
   get muxName(): string | null {
     return this._muxName;
+  }
+
+  /** Check for active child processes (mock returns configurable list) */
+  getActiveChildProcesses(): { pid: number; command: string }[] {
+    return this._activeChildProcesses;
+  }
+
+  /** Set active child processes for testing */
+  setActiveChildProcesses(processes: { pid: number; command: string }[]): void {
+    this._activeChildProcesses = processes;
   }
 
   // ========== Route-test conveniences ==========
