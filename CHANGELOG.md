@@ -1,5 +1,11 @@
 # aicodeman
 
+## 0.5.6
+
+### Patch Changes
+
+- fix: default new sessions to opus[1m] (1M context window) instead of plain opus (200k context)
+
 ## 0.5.5
 
 ### Patch Changes
