@@ -308,7 +308,7 @@ export function registerRalphRoutes(
       useMux: true,
       mode: 'claude',
       niceConfig,
-      model: rlModelConfig?.defaultModel,
+      model: rlModelConfig?.defaultModel || undefined,
       claudeMode: rlClaudeModeConfig.claudeMode,
       allowedTools: rlClaudeModeConfig.allowedTools,
     });

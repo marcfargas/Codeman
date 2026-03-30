@@ -186,7 +186,11 @@ export function registerSessionRoutes(
     const modelConfig = await ctx.getModelConfig();
     const mode = body.mode || 'claude';
     const model =
-      mode === 'opencode' ? body.openCodeConfig?.model : mode !== 'shell' ? modelConfig?.defaultModel : undefined;
+      mode === 'opencode'
+        ? body.openCodeConfig?.model
+        : mode !== 'shell'
+          ? modelConfig?.defaultModel || undefined
+          : undefined;
     const claudeModeConfig = await ctx.getClaudeModeConfig();
     const session = new Session({
       workingDir,
@@ -766,7 +770,11 @@ export function registerSessionRoutes(
     const niceConfig = await ctx.getGlobalNiceConfig();
     const qsModelConfig = await ctx.getModelConfig();
     const qsModel =
-      mode === 'opencode' ? openCodeConfig?.model : mode !== 'shell' ? qsModelConfig?.defaultModel : undefined;
+      mode === 'opencode'
+        ? openCodeConfig?.model
+        : mode !== 'shell'
+          ? qsModelConfig?.defaultModel || undefined
+          : undefined;
     const qsClaudeModeConfig = await ctx.getClaudeModeConfig();
     const session = new Session({
       workingDir: casePath,

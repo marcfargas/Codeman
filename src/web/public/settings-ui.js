@@ -1278,7 +1278,7 @@ Object.assign(CodemanApp.prototype, {
         // Default model
         const defaultModelEl = document.getElementById('appSettingsDefaultModel');
         if (defaultModelEl) {
-          defaultModelEl.value = config.defaultModel || 'opus';
+          defaultModelEl.value = config.defaultModel || '';
         }
         // Show recommendations
         const showRecsEl = document.getElementById('appSettingsShowModelRecommendations');
@@ -1317,7 +1317,7 @@ Object.assign(CodemanApp.prototype, {
     if (reviewEl?.value) agentTypeOverrides.review = reviewEl.value;
 
     const config = {
-      defaultModel: defaultModelEl?.value || 'opus',
+      defaultModel: defaultModelEl?.value || '',
       showRecommendations: showRecsEl?.checked ?? true,
       agentTypeOverrides,
     };
