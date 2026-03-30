@@ -4,7 +4,7 @@
  * Defines two exports:
  *
  * - KeyboardAccessoryBar (singleton object) — Quick action buttons shown above the virtual
- *   keyboard on mobile: arrow up/down, /init, /clear, /compact, paste, and dismiss.
+ *   keyboard on mobile: arrow up/down, Shift+Tab, /init, /clear, /compact, paste, and dismiss.
  *   Destructive actions (/clear, /compact) require double-tap confirmation (2s amber state).
  *   Commands are sent as text + Enter separately for Ink compatibility.
  *   Only initializes on touch devices (MobileDetection.isTouchDevice guard).
@@ -53,6 +53,7 @@ const KeyboardAccessoryBar = {
           <path d="M19 9l-7 7-7-7"/>
         </svg>
       </button>
+      <button class="accessory-btn" data-action="shift-tab" title="Shift+Tab">⇧Tab</button>
       <button class="accessory-btn" data-action="init" title="/init">/init</button>
       <button class="accessory-btn" data-action="clear" title="/clear">/clear</button>
       <button class="accessory-btn" data-action="compact" title="/compact">/compact</button>
@@ -80,7 +81,7 @@ const KeyboardAccessoryBar = {
       this.handleAction(action, btn);
 
       // Refocus terminal so keyboard stays open (tap blurs terminal → keyboard dismisses → toolbar shifts)
-      if ((action === 'scroll-up' || action === 'scroll-down') ||
+      if ((action === 'scroll-up' || action === 'scroll-down' || action === 'shift-tab') ||
           ((action === 'clear' || action === 'compact') && this._confirmAction)) {
         if (typeof app !== 'undefined' && app.terminal) {
           app.terminal.focus();
@@ -108,6 +109,9 @@ const KeyboardAccessoryBar = {
         break;
       case 'scroll-down':
         this.sendKey('\x1b[B');
+        break;
+      case 'shift-tab':
+        this.sendKey('\x1b[Z');
         break;
       case 'init':
         this.sendCommand('/init');
