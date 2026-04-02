@@ -4,7 +4,7 @@
  * Defines two exports:
  *
  * - KeyboardAccessoryBar (singleton object) — Quick action buttons shown above the virtual
- *   keyboard on mobile: arrow up/down, Shift+Tab, /init, /clear, /compact, paste, and dismiss.
+ *   keyboard on mobile: Esc, arrow up/down, Tab, Shift+Tab, /init, /clear, /compact, paste, and dismiss.
  *   Destructive actions (/clear, /compact) require double-tap confirmation (2s amber state).
  *   Commands are sent as text + Enter separately for Ink compatibility.
  *   Only initializes on touch devices (MobileDetection.isTouchDevice guard).
@@ -53,18 +53,21 @@ const KeyboardAccessoryBar = {
           <path d="M19 9l-7 7-7-7"/>
         </svg>
       </button>
-      <button class="accessory-btn" data-action="shift-tab" title="Shift+Tab">⇧Tab</button>
-      <button class="accessory-btn" data-action="init" title="/init">/init</button>
-      <button class="accessory-btn" data-action="clear" title="/clear">/clear</button>
-      <button class="accessory-btn" data-action="compact" title="/compact">/compact</button>
       <button class="accessory-btn" data-action="paste" title="Paste from clipboard">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
           <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
         </svg>
       </button>
-      <button class="accessory-btn accessory-btn-dismiss" data-action="dismiss" title="Dismiss keyboard">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+      <button class="accessory-btn" data-action="tab" title="Tab">Tab</button>
+      <button class="accessory-btn" data-action="shift-tab" title="Shift+Tab">⇧Tab</button>
+      <button class="accessory-btn" data-action="opt-enter" title="Option+Enter (newline)">⌥Enter</button>
+      <button class="accessory-btn" data-action="esc" title="Escape">Esc</button>
+      <button class="accessory-btn" data-action="init" title="/init">/init</button>
+      <button class="accessory-btn" data-action="clear" title="/clear">/clear</button>
+      <button class="accessory-btn" data-action="compact" title="/compact">/compact</button>
+      <button class="accessory-btn accessory-btn-arrow" data-action="dismiss" title="Dismiss keyboard">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <path d="M19 9l-7 7-7-7"/>
         </svg>
       </button>
@@ -81,7 +84,7 @@ const KeyboardAccessoryBar = {
       this.handleAction(action, btn);
 
       // Refocus terminal so keyboard stays open (tap blurs terminal → keyboard dismisses → toolbar shifts)
-      if ((action === 'scroll-up' || action === 'scroll-down' || action === 'shift-tab') ||
+      if ((action === 'scroll-up' || action === 'scroll-down' || action === 'tab' || action === 'shift-tab' || action === 'opt-enter' || action === 'esc') ||
           ((action === 'clear' || action === 'compact') && this._confirmAction)) {
         if (typeof app !== 'undefined' && app.terminal) {
           app.terminal.focus();
@@ -109,6 +112,15 @@ const KeyboardAccessoryBar = {
         break;
       case 'scroll-down':
         this.sendKey('\x1b[B');
+        break;
+      case 'esc':
+        this.sendKey('\x1b');
+        break;
+      case 'opt-enter':
+        this.sendKey('\x1b\r');
+        break;
+      case 'tab':
+        this.sendKey('\t');
         break;
       case 'shift-tab':
         this.sendKey('\x1b[Z');

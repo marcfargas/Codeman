@@ -946,24 +946,6 @@ html.mobile-init .file-browser-panel {
     background: #2563eb;
   }
 
-  .accessory-btn-dismiss {
-    padding: 8px 14px;
-    background: #2a2a2a;
-    border: 1.5px solid rgba(255, 255, 255, 0.25);
-    border-radius: 6px;
-    color: #e5e5e5;
-  }
-
-  .accessory-btn-dismiss svg {
-    width: 22px;
-    height: 22px;
-    stroke-width: 3;
-  }
-
-  .accessory-btn-dismiss:active {
-    background: #3a3a3a;
-  }
-
   /* Voice preview — positioned above accessory bar on mobile */
   .voice-preview {
     bottom: calc(var(--safe-area-bottom) + 94px);
@@ -2129,24 +2111,6 @@ html.mobile-init .file-browser-panel {
 
 .accessory-btn-arrow:active {
   background: #2563eb;
-}
-
-.accessory-btn-dismiss {
-  padding: 8px 14px;
-  background: #2a2a2a;
-  border: 1.5px solid rgba(255, 255, 255, 0.25);
-  border-radius: 6px;
-  color: #e5e5e5;
-}
-
-.accessory-btn-dismiss svg {
-  width: 22px;
-  height: 22px;
-  stroke-width: 3;
-}
-
-.accessory-btn-dismiss:active {
-  background: #3a3a3a;
 }
 
 /* ============================================================================
