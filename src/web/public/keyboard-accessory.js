@@ -53,6 +53,16 @@ const KeyboardAccessoryBar = {
           <path d="M19 9l-7 7-7-7"/>
         </svg>
       </button>
+      <button class="accessory-btn accessory-btn-arrow" data-action="arrow-left" title="Arrow left">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M15 19l-7-7 7-7"/>
+        </svg>
+      </button>
+      <button class="accessory-btn accessory-btn-arrow" data-action="arrow-right" title="Arrow right">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M9 5l7 7-7 7"/>
+        </svg>
+      </button>
       <button class="accessory-btn" data-action="paste" title="Paste from clipboard">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
@@ -84,7 +94,7 @@ const KeyboardAccessoryBar = {
       this.handleAction(action, btn);
 
       // Refocus terminal so keyboard stays open (tap blurs terminal → keyboard dismisses → toolbar shifts)
-      if ((action === 'scroll-up' || action === 'scroll-down' || action === 'tab' || action === 'shift-tab' || action === 'opt-enter' || action === 'esc') ||
+      if ((action === 'scroll-up' || action === 'scroll-down' || action === 'arrow-left' || action === 'arrow-right' || action === 'tab' || action === 'shift-tab' || action === 'opt-enter' || action === 'esc') ||
           ((action === 'clear' || action === 'compact') && this._confirmAction)) {
         if (typeof app !== 'undefined' && app.terminal) {
           app.terminal.focus();
@@ -112,6 +122,12 @@ const KeyboardAccessoryBar = {
         break;
       case 'scroll-down':
         this.sendKey('\x1b[B');
+        break;
+      case 'arrow-left':
+        this.sendKey('\x1b[D');
+        break;
+      case 'arrow-right':
+        this.sendKey('\x1b[C');
         break;
       case 'esc':
         this.sendKey('\x1b');
