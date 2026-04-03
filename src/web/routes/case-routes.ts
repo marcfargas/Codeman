@@ -11,10 +11,10 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { ApiResponse, CaseInfo } from '../../types.js';
 import { ApiErrorCode, createErrorResponse, getErrorMessage } from '../../types.js';
-import { CreateCaseSchema, LinkCaseSchema } from '../schemas.js';
+import { CreateCaseSchema, LinkCaseSchema, CaseOrderSchema } from '../schemas.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { writeHooksConfig } from '../../hooks-config.js';
-import { CASES_DIR, validatePathWithinBase, parseBody, readJsonConfig } from '../route-helpers.js';
+import { CASES_DIR, SETTINGS_PATH, validatePathWithinBase, parseBody, readJsonConfig } from '../route-helpers.js';
 import { SseEvent } from '../sse-events.js';
 import type { EventPort, ConfigPort } from '../ports/index.js';
 
@@ -69,6 +69,18 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
           hasClaudeMd: existsSync(join(path, 'CLAUDE.md')),
         });
       }
+    }
+
+    // Sort by persisted caseOrder from settings.json
+    const settings = await readJsonConfig<Record<string, unknown>>(SETTINGS_PATH, 'settings', {});
+    const caseOrder = Array.isArray(settings.caseOrder) ? (settings.caseOrder as string[]) : [];
+    if (caseOrder.length > 0) {
+      const orderMap = new Map(caseOrder.map((name, idx) => [name, idx]));
+      cases.sort((a, b) => {
+        const ai = orderMap.get(a.name) ?? Number.MAX_SAFE_INTEGER;
+        const bi = orderMap.get(b.name) ?? Number.MAX_SAFE_INTEGER;
+        return ai - bi;
+      });
     }
 
     return cases;
@@ -145,6 +157,68 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       await fs.writeFile(LINKED_CASES_FILE, JSON.stringify(linkedCases, null, 2));
       ctx.broadcast(SseEvent.CaseLinked, { name, path: expandedPath });
       return { success: true, data: { case: { name, path: expandedPath } } };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+    }
+  });
+
+  // ========== Delete / Unlink Case ==========
+
+  app.delete('/api/cases/:name', async (req): Promise<ApiResponse<{ name: string }>> => {
+    const { name } = req.params as { name: string };
+
+    if (!validatePathWithinBase(name, CASES_DIR)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case name');
+    }
+
+    // Check linked cases first — unlink only, don't delete the actual directory
+    const linkedCases = await readLinkedCases();
+    if (linkedCases[name]) {
+      delete linkedCases[name];
+      try {
+        await fs.writeFile(LINKED_CASES_FILE, JSON.stringify(linkedCases, null, 2));
+        ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'unlinked' });
+        return { success: true, data: { name } };
+      } catch (err) {
+        return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+      }
+    }
+
+    // Case in CASES_DIR — delete the entire directory
+    const casePath = join(CASES_DIR, name);
+    if (!existsSync(casePath)) {
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, `Case "${name}" not found`);
+    }
+
+    try {
+      await fs.rm(casePath, { recursive: true, force: true });
+      ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'deleted' });
+      return { success: true, data: { name } };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+    }
+  });
+
+  // ========== Reorder Cases ==========
+
+  app.put('/api/cases/order', async (req): Promise<ApiResponse<{ order: string[] }>> => {
+    const { order } = parseBody(CaseOrderSchema, req.body, 'Invalid order data');
+
+    try {
+      const dir = join(homedir(), '.codeman');
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+      let existing: Record<string, unknown> = {};
+      try {
+        existing = JSON.parse(await fs.readFile(SETTINGS_PATH, 'utf-8'));
+      } catch {
+        /* ignore */
+      }
+      const merged = { ...existing, caseOrder: order };
+      await fs.writeFile(SETTINGS_PATH, JSON.stringify(merged, null, 2));
+      ctx.broadcast(SseEvent.CaseOrderChanged, { order });
+      return { success: true, data: { order } };
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }

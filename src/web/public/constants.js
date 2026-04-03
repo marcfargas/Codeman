@@ -291,6 +291,12 @@ const SSE_EVENTS = {
   ORCHESTRATOR_TASK_FAILED: 'orchestrator:taskFailed',
   ORCHESTRATOR_COMPLETED: 'orchestrator:completed',
   ORCHESTRATOR_ERROR: 'orchestrator:error',
+
+  // Cases
+  CASE_CREATED: 'case:created',
+  CASE_LINKED: 'case:linked',
+  CASE_DELETED: 'case:deleted',
+  CASE_ORDER_CHANGED: 'case:order-changed',
 };
 
 // ═══════════════════════════════════════════════════════════════

@@ -325,6 +325,10 @@ export const OrchestratorError = 'orchestrator:error' as const;
 export const CaseCreated = 'case:created' as const;
 /** Existing directory linked as a case. */
 export const CaseLinked = 'case:linked' as const;
+/** Case deleted or unlinked. */
+export const CaseDeleted = 'case:deleted' as const;
+/** Case ordering changed. */
+export const CaseOrderChanged = 'case:order-changed' as const;
 
 // ─── Namespace Re-export ─────────────────────────────────────────────────────
 
@@ -485,4 +489,6 @@ export const SseEvent = {
   // Cases
   CaseCreated,
   CaseLinked,
+  CaseDeleted,
+  CaseOrderChanged,
 } as const;

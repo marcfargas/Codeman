@@ -1360,6 +1360,7 @@
         <div class="modal-tabs">
           <button class="modal-tab-btn active" data-tab="case-create">Create New</button>
           <button class="modal-tab-btn" data-tab="case-link">Link Existing</button>
+          <button class="modal-tab-btn" data-tab="case-manage">Manage</button>
         </div>
         <div class="modal-body">
           <!-- Create New Tab -->
@@ -1386,6 +1387,13 @@
               <input type="text" id="linkCasePath" placeholder="/home/user/projects/my-project" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
               <span class="form-hint">Absolute path to an existing project folder, e.g. /home/you/my-project</span>
             </div>
+          </div>
+          <!-- Manage Tab -->
+          <div class="modal-tab-content hidden" id="case-manage">
+            <div class="case-manage-list" id="caseManageList">
+              <!-- Populated by JS -->
+            </div>
+            <span class="form-hint" style="margin-top: 8px; display: block;">Drag or use arrows to reorder. Changes are saved automatically.</span>
           </div>
         </div>
         <div class="form-actions">
