@@ -523,6 +523,9 @@ class CodemanApp {
     SwipeHandler.init();
     VoiceInput.init();
     KeyboardAccessoryBar.init();
+    // Apply keyboard bar mode from settings
+    const _kbSettings = this.loadAppSettingsFromStorage();
+    if (_kbSettings.extendedKeyboardBar) KeyboardAccessoryBar.setMode('extended');
     this.applyHeaderVisibilitySettings();
     this.applyTabWrapSettings();
     this.applyMonitorVisibility();
