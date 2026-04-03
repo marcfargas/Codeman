@@ -1,5 +1,25 @@
 # aicodeman
 
+## 0.5.8
+
+### Patch Changes
+
+- Case management: add Manage tab with reorder (up/down arrows) and delete for cases; linked cases are unlinked (folder preserved), CASES_DIR cases are permanently deleted. New endpoints: DELETE /api/cases/:name, PUT /api/cases/order. SSE events: case:deleted, case:order-changed.
+
+  Security: sanitize case names from filesystem with /^[a-zA-Z0-9_-]+$/ regex before returning from GET /api/cases to prevent XSS via maliciously-named directories reaching frontend inline onclick handlers.
+
+  Auto-attach PTY: server now calls startInteractive() for recovered tmux sessions during startup so all sessions resume capturing output immediately after deploy, instead of waiting for client selection. Frontend auto-attach condition relaxed from (pid===null && status==='idle') to (pid===null && !\_ended).
+
+  Mobile keyboard accessory: add Shift+Tab, Tab, Esc, Alt+Enter, Left/Right arrow, and Ctrl+O buttons.
+
+  Terminal: fix flicker regression by moving viewport clear inside dimension guard.
+
+  State store: fix temp file collisions on concurrent writes.
+
+  macOS: fix installer failures when piped via curl | bash, add HTML cache support, launchd service template, and trust dialog handling.
+
+  Housekeeping: remove accidentally committed dist/state-store.js build artifact.
+
 ## 0.5.7
 
 ### Patch Changes
