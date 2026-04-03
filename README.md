@@ -88,7 +88,7 @@ cat > ~/Library/LaunchAgents/com.codeman.web.plist << EOF
 </dict>
 </plist>
 EOF
-launchctl load ~/Library/LaunchAgents/com.codeman.web.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.codeman.web.plist
 ```
 </details>
 
