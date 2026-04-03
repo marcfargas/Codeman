@@ -1,5 +1,13 @@
 # aicodeman
 
+## 0.5.10
+
+### Patch Changes
+
+- fix: allow bracket characters in model validation regex so models like opus[1m] (1M context window) are accepted instead of silently dropped. Quote the model flag value in tmux spawn commands to prevent bash glob expansion of bracket patterns.
+
+  docs: update macOS launchd instructions to use `launchctl bootstrap` instead of deprecated `load`. Clean up README install and service sections.
+
 ## 0.5.9
 
 ### Patch Changes
