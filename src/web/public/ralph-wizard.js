@@ -151,11 +151,11 @@ Object.assign(CodemanApp.prototype, {
       const res = await fetch(`/api/cases/${encodeURIComponent(caseName)}/fix-plan`);
       const data = await res.json();
 
-      if (data.success && data.exists && data.todos?.length > 0) {
+      if (data.success && data.data.exists && data.data.todos?.length > 0) {
         this.ralphWizardConfig.existingPlan = {
-          todos: data.todos,
-          stats: data.stats,
-          content: data.content,
+          todos: data.data.todos,
+          stats: data.data.stats,
+          content: data.data.content,
         };
         this.updateExistingPlanUI();
       } else {
@@ -378,7 +378,10 @@ Object.assign(CodemanApp.prototype, {
     prompt += `Output \`<promise>${config.completionPhrase}</promise>\` when done\n\n`;
 
     prompt += '## If Stuck\n';
-    prompt += 'Output `<promise>BLOCKED</promise>` with explanation';
+    prompt += 'Output `<promise>BLOCKED</promise>` with explanation\n\n';
+
+    prompt += '## Status Reporting\n';
+    prompt += '• End every response with a `RALPH_STATUS` block (parsed by Codeman)';
 
     // Show preview with highlighting (escape first, then apply formatting)
     const escapedPrompt = escapeHtml(prompt);
@@ -1032,6 +1035,9 @@ Object.assign(CodemanApp.prototype, {
     const enabledItems = config.generatedPlan?.filter(i => i.enabled);
 
     try {
+      const ralphGlobalSettings = this.loadAppSettingsFromStorage();
+      const envOverrides = this.buildEnvOverrides(this.getCaseSettings(config.caseName), ralphGlobalSettings);
+      const effort = this.getEffortSetting(ralphGlobalSettings);
       const res = await fetch('/api/ralph-loop/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1042,6 +1048,8 @@ Object.assign(CodemanApp.prototype, {
           maxIterations: config.maxIterations || null,
           enableRespawn: config.enableRespawn,
           planItems: enabledItems?.length ? enabledItems : undefined,
+          ...(Object.keys(envOverrides).length > 0 ? { envOverrides } : {}),
+          ...(effort ? { effort } : {}),
         }),
       });
       const data = await res.json();
@@ -1049,8 +1057,8 @@ Object.assign(CodemanApp.prototype, {
         this.showToast(data.error || 'Failed to start', 'error');
         return;
       }
-      this.ralphClosedSessions.delete(data.sessionId);
-      await this.selectSession(data.sessionId);
+      this.ralphClosedSessions.delete(data.data.sessionId);
+      await this.selectSession(data.data.sessionId);
       this.showToast(`Ralph Loop started in ${config.caseName}`, 'success');
     } catch (err) {
       console.error('Failed to start Ralph loop:', err);

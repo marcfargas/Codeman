@@ -39,6 +39,9 @@ import {
   TokenUsageEntry,
 } from './types.js';
 import { Debouncer, MAX_SESSION_TOKENS } from './utils/index.js';
+import { dataPath, CODEMAN_INSTANCE } from './config/instance.js';
+import { normalizeSessionOrder } from './session-order.js';
+import { validateTabLayout, type TabLayout } from './tab-layout.js';
 
 /** Debounce delay for batching state writes (ms) */
 const SAVE_DEBOUNCE_MS = 500;
@@ -89,8 +92,10 @@ export class StateStore {
   private _saveInFlight: Promise<void> | null = null;
 
   constructor(filePath?: string) {
-    // Migrate legacy data directory (~/.claudeman → ~/.codeman)
-    if (!filePath) {
+    // Migrate legacy data directory (~/.claudeman → ~/.codeman). Default (prod)
+    // instance only — a named instance (e.g. beta) must never touch the shared
+    // ~/.codeman / ~/codeman-cases layout, preserving instance isolation.
+    if (!filePath && !CODEMAN_INSTANCE) {
       const legacyDir = join(homedir(), '.claudeman');
       const newDir = join(homedir(), '.codeman');
       if (existsSync(legacyDir) && !existsSync(newDir)) {
@@ -105,7 +110,7 @@ export class StateStore {
       }
     }
 
-    this.filePath = filePath || join(homedir(), '.codeman', 'state.json');
+    this.filePath = filePath || dataPath('state.json');
     this.ralphStatePath = this.filePath.replace('.json', '-inner.json');
     this.state = this.load();
     this.state.config.stateFilePath = this.filePath;
@@ -268,6 +273,18 @@ export class StateStore {
     }
     if (this.state.tokenStats) {
       parts.push(`"tokenStats":${JSON.stringify(this.state.tokenStats)}`);
+    }
+    if (this.state.cronJobs) {
+      parts.push(`"cronJobs":${JSON.stringify(this.state.cronJobs)}`);
+    }
+    if (this.state.cronJobRuns) {
+      parts.push(`"cronJobRuns":${JSON.stringify(this.state.cronJobRuns)}`);
+    }
+    if (this.state.sessionOrder) {
+      parts.push(`"sessionOrder":${JSON.stringify(this.state.sessionOrder)}`);
+    }
+    if (this.state.tabLayouts !== undefined) {
+      parts.push(`"tabLayouts":${JSON.stringify(this.state.tabLayouts)}`);
     }
 
     return `{${parts.join(',')}}`;
@@ -477,27 +494,53 @@ export class StateStore {
   }
 
   /**
+   * COD-142: Remove a session's persisted record on kill UNLESS it is pinned.
+   * A pinned session is demoted to a lightweight `stopped` record (pin retained)
+   * so it stays visible in the session-manager pinned group and survives restart.
+   * Unpinned sessions are fully removed (unchanged behavior).
+   * @returns 'preserved' if demoted to stopped+pinned, 'removed' if deleted, 'absent' if no record existed.
+   */
+  demoteOrRemoveSession(id: string): 'preserved' | 'removed' | 'absent' {
+    const existing = this.state.sessions[id];
+    if (!existing) return 'absent';
+    if (existing.pinned === true) {
+      // Demote in place: keep identity/resume fields + pin, mark stopped, clear live runtime.
+      this.setSession(id, { ...existing, status: 'stopped', pid: null });
+      return 'preserved';
+    }
+    this.removeSession(id);
+    return 'removed';
+  }
+
+  /**
    * Cleans up stale sessions from state that don't have corresponding active sessions.
    * @param activeSessionIds - Set of currently active session IDs
    * @returns Number of sessions cleaned up
    */
   cleanupStaleSessions(activeSessionIds: Set<string>): {
     count: number;
-    cleaned: Array<{ id: string; name?: string }>;
+    cleaned: Array<{ id: string; name?: string; owner?: string }>;
   } {
-    const allSessionIds = Object.keys(this.state.sessions);
-    const cleaned: Array<{ id: string; name?: string }> = [];
+    const staleIds = new Set(Object.keys(this.state.sessions).filter((sessionId) => !activeSessionIds.has(sessionId)));
+    return this.cleanupSessionsByIds(staleIds);
+  }
 
-    for (const sessionId of allSessionIds) {
-      if (!activeSessionIds.has(sessionId)) {
-        const name = this.state.sessions[sessionId]?.name;
-        cleaned.push({ id: sessionId, name });
-        delete this.state.sessions[sessionId];
-        this.cachedSessionJsons.delete(sessionId);
-        this.dirtySessions.delete(sessionId);
-        // Also clean up Ralph state for this session
-        this.ralphStates.delete(sessionId);
-      }
+  /** Deletes only confirmed stale session IDs, retaining records pinned after confirmation. */
+  cleanupSessionsByIds(sessionIds: ReadonlySet<string>): {
+    count: number;
+    cleaned: Array<{ id: string; name?: string; owner?: string }>;
+  } {
+    const cleaned: Array<{ id: string; name?: string; owner?: string }> = [];
+
+    for (const sessionId of sessionIds) {
+      const session = this.state.sessions[sessionId];
+      if (!session || session.pinned === true) continue; // COD-142: pinned records persist even with no live session
+      cleaned.push({ id: sessionId, name: session.name, owner: session.owner });
+      delete this.state.sessions[sessionId];
+      this.cachedSessionJsons.delete(sessionId);
+      this.dirtySessions.delete(sessionId);
+      // Also clean up Ralph state for this session
+      this.ralphStates.delete(sessionId);
     }
 
     if (cleaned.length > 0) {
@@ -565,6 +608,51 @@ export class StateStore {
     this.save();
   }
 
+  // ========== Cron Job Methods ==========
+
+  /** Returns all scheduled jobs keyed by job ID. */
+  getCronJobs(): Record<string, import('./types/cron.js').CronJob> {
+    if (!this.state.cronJobs) this.state.cronJobs = {};
+    return this.state.cronJobs;
+  }
+
+  /** Returns a scheduled job by ID, or null if not found. */
+  getCronJob(id: string): import('./types/cron.js').CronJob | null {
+    return this.state.cronJobs?.[id] ?? null;
+  }
+
+  /** Sets a scheduled job and triggers a debounced save. */
+  setCronJob(id: string, job: import('./types/cron.js').CronJob): void {
+    if (!this.state.cronJobs) this.state.cronJobs = {};
+    this.state.cronJobs[id] = job;
+    this.save();
+  }
+
+  /** Removes a scheduled job and triggers a debounced save. */
+  removeCronJob(id: string): void {
+    if (this.state.cronJobs) delete this.state.cronJobs[id];
+    this.save();
+  }
+
+  /** Returns all scheduled job runs keyed by run ID. */
+  getCronJobRuns(): Record<string, import('./types/cron.js').CronJobRun> {
+    if (!this.state.cronJobRuns) this.state.cronJobRuns = {};
+    return this.state.cronJobRuns;
+  }
+
+  /** Sets a scheduled job run (history record) and triggers a debounced save. */
+  setCronJobRun(id: string, run: import('./types/cron.js').CronJobRun): void {
+    if (!this.state.cronJobRuns) this.state.cronJobRuns = {};
+    this.state.cronJobRuns[id] = run;
+    this.save();
+  }
+
+  /** Removes a scheduled job run and triggers a debounced save. */
+  removeCronJobRun(id: string): void {
+    if (this.state.cronJobRuns) delete this.state.cronJobRuns[id];
+    this.save();
+  }
+
   /** Returns the application configuration. */
   getConfig() {
     return this.state.config;
@@ -574,6 +662,52 @@ export class StateStore {
   setConfig(config: Partial<AppState['config']>) {
     this.state.config = { ...this.state.config, ...config };
     this.save();
+  }
+
+  /** Returns the global tab order (ordered sessionIds), [] if unset. COD-131. */
+  getSessionOrder(): string[] {
+    return this.state.sessionOrder ?? [];
+  }
+
+  /** Persists the global tab order (ordered sessionIds) and triggers a debounced save. COD-131. */
+  setSessionOrder(order: string[]): void {
+    this.state.sessionOrder = order;
+    this.save();
+  }
+
+  /** Returns an owner layout, or null before that owner has been migrated. */
+  getTabLayout(owner: string): TabLayout | null {
+    const layouts = this.state.tabLayouts;
+    return layouts && Object.hasOwn(layouts, owner) ? layouts[owner] : null;
+  }
+
+  /** Returns a defensive snapshot of every stored owner layout. */
+  getTabLayouts(): Record<string, TabLayout> {
+    return structuredClone(this.state.tabLayouts ?? {});
+  }
+
+  /** Validates and atomically persists one owner layout. */
+  setTabLayout(owner: string, layout: TabLayout): void {
+    const validated = validateTabLayout(layout);
+    this.state.tabLayouts = { ...(this.state.tabLayouts ?? {}), [owner]: validated };
+    this.save();
+  }
+
+  /** Atomically publishes validated owner layouts and their latest global compatibility projection. */
+  commitTabLayoutProjection(
+    layouts: Readonly<Record<string, TabLayout>>,
+    projectOrder: (latest: readonly string[]) => readonly string[]
+  ): { layouts: Record<string, TabLayout>; sessionOrder: string[] } {
+    const validated = Object.fromEntries(
+      Object.entries(layouts).map(([owner, layout]) => [owner, validateTabLayout(layout)])
+    );
+    const sessionOrder = normalizeSessionOrder(projectOrder([...(this.state.sessionOrder ?? [])]));
+    const nextLayouts = { ...(this.state.tabLayouts ?? {}), ...validated };
+
+    this.state.tabLayouts = nextLayouts;
+    this.state.sessionOrder = sessionOrder;
+    this.save();
+    return { layouts: structuredClone(validated), sessionOrder: [...sessionOrder] };
   }
 
   /** Resets all state to initial values and saves immediately. */

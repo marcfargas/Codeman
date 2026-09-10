@@ -792,7 +792,7 @@ Object.assign(CodemanApp.prototype, {
       const res = await fetch(`/api/sessions/${this.editingSessionId}/respawn/enable`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config: respawnConfig, durationMinutes })
+        body: JSON.stringify({ config: respawnConfig, durationMinutes: durationMinutes ?? undefined })
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
@@ -848,6 +848,18 @@ Object.assign(CodemanApp.prototype, {
   },
 
   closeSessionOptions() {
+    // Commit the field the user was still editing BEFORE editingSessionId is
+    // cleared. The Session Name input saves on blur (and the auto-compact prompt
+    // on change), and every autosave handler bails out on `!this.editingSessionId`.
+    // Hiding the modal blurs the focused input on its own, but that happens after
+    // the id is gone, so Escape / backdrop-click silently dropped what was typed.
+    // (Clicking the X worked only because mousedown blurs the input first.)
+    const modal = document.getElementById('sessionOptionsModal');
+    const focused = document.activeElement;
+    if (focused && modal && modal.contains(focused) && typeof focused.blur === 'function') {
+      focused.blur();
+    }
+
     this.editingSessionId = null;
     // Stop run summary auto-refresh if it was running
     this.stopRunSummaryAutoRefresh();
@@ -1041,7 +1053,7 @@ Object.assign(CodemanApp.prototype, {
         return;
       }
 
-      this.runSummaryData = data.summary;
+      this.runSummaryData = data.data.summary;
       this.renderRunSummary();
     } catch (err) {
       console.error('Failed to load run summary:', err);

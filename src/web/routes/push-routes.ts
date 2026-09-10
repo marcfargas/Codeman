@@ -24,6 +24,10 @@ export function registerPushRoutes(app: FastifyInstance, ctx: InfraPort): void {
       userAgent: userAgent ?? req.headers['user-agent'] ?? '',
       createdAt: Date.now(),
       pushPreferences: pushPreferences ?? {},
+      // Multi-user: stamp the trusted caller identity so sendPushNotifications can
+      // scope session notifications to the owner (+ admins). Undefined in single-user.
+      username: req.authUser?.username,
+      role: req.authUser?.role,
     });
     return { success: true, data: { id: record.id } };
   });
@@ -35,7 +39,7 @@ export function registerPushRoutes(app: FastifyInstance, ctx: InfraPort): void {
     if (!updated) {
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Subscription not found');
     }
-    return { success: true };
+    return {};
   });
 
   app.delete('/api/push/subscribe/:id', async (req) => {
@@ -44,6 +48,6 @@ export function registerPushRoutes(app: FastifyInstance, ctx: InfraPort): void {
     if (!removed) {
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Subscription not found');
     }
-    return { success: true };
+    return {};
   });
 }

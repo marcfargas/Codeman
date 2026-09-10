@@ -38,12 +38,46 @@ Object.assign(CodemanApp.prototype, {
     this._notifySession(data.sessionId, 'critical', 'hook-elicitation', 'Question Asked', data.question || 'Claude is asking a question and waiting for your answer');
   },
 
+  _onHookElicitationComplete(data) {
+    // Question answered in the terminal: clear the action alert without
+    // waiting for `stop` (the turn may keep running for a long time).
+    // ⚠️ BOTH action kinds, matching the server's APPROVAL_RESOLVING_EVENTS,
+    // which resolves a session's pending item whatever its kind. An
+    // AskUserQuestion dialog arrives as `permission_prompt` (only MCP
+    // elicitation is `elicitation_dialog`), so clearing just the elicitation
+    // entry left the red alert armed on exactly the dialog these events are
+    // most often about. Normally the server's `approval:resolved` broadcast
+    // clears it too; this is the path that still works when the store holds no
+    // item for the session (restart, superseded).
+    if (data.sessionId) {
+      this.clearPendingHooks(data.sessionId, 'elicitation_dialog');
+      this.clearPendingHooks(data.sessionId, 'permission_prompt');
+    }
+  },
+
+  _onHookElicitationResponse(data) {
+    this._onHookElicitationComplete(data);
+  },
+
   _onHookStop(data) {
     // Clear all pending hooks when Claude finishes responding
     if (data.sessionId) {
       this.clearPendingHooks(data.sessionId);
     }
     this._notifySession(data.sessionId, 'info', 'hook-stop', 'Response Complete', data.reason || 'Claude has finished responding');
+  },
+
+  _onHookAgentWorking(data) {
+    // The agent started a turn, so whatever it was blocked on is gone. Reported
+    // by the DeepSeek status bridge; a harness turn cannot run while one of its
+    // own modal approvals is on screen, so this means the dialog was answered in
+    // the terminal. Same clearing as _onHookElicitationComplete, and notably NOT
+    // a notification: a turn STARTING is not news.
+    if (data.sessionId) {
+      this.clearPendingHooks(data.sessionId, 'elicitation_dialog');
+      this.clearPendingHooks(data.sessionId, 'permission_prompt');
+      this.clearPendingHooks(data.sessionId, 'idle_prompt');
+    }
   },
 
   _onHookTeammateIdle(data) {
@@ -153,13 +187,20 @@ Object.assign(CodemanApp.prototype, {
 
   registerServiceWorker() {
     if (!('serviceWorker' in navigator)) return;
-    navigator.serviceWorker.register('/sw.js').then((reg) => {
+    // Behind a sub-path mount the worker is served at <base>/sw.js and controls
+    // <base>/ (Service-Worker-Allowed is '/', so this narrower scope is permitted).
+    const _swBase = window.CodemanBase?.base || '';
+    navigator.serviceWorker.register(_swBase + '/sw.js', { scope: _swBase + '/' }).then((reg) => {
       this._swRegistration = reg;
       // Listen for messages from service worker (notification clicks)
       navigator.serviceWorker.addEventListener('message', (event) => {
         if (event.data?.type === 'notification-click') {
-          const { sessionId } = event.data;
-          if (sessionId && this.sessions.has(sessionId)) {
+          const { sessionId, action, approvalId } = event.data;
+          if (action) {
+            // Approve/Deny action buttons on a push: answer via the
+            // Approvals Inbox instead of just focusing the session.
+            this.handleNotificationAction?.(action, approvalId, sessionId);
+          } else if (sessionId && this.sessions.has(sessionId)) {
             this.selectSession(sessionId);
           }
           window.focus();
@@ -185,9 +226,9 @@ Object.assign(CodemanApp.prototype, {
     try {
       // Get VAPID public key from server
       const keyData = await this._apiJson('/api/push/vapid-key');
-      if (!keyData?.success) throw new Error('Failed to get VAPID key');
+      if (!keyData) throw new Error('Failed to get VAPID key');
 
-      const applicationServerKey = urlBase64ToUint8Array(keyData.data.publicKey);
+      const applicationServerKey = urlBase64ToUint8Array(keyData.publicKey);
       const subscription = await this._swRegistration.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey,
@@ -204,11 +245,11 @@ Object.assign(CodemanApp.prototype, {
           pushPreferences: this._buildPushPreferences(),
         },
       });
-      if (!data?.success) throw new Error('Failed to register subscription');
+      if (!data) throw new Error('Failed to register subscription');
 
       this._pushSubscription = subscription;
-      this._pushSubscriptionId = data.data.id;
-      localStorage.setItem('codeman-push-subscription-id', data.data.id);
+      this._pushSubscriptionId = data.id;
+      localStorage.setItem('codeman-push-subscription-id', data.id);
       this._updatePushUI(true);
       this.showToast('Push notifications enabled', 'success');
     } catch (err) {
@@ -297,6 +338,8 @@ Object.assign(CodemanApp.prototype, {
   openAppSettings() {
     // Load current settings
     const settings = this.loadAppSettingsFromStorage();
+    document.getElementById('appSettingsDisplayName').value = settings.displayName || 'Codeman';
+    document.getElementById('appSettingsLanguage').value = settings.language === 'zh-CN' ? 'zh-CN' : 'en';
     document.getElementById('appSettingsClaudeMdPath').value = settings.defaultClaudeMdPath || '';
     document.getElementById('appSettingsDefaultDir').value = settings.defaultWorkingDir || '';
     // Use device-aware defaults for display settings (mobile has different defaults)
@@ -305,22 +348,97 @@ Object.assign(CodemanApp.prototype, {
     // Header visibility settings
     document.getElementById('appSettingsShowFontControls').checked = settings.showFontControls ?? defaults.showFontControls ?? false;
     document.getElementById('appSettingsShowSystemStats').checked = settings.showSystemStats ?? defaults.showSystemStats ?? true;
-    document.getElementById('appSettingsShowTokenCount').checked = settings.showTokenCount ?? defaults.showTokenCount ?? true;
-    document.getElementById('appSettingsShowCost').checked = settings.showCost ?? defaults.showCost ?? false;
-    document.getElementById('appSettingsShowLifecycleLog').checked = settings.showLifecycleLog ?? defaults.showLifecycleLog ?? true;
-    document.getElementById('appSettingsShowMonitor').checked = settings.showMonitor ?? defaults.showMonitor ?? true;
+    document.getElementById('appSettingsShowLifecycleLog').checked = settings.showLifecycleLog ?? defaults.showLifecycleLog ?? false;
+    document.getElementById('appSettingsShowResponseViewer').checked = settings.showResponseViewer ?? defaults.showResponseViewer ?? false;
+    document.getElementById('appSettingsShowFileViewerButton').checked = settings.showFileViewerButton ?? defaults.showFileViewerButton ?? true;
+    document.getElementById('appSettingsShowAttachmentsButton').checked = settings.showAttachmentsButton ?? defaults.showAttachmentsButton ?? false;
+    document.getElementById('appSettingsSkin').value = settings.skin ?? defaults.skin ?? 'daylight-blue';
+    // Entrance animations. Deliberately NOT part of the settings payload: the
+    // styles persist to their own localStorage keys via setAnimTheme(), which
+    // keeps them per-device without touching the .strict() SettingsUpdateSchema.
+    this._syncEntranceAnimSetting?.();
+    // WebGL renderer (desktop only — mobile always uses the DOM renderer, so hide
+    // the toggle there so it can't promise something that won't apply).
+    document.getElementById('appSettingsWebglRenderer').checked = settings.webglRendererEnabled ?? defaults.webglRendererEnabled ?? true;
+    const webglItem = document.getElementById('appSettingsWebglRendererItem');
+    if (webglItem) webglItem.style.display = MobileDetection.getDeviceType() === 'desktop' ? '' : 'none';
+    document.getElementById('appSettingsShowMonitor').checked = settings.showMonitor ?? defaults.showMonitor ?? false;
     document.getElementById('appSettingsShowProjectInsights').checked = settings.showProjectInsights ?? defaults.showProjectInsights ?? false;
     document.getElementById('appSettingsShowFileBrowser').checked = settings.showFileBrowser ?? defaults.showFileBrowser ?? false;
     document.getElementById('appSettingsShowSubagents').checked = settings.showSubagents ?? defaults.showSubagents ?? false;
+    document.getElementById('appSettingsShowUltracodeAgents').checked = settings.showUltracodeAgents ?? defaults.showUltracodeAgents ?? false;
+    // Approvals Inbox: synced, default OFF (opt-in; only an explicit true enables).
+    document.getElementById('appSettingsApprovalsInbox').checked = settings.approvalsInboxEnabled === true;
+    // Read My Mind: synced, default OFF (opt-in; capture + prediction cost real tokens).
+    document.getElementById('appSettingsReadMyMind').checked = settings.readMyMindEnabled === true;
+    document.getElementById('appSettingsUltracodeFloatingWindows').checked =
+      settings.ultracodeFloatingWindows ?? defaults.ultracodeFloatingWindows ?? false;
+    document.getElementById('appSettingsShowMultiMonitorButton').checked = settings.showMultiMonitorButton ?? defaults.showMultiMonitorButton ?? false;
+    document.getElementById('appSettingsShowPlanUsageLimits').checked = this.planUsageChipEnabled(settings);
+    document.getElementById('appSettingsShowRedrawButton').checked = settings.showRedrawButton ?? defaults.showRedrawButton ?? false;
+    // Phone overview home screen: only meaningful under 430px, so the row is
+    // hidden elsewhere rather than offering a toggle that changes nothing.
+    // Spawn lineage lines: desktop-only (the overlay sits UNDER the fixed mobile
+    // header), so the row is hidden elsewhere rather than offering a toggle that
+    // changes nothing. Default ON — only an explicit false turns it off.
+    document.getElementById('appSettingsLineageLines').checked = settings.sessionLineageLines ?? defaults.sessionLineageLines ?? true;
+    const lineageItem = document.getElementById('appSettingsLineageLinesItem');
+    if (lineageItem) lineageItem.style.display = MobileDetection.getDeviceType() === 'desktop' ? '' : 'none';
+    document.getElementById('appSettingsMobileOverview').checked = settings.mobileOverviewEnabled ?? defaults.mobileOverviewEnabled ?? false;
+    const mobileOverviewItem = document.getElementById('appSettingsMobileOverviewItem');
+    if (mobileOverviewItem) mobileOverviewItem.style.display = MobileDetection.getDeviceType() === 'mobile' ? '' : 'none';
+    // Session Manager, Away Digest and Cron buttons all default OFF (opt-in under
+    // Display → Header Displays; the Cron button also ships with btn-cron--hidden
+    // in the template, so an unchecked box and a hidden button stay consistent).
+    document.getElementById('appSettingsShowSessionButton').checked = settings.showSessionButton ?? defaults.showSessionButton ?? false;
+    document.getElementById('appSettingsShowAwayDigestButton').checked = settings.showAwayDigestButton ?? defaults.showAwayDigestButton ?? false;
+    document.getElementById('appSettingsShowCronButton').checked = settings.showCronButton ?? defaults.showCronButton ?? false;
+    // Gesture control lives in the Input section (alongside Local Echo / CJK Input)
+    // but is only available when the instance runs with CODEMAN_GESTURE=1 (server sets
+    // window.__codemanGestureAvailable). Hide just this item otherwise so the toggle
+    // can't promise something that won't work.
+    const gestureItem = document.getElementById('appSettingsGestureControlItem');
+    if (gestureItem) gestureItem.style.display = window.__codemanGestureAvailable ? '' : 'none';
+    document.getElementById('appSettingsGestureControl').checked = settings.gestureControlEnabled ?? defaults.gestureControlEnabled ?? false;
     document.getElementById('appSettingsSubagentTracking').checked = settings.subagentTrackingEnabled ?? defaults.subagentTrackingEnabled ?? true;
     document.getElementById('appSettingsSubagentActiveTabOnly').checked = settings.subagentActiveTabOnly ?? defaults.subagentActiveTabOnly ?? true;
     document.getElementById('appSettingsImageWatcherEnabled').checked = settings.imageWatcherEnabled ?? defaults.imageWatcherEnabled ?? false;
     document.getElementById('appSettingsTunnelEnabled').checked = settings.tunnelEnabled ?? false;
     this.loadTunnelStatus();
     document.getElementById('appSettingsLocalEcho').checked = settings.localEchoEnabled ?? MobileDetection.isTouchDevice();
-    document.getElementById('appSettingsCjkInput').checked = settings.cjkInputEnabled ?? false;
+    // Auto Copy (copy-on-select): per-device, default OFF everywhere. It quietly
+    // overwrites the system clipboard on a gesture the user may have meant only as
+    // a way to read, so it is opt-in rather than a default anyone has to discover.
+    document.getElementById('appSettingsAutoCopySelection').checked = settings.autoCopySelection === true;
+    document.getElementById('appSettingsTerminalFont').value = settings.terminalFontFamily || '';
+    document.getElementById('appSettingsTerminalWheelLocal').checked =
+      settings.terminalWheelLocalScrollback ?? defaults.terminalWheelLocalScrollback ?? false;
+    document.getElementById('appSettingsCjkInput').checked = settings.cjkInputEnabled ?? defaults.cjkInputEnabled ?? false;
     document.getElementById('appSettingsExtendedKeyboardBar').checked = settings.extendedKeyboardBar ?? false;
     document.getElementById('appSettingsTabTwoRows').checked = settings.tabTwoRows ?? defaults.tabTwoRows ?? false;
+    document.getElementById('appSettingsTabOrientation').value =
+      settings.tabOrientation ?? defaults.tabOrientation ?? 'horizontal';
+    const tabRailWidth = window.CodemanTabRail?.resolveWidth({
+      // Same default resolution as applyTabRailWidth(): a rail that has never
+      // been sized shows the width it is actually rendering at, which for
+      // detailed rows is the Wide preset rather than 256. The rich-aware
+      // default must come BEFORE the per-device defaults blob: the handheld
+      // blob carries tabRailWidth: 256, which applyTabRailWidth() never reads,
+      // so consulting it first showed a tablet's unsized rich rail as 256 while
+      // it rendered at 320 — and a routine Save then PERSISTED the 256.
+      width: settings.tabRailWidth ?? this._defaultTabRailWidth?.() ?? defaults.tabRailWidth ?? 256,
+    }) ?? 256;
+    this.syncTabRailWidthSetting?.(tabRailWidth);
+    document.getElementById('appSettingsTabRailDetail').value =
+      settings.tabRailDetail ?? defaults.tabRailDetail ?? 'rich';
+    document.getElementById('appSettingsShowTabDetachButton').checked = settings.showTabDetachButton ?? defaults.showTabDetachButton ?? false;
+    document.getElementById('appSettingsSessionListLayout').value =
+      settings.sessionListLayout ?? defaults.sessionListLayout ?? 'header';
+    const sessionSidebarFontSize = this.resolveSessionSidebarFontSize(
+      settings.sessionSidebarFontSize ?? defaults.sessionSidebarFontSize
+    );
+    document.getElementById('appSettingsSessionSidebarFontSize').value = String(sessionSidebarFontSize);
+    document.getElementById('appSettingsSessionSidebarFontSizeValue').textContent = `${sessionSidebarFontSize} px`;
     // Claude CLI settings
     const claudeModeSelect = document.getElementById('appSettingsClaudeMode');
     const allowedToolsRow = document.getElementById('allowedToolsRow');
@@ -331,9 +449,25 @@ Object.assign(CodemanApp.prototype, {
     claudeModeSelect.onchange = () => {
       allowedToolsRow.style.display = claudeModeSelect.value === 'allowedTools' ? '' : 'none';
     };
+    // Codex CLI settings. The inputs are always populated (and always read back
+    // by saveAppSettings), even when the tab is hidden below, so a user without
+    // codex installed can never silently wipe the codex prefs of an instance
+    // that does have it.
+    document.getElementById('appSettingsCodexDangerouslyBypassApprovals').checked =
+      settings.codexDangerouslyBypassApprovals ?? false;
+    document.getElementById('appSettingsCodexAnimations').checked =
+      settings.codexAnimationsEnabled ?? false;
+    this._applyCodexSettingsVisibility();
     // Claude Permissions settings
     document.getElementById('appSettingsAgentTeams').checked = settings.agentTeamsEnabled ?? false;
+    document.getElementById('appSettingsAgentSkill').checked = settings.agentSkillEnabled ?? false;
+    // Default ON: an absent key is a user who has never seen this setting, and OFF
+    // for them means no tab alerts in any workspace Codeman did not scaffold.
+    document.getElementById('appSettingsWorkspaceHooks').checked = settings.workspaceHooksEnabled !== false;
+    document.getElementById('appSettingsClaudeModel').value = settings.claudeModel ?? '';
     document.getElementById('appSettingsOpusContext1m').checked = settings.opusContext1mEnabled ?? false;
+    document.getElementById('appSettingsRemoteAutoReconnect').checked = settings.remoteAutoReconnect ?? true;
+    document.getElementById('appSettingsThinkingEffort').value = settings.thinkingEffort ?? '';
     // CPU Priority settings
     const niceSettings = settings.nice || {};
     document.getElementById('appSettingsNiceEnabled').checked = niceSettings.enabled ?? false;
@@ -374,7 +508,7 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('eventIdleAudio').checked = idlePref.audio ?? false;
     // Response complete (stop)
     const stopPref = eventTypes.stop || {};
-    document.getElementById('eventStopEnabled').checked = stopPref.enabled ?? true;
+    document.getElementById('eventStopEnabled').checked = stopPref.enabled ?? false;
     document.getElementById('eventStopBrowser').checked = stopPref.browser ?? false;
     document.getElementById('eventStopPush').checked = stopPref.push ?? false;
     document.getElementById('eventStopAudio').checked = stopPref.audio ?? false;
@@ -409,24 +543,34 @@ Object.assign(CodemanApp.prototype, {
     const voiceCfg = VoiceInput._getDeepgramConfig();
     document.getElementById('voiceDeepgramKey').value = voiceCfg.apiKey || '';
     document.getElementById('voiceLanguage').value = voiceCfg.language || 'en-US';
-    document.getElementById('voiceKeyterms').value = voiceCfg.keyterms || 'refactor, endpoint, middleware, callback, async, regex, TypeScript, npm, API, deploy, config, linter, env, webhook, schema, CLI, JSON, CSS, DOM, SSE, backend, frontend, localhost, dependencies, repository, merge, rebase, diff, commit, com';
+    document.getElementById('voiceKeyterms').value = voiceCfg.keyterms || DEFAULT_VOICE_KEYTERMS;
     document.getElementById('voiceInsertMode').value = voiceCfg.insertMode || 'direct';
+    document.getElementById('voiceProvider').value = voiceCfg.provider || 'auto';
+    document.getElementById('appSettingsClaudeVoice').checked = settings.claudeVoiceEnabled ?? false;
     // Reset key visibility to hidden
     const keyInput = document.getElementById('voiceDeepgramKey');
     keyInput.type = 'password';
     document.getElementById('voiceKeyToggleBtn').textContent = 'Show';
-    // Update provider status
-    const providerName = VoiceInput.getActiveProviderName();
-    const providerEl = document.getElementById('voiceProviderStatus');
-    providerEl.textContent = providerName;
-    providerEl.className = 'voice-provider-status' + (providerName.startsWith('Deepgram') ? ' active' : '');
+    // Update provider status. The Claude row needs a fresh server probe: the
+    // setting is synced, so another device may have flipped it since page load.
+    this._renderVoiceProviderStatus();
+    VoiceInput.refreshClaudeStatus().then(() => this._renderVoiceProviderStatus());
 
-    // Reset to first tab and wire up tab switching
-    this.switchSettingsTab('settings-display');
+    // Updates section — show current version, reset transient result/progress UI.
+    this._initUpdatesSection();
+
+    // Model cards + effort segment are views over the hidden <select>s above,
+    // so they must be synced AFTER those have been given their stored values.
+    this._initSettingsNav();
+    this._syncSettingsChips();
+    this._syncModelCards();
+    this._syncEffortSegment();
+    // Back to the top of the document (one scroll, not a tab reset). Updates is
+    // first now: the version this install is running, and whether a newer one is
+    // waiting, are the two things worth seeing before any preference. The rest of
+    // the system settings (paths, automation, remote access) tail the document.
+    this.switchSettingsTab('settings-updates');
     const modal = document.getElementById('appSettingsModal');
-    modal.querySelectorAll('.modal-tabs .modal-tab-btn').forEach(btn => {
-      btn.onclick = () => this.switchSettingsTab(btn.dataset.tab);
-    });
     modal.classList.add('active');
 
     // Activate focus trap
@@ -434,19 +578,442 @@ Object.assign(CodemanApp.prototype, {
     this.activeFocusTrap.activate();
   },
 
-  switchSettingsTab(tabName) {
+  /**
+   * Show the App Settings "Codex" group only on instances where the codex binary
+   * actually resolves. Both settings in it (approval bypass, animated status
+   * effects) are passed to `codex` at launch, so on a box without codex the
+   * group is a promise nothing can keep.
+   *
+   * Availability comes from the injected `window.__codemanCliAvailable`, shared
+   * with the welcome buttons and the run-mode dropdown, so the group never
+   * flickers in and back out. The inputs stay in the DOM either way, so a user
+   * without codex can never silently wipe the codex prefs of an instance that
+   * has it (openAppSettings/saveAppSettings still read and write them).
+   *
+   * Note the inverted default versus the run buttons: an UNKNOWN flag hides this
+   * group. Hiding it costs a user nothing, whereas hiding a run button would
+   * leave a working install with nothing to click.
+   */
+  _applyCodexSettingsVisibility() {
+    const group = document.getElementById('appSettingsCodexGroup');
+    if (group) group.style.display = window.__codemanCliAvailable?.codex === true ? '' : 'none';
+  },
+
+  /**
+   * Scroll the settings document to a section.
+   *
+   * Kept under the historical `switchSettingsTab` name because it is the shared
+   * entry point: openAppSettings() calls it, and admin-ui.js's injected Users
+   * entry routes through it too. Sections are never hidden any more — the rail
+   * is a table of contents over ONE document, so "switching" is a scroll.
+   */
+  switchSettingsTab(sectionId) {
+    // The Shortcuts list renders lazily so it reflects the CURRENT registry
+    // (defaults + overrides) every time it is reached.
+    if (sectionId === 'settings-shortcuts') this.renderShortcutSettingsList?.();
+    const doc = document.getElementById('appSettingsDoc');
+    const section = document.getElementById(sectionId);
+    if (doc && section && typeof section.offsetTop === 'number') {
+      // On phones the jump pill is sticky at the top of the document, so land
+      // the section head below it instead of underneath it.
+      const jump = document.getElementById('appSettingsJump');
+      const inset = jump && jump.offsetParent ? jump.offsetHeight + 16 : 6;
+      doc.scrollTop = Math.max(0, section.offsetTop - inset);
+    }
+    this._setActiveSettingsSection(sectionId);
+  },
+
+  /** Paint the rail + jump pill for the section currently in view. */
+  _setActiveSettingsSection(sectionId) {
     const modal = document.getElementById('appSettingsModal');
-    // Toggle active class on tab buttons
-    modal.querySelectorAll('.modal-tabs .modal-tab-btn').forEach(btn => {
-      btn.classList.toggle('active', btn.dataset.tab === tabName);
+    if (!modal || typeof modal.querySelectorAll !== 'function') return;
+    let active = null;
+    modal.querySelectorAll('.set-rail-item').forEach(item => {
+      const on = item.dataset.section === sectionId;
+      item.classList.toggle('active', on);
+      if (on) active = item;
     });
-    // Toggle hidden class on tab content
-    modal.querySelectorAll('.modal-tab-content').forEach(content => {
-      content.classList.toggle('hidden', content.id !== tabName);
+    modal.querySelectorAll('.set-jump-row').forEach(row => {
+      row.classList.toggle('active', row.dataset.section === sectionId);
+    });
+    const label = document.getElementById('appSettingsJump')?.querySelector('.set-jump-label');
+    if (label && active) label.textContent = active.textContent.trim();
+    const ico = document.getElementById('appSettingsJump')?.querySelector('.set-jump-ico');
+    const src = active?.querySelector('svg');
+    if (ico && src) ico.innerHTML = src.innerHTML;
+  },
+
+  /**
+   * Wire the settings navigation once per page: rail clicks, the phone jump
+   * menu, scroll-spy, live search, chip/card/segment views over the real inputs,
+   * and the collapsible Advanced group. Idempotent — openAppSettings() calls it
+   * on every open, and re-registering listeners on every open would multiply
+   * them across a long-lived tab.
+   */
+  _initSettingsNav() {
+    const modal = document.getElementById('appSettingsModal');
+    const doc = document.getElementById('appSettingsDoc');
+    if (!modal || !doc || typeof modal.querySelectorAll !== 'function') return;
+    this._buildModelCards();
+    this._buildEffortSegment();
+    // Rebuilt on every open: admin-ui.js appends its Users entry to the rail
+    // after the first open, and the menu must not drift from the rail.
+    this._buildSettingsJumpMenu();
+    if (modal.dataset.navReady === '1') return;
+    modal.dataset.navReady = '1';
+
+    // Delegated so rail entries injected later (Users) work without rewiring.
+    modal.querySelector('.set-rail-items')?.addEventListener('click', e => {
+      const item = e.target.closest?.('.set-rail-item');
+      if (item?.dataset.section) this.switchSettingsTab(item.dataset.section);
+    });
+    document.getElementById('appSettingsJumpMenu')?.addEventListener('click', e => {
+      const row = e.target.closest?.('.set-jump-row');
+      if (!row?.dataset.section) return;
+      this._toggleSettingsJump(false);
+      this.switchSettingsTab(row.dataset.section);
+    });
+    document.getElementById('appSettingsJump')?.addEventListener('click', () => this._toggleSettingsJump());
+    document.getElementById('appSettingsJumpVeil')?.addEventListener('click', () => this._toggleSettingsJump(false));
+
+    // Scroll-spy: the rail follows the document rather than driving it.
+    doc.addEventListener('scroll', () => {
+      if (this._settingsSpyQueued) return;
+      this._settingsSpyQueued = true;
+      requestAnimationFrame(() => {
+        this._settingsSpyQueued = false;
+        const sections = [...doc.querySelectorAll('.set-section')].filter(s => s.offsetParent !== null);
+        if (!sections.length) return;
+        let current = sections[0].id;
+        for (const s of sections) {
+          if (s.offsetTop - doc.scrollTop <= 140) current = s.id;
+        }
+        this._setActiveSettingsSection(current);
+      });
+    });
+
+    const search = document.getElementById('appSettingsSearch');
+    search?.addEventListener('input', () => this._filterSettings(search.value));
+
+    // Chips are labels wrapping the real checkbox; mirror the checked state onto
+    // the label so the styling does not depend on :has() support.
+    modal.querySelectorAll('.set-chip input').forEach(input => {
+      input.addEventListener('change', () => this._syncSettingsChips());
+    });
+
+    const advHead = modal.querySelector('.set-group-head-toggle');
+    const advGroup = advHead?.closest('.set-group-advanced');
+    if (advHead && advGroup) {
+      const toggle = () => {
+        const open = advGroup.classList.toggle('open');
+        advHead.setAttribute('aria-expanded', open ? 'true' : 'false');
+      };
+      advHead.addEventListener('click', toggle);
+      advHead.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggle();
+        }
+      });
+    }
+
+    document.getElementById('appSettingsOpusContext1m')?.addEventListener('change', () => this._applyModelSelection());
+  },
+
+  /** Phone jump menu, mirrored from the rail so the two can never drift. */
+  _buildSettingsJumpMenu() {
+    const modal = document.getElementById('appSettingsModal');
+    const menu = document.getElementById('appSettingsJumpMenu');
+    if (!modal || !menu) return;
+    menu.innerHTML = '';
+    modal.querySelectorAll('.set-rail-item').forEach(item => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'set-jump-row';
+      row.dataset.section = item.dataset.section;
+      row.innerHTML = item.innerHTML;
+      const section = document.getElementById(item.dataset.section);
+      const count = section ? section.querySelectorAll('input, select').length : 0;
+      if (count) {
+        const n = document.createElement('span');
+        n.className = 'set-jump-count';
+        n.textContent = String(count);
+        row.appendChild(n);
+      }
+      menu.appendChild(row);
     });
   },
 
+  _toggleSettingsJump(force) {
+    const modal = document.getElementById('appSettingsModal');
+    if (!modal) return;
+    const open = force === undefined ? !modal.classList.contains('jump-open') : force;
+    modal.classList.toggle('jump-open', open);
+    document.getElementById('appSettingsJump')?.setAttribute('aria-expanded', open ? 'true' : 'false');
+  },
+
+  /**
+   * Mirror checkbox state onto the chip labels (see _initSettingsNav).
+   *
+   * Covers Session Options too: it shares the `set-*` surface, and its cycle-step
+   * chips would otherwise depend on `:has()` alone for their checked styling.
+   */
+  _syncSettingsChips() {
+    document.querySelectorAll('#appSettingsModal .set-chip, #sessionOptionsModal .set-chip').forEach(chip => {
+      chip.classList.toggle('is-on', !!chip.querySelector('input')?.checked);
+    });
+    this._syncLayoutPreview();
+  },
+
+  /**
+   * Redraw the Header & Panels live preview from the chips above it.
+   *
+   * The preview is a scale model of the app, not a second list of settings, so
+   * every icon is CLONED from the chip that owns it (`.set-chip-ico`): each icon
+   * has exactly ONE copy in index.html and a chip can never drift from the button
+   * it previews. A chip joins the preview purely by carrying `data-preview`
+   * (which slot) and `data-preview-order` (where in that slot); nothing here
+   * needs to know the setting's name.
+   *
+   * `data-preview-text` replaces the icon with a text token for the header
+   * entries that are readouts rather than buttons (plan usage, CPU, font size).
+   */
+  _syncLayoutPreview() {
+    const modal = document.getElementById('appSettingsModal');
+    if (!modal || typeof modal.querySelectorAll !== 'function') return;
+    const slots = {
+      header: document.getElementById('appSettingsPreviewHeader'),
+      panel: document.getElementById('appSettingsPreviewPanels'),
+      toolbar: document.getElementById('appSettingsPreviewToolbar'),
+      float: document.getElementById('appSettingsPreviewFloats'),
+    };
+    if (!slots.header) return;
+    Object.values(slots).forEach(el => {
+      if (el) el.innerHTML = '';
+    });
+
+    const chips = [...modal.querySelectorAll('.set-chip[data-preview]')]
+      .filter(chip => chip.querySelector('input')?.checked)
+      .sort((a, b) => (Number(a.dataset.previewOrder) || 0) - (Number(b.dataset.previewOrder) || 0));
+
+    let shown = 0;
+    for (const chip of chips) {
+      const kind = chip.dataset.preview;
+      const slot = slots[kind];
+      if (!slot) continue;
+      // The label is the chip's own text; the icon span (if any) is skipped by
+      // taking the LAST span, which is always the label.
+      const spans = chip.querySelectorAll('span');
+      const label = (spans[spans.length - 1]?.textContent || '').trim();
+      const el = document.createElement('span');
+      el.title = label;
+      if (kind === 'header') {
+        const text = chip.dataset.previewText;
+        el.className = text ? 'set-preview-chip' : 'set-preview-btn';
+        if (text) el.textContent = text;
+        else this._appendPreviewIcon(el, chip);
+      } else {
+        el.className = `set-preview-${kind}`;
+        this._appendPreviewIcon(el, chip);
+        const name = document.createElement('span');
+        name.textContent = label;
+        el.appendChild(name);
+      }
+      slot.appendChild(el);
+      shown++;
+    }
+
+    const empty = document.getElementById('appSettingsPreviewEmpty');
+    if (empty) empty.hidden = shown > 0;
+  },
+
+  /** Clone a chip's icon into a preview element (see _syncLayoutPreview). */
+  _appendPreviewIcon(target, chip) {
+    const icon = chip.querySelector('.set-chip-ico');
+    if (!icon) return;
+    const clone = icon.cloneNode(true);
+    clone.classList.remove('set-chip-ico');
+    clone.classList.add('set-preview-ico');
+    target.appendChild(clone);
+  },
+
+  /**
+   * Build the model picker cards from the hidden <select>'s own options, so the
+   * select stays the single source of truth that openAppSettings/saveAppSettings
+   * read and write by id. The `[1m]` variants are folded away: context width is a
+   * property of the chosen model (the "1M context window" switch), not a rival
+   * setting that silently loses to it.
+   */
+  _buildModelCards() {
+    const select = document.getElementById('appSettingsClaudeModel');
+    const grid = document.getElementById('appSettingsModelCards');
+    if (!select || !grid || grid.dataset.built === '1' || !select.options) return;
+    grid.innerHTML = '';
+    [...select.options]
+      .filter(opt => opt.dataset.variant !== '1m')
+      .forEach(opt => {
+        const card = document.createElement('button');
+        card.type = 'button';
+        card.className = 'set-modelcard';
+        card.setAttribute('role', 'radio');
+        card.dataset.value = opt.value;
+        if (opt.dataset.ctx === '1') card.dataset.ctx = '1';
+        const top = document.createElement('span');
+        top.className = 'set-mc-top';
+        const name = document.createElement('span');
+        name.className = 'set-mc-name';
+        name.textContent = opt.textContent;
+        top.appendChild(name);
+        const dot = document.createElement('span');
+        dot.className = 'set-mc-dot';
+        top.appendChild(dot);
+        card.appendChild(top);
+        const meta = document.createElement('span');
+        meta.className = 'set-mc-meta';
+        meta.textContent = opt.dataset.meta || '';
+        card.appendChild(meta);
+        if (opt.dataset.ctx === '1') {
+          const ctx = document.createElement('span');
+          ctx.className = 'set-mc-ctx';
+          ctx.textContent = '1M capable';
+          card.appendChild(ctx);
+        }
+        card.addEventListener('click', () => {
+          this._settingsModelBase = opt.value;
+          this._applyModelSelection();
+        });
+        grid.appendChild(card);
+      });
+    grid.dataset.built = '1';
+  },
+
+  /** Derive card + context-switch state from the select's stored value. */
+  _syncModelCards() {
+    const select = document.getElementById('appSettingsClaudeModel');
+    if (!select) return;
+    const value = select.value || '';
+    this._settingsModelBase = value.endsWith('[1m]') ? value.slice(0, -4) : value;
+    if (value.endsWith('[1m]')) {
+      const ctx = document.getElementById('appSettingsOpusContext1m');
+      if (ctx) ctx.checked = true;
+    }
+    this._applyModelSelection();
+  },
+
+  /** Compose card + context switch back into the select's value. */
+  _applyModelSelection() {
+    const select = document.getElementById('appSettingsClaudeModel');
+    const grid = document.getElementById('appSettingsModelCards');
+    if (!select || !grid) return;
+    const base = this._settingsModelBase || '';
+    let capable = false;
+    grid.querySelectorAll('.set-modelcard').forEach(card => {
+      const on = card.dataset.value === base;
+      card.classList.toggle('selected', on);
+      card.setAttribute('aria-checked', on ? 'true' : 'false');
+      if (on) capable = card.dataset.ctx === '1';
+    });
+    const ctxOn = !!document.getElementById('appSettingsOpusContext1m')?.checked;
+    select.value = base && capable && ctxOn ? `${base}[1m]` : base;
+    // A model with no 1M variant makes the switch inert; say so instead of
+    // leaving a toggle that looks like it does something.
+    const row = document.getElementById('appSettingsContextRow');
+    const desc = document.getElementById('appSettingsContextDesc');
+    const inert = !!base && !capable;
+    row?.classList.toggle('set-row-disabled', inert);
+    if (desc) {
+      desc.textContent = inert
+        ? 'The selected model has no 1M variant.'
+        : base
+          ? 'Available for Fable 5.1, Fable 5, Opus and Opus 4.6.'
+          : 'With no model pinned, this starts new sessions on Opus with a 1M window.';
+    }
+  },
+
+  _buildEffortSegment() {
+    const select = document.getElementById('appSettingsThinkingEffort');
+    const seg = document.getElementById('appSettingsEffortSegment');
+    if (!select || !seg || seg.dataset.built === '1' || !select.options) return;
+    seg.innerHTML = '';
+    [...select.options].forEach(opt => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.setAttribute('role', 'radio');
+      btn.dataset.value = opt.value;
+      btn.textContent = opt.textContent;
+      btn.addEventListener('click', () => {
+        select.value = opt.value;
+        this._syncEffortSegment();
+      });
+      seg.appendChild(btn);
+    });
+    seg.dataset.built = '1';
+  },
+
+  _syncEffortSegment() {
+    const select = document.getElementById('appSettingsThinkingEffort');
+    const seg = document.getElementById('appSettingsEffortSegment');
+    if (!select || !seg) return;
+    seg.querySelectorAll('button').forEach(btn => {
+      const on = btn.dataset.value === (select.value || '');
+      btn.classList.toggle('selected', on);
+      btn.setAttribute('aria-checked', on ? 'true' : 'false');
+    });
+  },
+
+  /**
+   * Live filter across every section. Everything stays mounted (that is the
+   * point of the single-document layout), so a search only hides units that do
+   * not match, then collapses groups and sections left with nothing visible.
+   */
+  _filterSettings(query) {
+    const doc = document.getElementById('appSettingsDoc');
+    if (!doc) return;
+    const q = (query || '').trim().toLowerCase();
+    const UNIT = '.set-row, .set-chip, .set-modelgrid, .set-minigrid, .event-type-grid, #appSettingsShortcutsList';
+    const units = [...doc.querySelectorAll(UNIT)];
+    let anyVisible = false;
+
+    units.forEach(unit => {
+      if (!q) {
+        unit.classList.remove('set-hit-hidden');
+        return;
+      }
+      const hay = `${unit.dataset?.search || ''} ${unit.textContent || ''}`.toLowerCase();
+      const hit = hay.includes(q);
+      unit.classList.toggle('set-hit-hidden', !hit);
+      if (hit) anyVisible = true;
+    });
+
+    // A chip wrapper is only empty when every chip inside it is hidden.
+    doc.querySelectorAll('.set-chips').forEach(wrap => {
+      const hasVisible = [...wrap.querySelectorAll('.set-chip')].some(c => !c.classList.contains('set-hit-hidden'));
+      wrap.classList.toggle('set-hit-hidden', !!q && !hasVisible);
+    });
+
+    doc.querySelectorAll('.set-group').forEach(group => {
+      const hasVisible = [...group.querySelectorAll(UNIT)].some(u => !u.classList.contains('set-hit-hidden'));
+      group.classList.toggle('set-hit-hidden', !!q && !hasVisible);
+      // An Advanced group that matches must open, or the hit stays invisible.
+      if (q && hasVisible) group.classList.add('open');
+    });
+
+    doc.querySelectorAll('.set-section').forEach(section => {
+      const hasVisible = [...section.querySelectorAll('.set-group')].some(g => !g.classList.contains('set-hit-hidden'));
+      section.classList.toggle('set-hit-hidden', !!q && !hasVisible);
+    });
+
+    // The live preview sits outside any group, so it survives the sweep above;
+    // a search is asking for one row, not for the scale model around it.
+    doc.querySelectorAll('.set-preview').forEach(pv => pv.classList.toggle('set-hit-hidden', !!q));
+
+    const empty = document.getElementById('appSettingsSearchEmpty');
+    if (empty) empty.hidden = !q || anyVisible;
+    if (!q) doc.querySelectorAll('.set-group-advanced').forEach(g => g.classList.remove('open'));
+  },
+
   closeAppSettings() {
+    this._toggleSettingsJump(false);
     document.getElementById('appSettingsModal').classList.remove('active');
 
     // Deactivate focus trap and restore focus
@@ -456,10 +1023,264 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  // ───────────────────────────────────────────────────────────────
+  // Self-Update (App Settings → Updates). Backend: src/web/self-update.ts.
+  // ───────────────────────────────────────────────────────────────
+
+  /** Friendly label for an in-flight update phase. */
+  _updatePhaseText(phase) {
+    return {
+      queued: 'Queued…',
+      preparing: 'Preparing…',
+      stashing: 'Stashing local changes…',
+      fetching: 'Fetching release…',
+      checkout: 'Checking out release…',
+      installing: 'Installing dependencies…',
+      building: 'Building…',
+      restarting: 'Restarting Codeman…',
+    }[phase] || phase;
+  },
+
+  /** Populate the version row and clear transient UI when the modal opens. */
+  _initUpdatesSection() {
+    const verEl = this.$('updateCurrentVersion');
+    if (verEl) verEl.textContent = (this.$('versionDisplay')?.textContent || '').trim() || '—';
+    for (const id of ['updateResult', 'updateActionRow', 'updateNotes', 'updateProgress']) {
+      const el = this.$(id);
+      if (el) el.style.display = 'none';
+    }
+    this._updateCheck = null;
+  },
+
+  _setUpdateResult(html) {
+    const el = this.$('updateResult');
+    if (el) { el.style.display = 'block'; el.innerHTML = html; }
+  },
+
+  _setUpdateProgress(html) {
+    const el = this.$('updateProgress');
+    if (el) { el.style.display = 'block'; el.innerHTML = html; }
+  },
+
+  /** Manual "Check for updates" — asks the server to query GitHub. */
+  async checkForUpdate() {
+    const btn = this.$('updateCheckBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+    const data = await this._apiJson('/api/system/update/check');
+    if (btn) { btn.disabled = false; btn.textContent = 'Check now'; }
+
+    const actionRow = this.$('updateActionRow');
+    const notes = this.$('updateNotes');
+    if (actionRow) actionRow.style.display = 'none';
+    if (notes) notes.style.display = 'none';
+
+    if (!data) {
+      this._setUpdateResult('Could not check for updates. Try again later.');
+      return;
+    }
+    this._updateCheck = data;
+    const verEl = this.$('updateCurrentVersion');
+    if (verEl && data.currentVersion) verEl.textContent = `v${data.currentVersion}`;
+
+    // `docker-compose` self-updates in place like `git` does — the container
+    // restarts itself. Anything else cannot.
+    if (data.installKind && data.installKind !== 'git' && data.installKind !== 'docker-compose') {
+      const hint =
+        data.supervisor === 'docker-compose'
+          ? 'Update from the Docker host with <code>docker/Start-Codeman.sh</code>.'
+          : 'Update with <code>npm i -g aicodeman@latest</code>.';
+      this._setUpdateResult(`This install can't update itself (${escapeHtml(data.installKind)}). ${hint}`);
+      return;
+    }
+    if (data.selfUpdateEnabled === false) {
+      this._setUpdateResult('In-app updates are disabled on this server (CODEMAN_DISABLE_SELF_UPDATE=1).');
+      return;
+    }
+    if (data.error && !data.updateAvailable) {
+      this._setUpdateResult(escapeHtml(data.error));
+      return;
+    }
+    // A container release that changes the ENVIRONMENT (Dockerfile, compose file
+    // or new .env keys) cannot be applied by the container restarting itself, so
+    // the update button is never offered — the host command is, instead. The
+    // server re-checks this on POST, so hiding the button is UX, not the gate.
+    const blockers = data.environment?.blockers || [];
+    if (data.updateAvailable && blockers.length > 0) {
+      const reasons = blockers
+        .map((b) => {
+          const details = b.details?.length ? `<br><code>${escapeHtml(b.details.join(' '))}</code>` : '';
+          return `<li>${escapeHtml(b.message)}${details}</li>`;
+        })
+        .join('');
+      this._setUpdateResult(
+        `<strong>v${escapeHtml(data.latestVersion || '')}</strong> needs a rebuild on the Docker host` +
+          ` (current v${escapeHtml(data.currentVersion || '')}):<ul>${reasons}</ul>` +
+          `Run <code>${escapeHtml(data.environment?.hostCommand || 'docker/Start-Codeman.sh')}</code> there to apply it.`
+      );
+      if (notes && data.notes) {
+        notes.style.display = 'block';
+        notes.textContent = data.notes;
+      }
+      return;
+    }
+
+    if (data.updateAvailable && data.latestVersion) {
+      this._setUpdateResult(
+        `Update available: <strong>v${escapeHtml(data.latestVersion)}</strong> &nbsp;(current v${escapeHtml(data.currentVersion || '')})`
+      );
+      const label = this.$('updateActionLabel');
+      if (label) label.textContent = `Update to v${data.latestVersion}`;
+      if (actionRow) actionRow.style.display = 'flex';
+      const nowBtn = this.$('updateNowBtn');
+      if (nowBtn) { nowBtn.disabled = false; nowBtn.textContent = 'Update now'; }
+      if (notes && data.notes) {
+        notes.style.display = 'block';
+        notes.textContent = data.notes;
+      }
+    } else {
+      this._setUpdateResult(`You're up to date (v${escapeHtml(data.currentVersion || '')}).`);
+    }
+  },
+
+  /** Start the update, then poll status across the service restart. */
+  async startSelfUpdate() {
+    const target = this._updateCheck?.latestVersion ? `v${this._updateCheck.latestVersion}` : 'the latest release';
+    if (!confirm(`Update Codeman to ${target}? The server will restart and this page will reload.`)) return;
+
+    const btn = this.$('updateNowBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+    const res = await this._apiPost('/api/system/update', {});
+    if (!res || !res.ok) {
+      let msg = 'Failed to start the update.';
+      try { const j = await res.json(); if (typeof j?.error === 'string' && j.error) msg = j.error; } catch {}
+      this._setUpdateProgress(`<span style="color:var(--danger,#e5534b)">${escapeHtml(msg)}</span>`);
+      if (btn) { btn.disabled = false; btn.textContent = 'Update now'; }
+      return;
+    }
+    const actionRow = this.$('updateActionRow');
+    if (actionRow) actionRow.style.display = 'none';
+    const notes = this.$('updateNotes');
+    if (notes) notes.style.display = 'none';
+    this._setUpdateProgress('Starting update…');
+    this._pollUpdateStatus();
+  },
+
+  _stopUpdatePolling() {
+    if (this._updatePollTimer) { clearInterval(this._updatePollTimer); this._updatePollTimer = null; }
+  },
+
+  /**
+   * Poll the status file every 1.5s. Survives the connection drop while the
+   * server restarts (fetch throws → "restarting"), then reads the reconciled
+   * terminal state from the freshly-booted server.
+   */
+  _pollUpdateStatus() {
+    this._stopUpdatePolling();
+    const terminal = new Set(['completed', 'completed-needs-manual-restart', 'failed', 'idle']);
+    const poll = async () => {
+      let data = null;
+      try {
+        const res = await fetch('/api/system/update/status');
+        if (res.ok) {
+          const env = await res.json();
+          data = env && env.success === true ? env.data : env;
+        }
+      } catch { /* server restarting — keep polling */ }
+
+      if (!data) {
+        this._setUpdateProgress('↻ Restarting Codeman…');
+        return;
+      }
+      if (!terminal.has(data.phase)) {
+        // Prefer the live status message — the updater's heartbeat enriches it with
+        // the latest npm/build output line so a slow step doesn't look frozen — and
+        // fall back to the static phase label. Append total elapsed so the counter
+        // keeps ticking between heartbeats: a clear "still working" signal.
+        const label = (data.message && data.message.trim()) ? data.message.trim() : this._updatePhaseText(data.phase);
+        let elapsed = '';
+        if (data.startedAt) {
+          const secs = Math.max(0, Math.round((Date.now() - data.startedAt) / 1000));
+          elapsed = ` <span style="color:var(--text-secondary)">· ${secs}s</span>`;
+        }
+        this._setUpdateProgress(`<span class="tunnel-spinner"></span> ${escapeHtml(label)}${elapsed}`);
+        return;
+      }
+      this._stopUpdatePolling();
+      if (data.phase === 'completed') {
+        let html = `<span style="color:var(--success,#3fb950)">✓ Updated to v${escapeHtml(data.toVersion || '')}. Reloading…</span>`;
+        if (data.stashRef) {
+          html += `<br><span style="color:var(--text-secondary)">Local changes stashed as <code>${escapeHtml(data.stashRef)}</code> — run <code>git stash pop</code> to restore.</span>`;
+        }
+        this._setUpdateProgress(html);
+        setTimeout(() => location.reload(), 2500);
+      } else if (data.phase === 'completed-needs-manual-restart') {
+        this._setUpdateProgress(
+          `Update staged. Restart Codeman to apply:<br><code>${escapeHtml(data.manualRestartCommand || 'restart codeman web')}</code>`
+        );
+      } else if (data.phase === 'failed') {
+        let html = `<span style="color:var(--danger,#e5534b)">✗ ${escapeHtml(data.message || 'Update failed')}.</span>`;
+        if (data.error) html += `<br><span style="color:var(--text-secondary)">${escapeHtml(data.error)}</span>`;
+        html += `<br><span style="color:var(--text-secondary)">The previous version is still running.</span>`;
+        if (data.stashRef) {
+          html += `<br><span style="color:var(--text-secondary)">Local changes stashed as <code>${escapeHtml(data.stashRef)}</code>.</span>`;
+        }
+        this._setUpdateProgress(html);
+        const nowBtn = this.$('updateNowBtn');
+        const actionRow = this.$('updateActionRow');
+        if (nowBtn) { nowBtn.disabled = false; nowBtn.textContent = 'Try again'; }
+        if (actionRow) actionRow.style.display = 'flex';
+      }
+    };
+    poll();
+    this._updatePollTimer = setInterval(poll, 1500);
+  },
+
+  /**
+   * Is `tool` installed on the server? Reads `window.__codemanCliAvailable`,
+   * injected by renderIndexHtml (see the comment there for why this is injected
+   * rather than fetched per surface).
+   *
+   * Unknown reads as AVAILABLE. A missing flag means the page was rendered by a
+   * build that predates the injection, or by a solo popup: hiding every run
+   * button on a doubt would leave nothing to click, and the pre-existing failure
+   * mode for a genuinely missing CLI is just an error toast.
+   */
+  isCliAvailable(tool) {
+    const flags = window.__codemanCliAvailable;
+    if (!flags || typeof flags !== 'object') return true;
+    return flags[tool] !== false;
+  },
+
+  /**
+   * #200: show a welcome-screen button only where the thing it launches exists.
+   * The markup ships them hidden, so an old cached page can never flash a button
+   * for a tool this server does not have.
+   */
+  applyWelcomeCliVisibility() {
+    const buttons = [
+      ['welcomeClaudeBtn', 'claude'],
+      ['welcomeOpencodeBtn', 'opencode'],
+      ['welcomeAntigravityBtn', 'antigravity'],
+      ['welcomeOmpBtn', 'omp'],
+      ['welcomeGeminiBtn', 'gemini'],
+      ['welcomePiBtn', 'pi'],
+      ['welcomeGrokBtn', 'grok'],
+      ['welcomeDeepSeekBtn', 'deepseek'],
+      // Not a run mode, same reasoning: offering a Cloudflare Tunnel on a box
+      // without cloudflared can only ever produce "cloudflared not found".
+      ['welcomeTunnelBtn', 'cloudflared'],
+    ];
+    for (const [id, tool] of buttons) {
+      const btn = document.getElementById(id);
+      if (btn) btn.style.display = this.isCliAvailable(tool) ? 'flex' : 'none';
+    }
+  },
+
   async loadTunnelStatus() {
     try {
       const res = await fetch('/api/tunnel/status');
-      const status = await res.json();
+      const env = await res.json();
+      const status = env?.success === true ? env.data : env;
       const active = status.running && status.url;
       this._tunnelUrl = active ? status.url : null;
       this._updateTunnelUrlDisplay(this._tunnelUrl);
@@ -528,7 +1349,8 @@ Object.assign(CodemanApp.prototype, {
         if (!res.ok) throw new Error('Tunnel not running');
         return res.json();
       })
-      .then(data => {
+      .then(env => {
+        const data = env?.success === true ? env.data : env;
         const container = document.getElementById('tunnelQrContainer');
         if (container && data.svg) container.innerHTML = data.svg;
         // Show auth badge, countdown, and regenerate button when auth is enabled
@@ -561,7 +1383,8 @@ Object.assign(CodemanApp.prototype, {
     // Fetch URL for display
     fetch('/api/tunnel/status')
       .then(r => r.json())
-      .then(status => {
+      .then(env => {
+        const status = env?.success === true ? env.data : env;
         const urlEl = document.getElementById('tunnelQrUrl');
         if (urlEl && status.url) {
           urlEl.textContent = status.url;
@@ -593,7 +1416,8 @@ Object.assign(CodemanApp.prototype, {
   _refreshTunnelQrFromApi() {
     fetch('/api/tunnel/qr')
       .then(res => res.ok ? res.json() : null)
-      .then(data => {
+      .then(env => {
+        const data = env?.success === true ? env.data : env;
         if (!data?.svg) return;
         const container = document.getElementById('tunnelQrContainer');
         if (container) container.innerHTML = data.svg;
@@ -639,11 +1463,18 @@ Object.assign(CodemanApp.prototype, {
     btn.disabled = true;
     try {
       const newEnabled = !isActive;
-      await fetch('/api/settings', {
+      const res = await fetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tunnelEnabled: newEnabled }),
       });
+      // COD-55: server refuses an unauthenticated public tunnel (403). Surface it.
+      if (newEnabled && (await this._handleTunnelEnableRefusal(res))) {
+        this._dismissTunnelConnecting();
+        this._updateWelcomeTunnelBtn(false);
+        btn.disabled = false;
+        return;
+      }
       if (newEnabled) {
         this._showTunnelConnecting();
         // Poll tunnel status as fallback in case SSE event is missed
@@ -708,7 +1539,8 @@ Object.assign(CodemanApp.prototype, {
     this._tunnelPollTimer = setTimeout(async () => {
       try {
         const res = await fetch('/api/tunnel/status');
-        const status = await res.json();
+        const env = await res.json();
+        const status = env?.success === true ? env.data : env;
         if (status.running && status.url) {
           // Tunnel is up — update UI
           this._dismissTunnelConnecting();
@@ -767,7 +1599,7 @@ Object.assign(CodemanApp.prototype, {
       }
       fetch('/api/tunnel/qr')
         .then(r => { if (!r.ok) throw new Error(); return r.json(); })
-        .then(data => { if (data.svg) qrInner.innerHTML = data.svg; })
+        .then(env => { const data = env?.success === true ? env.data : env; if (data.svg) qrInner.innerHTML = data.svg; })
         .catch(() => { qrInner.innerHTML = '<div style="color:#999;font-size:11px;padding:20px">QR unavailable</div>'; });
     } else {
       clearTimeout(this._welcomeQrShrinkTimer);
@@ -839,7 +1671,8 @@ Object.assign(CodemanApp.prototype, {
     // Fetch tunnel info
     try {
       const res = await fetch('/api/tunnel/info');
-      const info = await res.json();
+      const env = await res.json();
+      const info = env?.success === true ? env.data : env;
       this._renderTunnelPanel(info);
     } catch {
       const body = document.getElementById('tunnelPanelBody');
@@ -941,13 +1774,82 @@ Object.assign(CodemanApp.prototype, {
     return `${Math.floor(hrs / 24)}d ago`;
   },
 
+  /**
+   * COD-55: detect the server's refusal to start an unauthenticated public tunnel.
+   * The PUT /api/settings route returns a 4xx with { success:false, error } when no
+   * CODEMAN_PASSWORD is set and the unauthenticated-network opt-in is not acknowledged.
+   * Shows the server's (actionable) message as an error toast.
+   * @param {Response|null} res - the fetch Response from the settings PUT
+   * @returns {Promise<boolean>} true if the tunnel-enable was refused (caller should abort)
+   */
+  async _handleTunnelEnableRefusal(res) {
+    if (!res || res.ok) return false;
+    let message = 'Tunnel refused: set CODEMAN_PASSWORD before exposing Codeman publicly.';
+    try {
+      const body = await res.json();
+      if (body && body.error) message = body.error;
+    } catch {
+      /* non-JSON body — use the default message */
+    }
+    // 403 = the no-password safety refusal (COD-55). Warn loudly and let the
+    // operator acknowledge the risk; on confirm, retry with explicit acknowledgment.
+    if (res.status === 403) {
+      const confirmed = confirm(
+        '⚠️ SECURITY WARNING — no password set\n\n' +
+          'Enabling the Cloudflare tunnel will publish THIS machine to a public URL with ' +
+          'NO login. Anyone who gets the URL has full terminal control — effectively remote ' +
+          'code execution on your computer.\n\n' +
+          'Strongly recommended: set CODEMAN_PASSWORD instead.\n\n' +
+          'Enable the unauthenticated public tunnel anyway?'
+      );
+      if (!confirmed) {
+        this._dismissTunnelConnecting?.();
+        this.showToast('Tunnel not enabled', 'info');
+        return true;
+      }
+      try {
+        const retry = await fetch('/api/settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tunnelEnabled: true, acknowledgeUnauthTunnel: true }),
+        });
+        if (retry.ok) {
+          this.showToast('Public tunnel enabling — no password set ⚠️', 'warning');
+          return false; // proceed with the caller's success/connecting path
+        }
+        let m = 'Failed to enable tunnel.';
+        try {
+          const b = await retry.json();
+          if (b && b.error) m = b.error;
+        } catch {
+          /* non-JSON */
+        }
+        this._dismissTunnelConnecting?.();
+        this.showToast(m, 'error');
+        return true;
+      } catch {
+        this._dismissTunnelConnecting?.();
+        this.showToast('Failed to enable tunnel', 'error');
+        return true;
+      }
+    }
+    this._dismissTunnelConnecting?.();
+    this.showToast(message, 'error');
+    return true;
+  },
+
   async _tunnelPanelToggle(enable) {
     try {
-      await fetch('/api/settings', {
+      const res = await fetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tunnelEnabled: enable }),
       });
+      // COD-55: server refuses an unauthenticated public tunnel (403). Surface it.
+      if (enable && (await this._handleTunnelEnableRefusal(res))) {
+        this.closeTunnelPanel();
+        return;
+      }
       if (enable) {
         this._updateTunnelIndicator(false);
         const indicator = document.getElementById('tunnelIndicator');
@@ -973,7 +1875,8 @@ Object.assign(CodemanApp.prototype, {
       this.showToast('All sessions revoked', 'success');
       // Refresh panel
       const res = await fetch('/api/tunnel/info');
-      const info = await res.json();
+      const env = await res.json();
+      const info = env?.success === true ? env.data : env;
       this._renderTunnelPanel(info);
     } catch {
       this.showToast('Failed to revoke sessions', 'error');
@@ -1068,7 +1971,8 @@ Object.assign(CodemanApp.prototype, {
 
     try {
       const res = await fetch(`/api/session-lifecycle?${params}`);
-      const data = await res.json();
+      const env = await res.json();
+      const data = env?.success === true ? env.data : env;
       const tbody = document.getElementById('lifecycleTableBody');
       const empty = document.getElementById('lifecycleEmpty');
 
@@ -1105,35 +2009,115 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  /**
+   * Paint both Voice status rows: which provider a mic press would use, and what
+   * the server reports about its Claude login. Called on open and again once the
+   * /api/voice/status probe resolves.
+   */
+  _renderVoiceProviderStatus() {
+    const providerEl = document.getElementById('voiceProviderStatus');
+    if (providerEl) {
+      const providerName = VoiceInput.getActiveProviderName();
+      providerEl.textContent = providerName;
+      const live = providerName.startsWith('Deepgram Nova') || providerName.startsWith('Claude (this');
+      providerEl.className = 'voice-provider-status' + (live ? ' active' : '');
+    }
+    const claudeEl = document.getElementById('voiceClaudeStatus');
+    if (!claudeEl) return;
+    const status = VoiceInput._claudeStatus;
+    const text = !status
+      ? 'Checking...'
+      : status.available
+        ? `Ready${status.subscriptionType ? ` (${status.subscriptionType})` : ''}`
+        : status.reason === 'expired'
+          ? 'Login expired - run a Claude session to refresh'
+          : status.reason === 'no-credentials'
+            ? 'No Claude Code login on the server'
+            : status.reason === 'malformed'
+              ? 'Claude credentials unreadable'
+              : 'Off - enable it above';
+    claudeEl.textContent = text;
+    claudeEl.className = 'voice-provider-status' + (status?.available ? ' active' : '');
+  },
+
   async saveAppSettings() {
+    // Gesture overlay is injected at page render (server-side), so a change to it
+    // only takes effect on reload — remember the prior value to decide below.
+    const _prev = this.loadAppSettingsFromStorage();
+    const _prevGestureEnabled = (_prev.gestureControlEnabled ?? false) === true;
+    // WebGL toggle: default ON (desktop), so only an explicit stored false counts
+    // as "previously off" — used below to detect a real OFF→ON flip.
+    const _prevWebglEnabled = (_prev.webglRendererEnabled ?? true) === true;
     const settings = {
+      displayName: window.CodemanI18n?.normalizeDisplayName(
+        document.getElementById('appSettingsDisplayName').value
+      ) || 'Codeman',
+      language: window.CodemanI18n?.normalizeLanguage(
+        document.getElementById('appSettingsLanguage').value
+      ) || 'en',
       defaultClaudeMdPath: document.getElementById('appSettingsClaudeMdPath').value.trim(),
       defaultWorkingDir: document.getElementById('appSettingsDefaultDir').value.trim(),
       ralphTrackerEnabled: document.getElementById('appSettingsRalphEnabled').checked,
       // Header visibility settings
       showFontControls: document.getElementById('appSettingsShowFontControls').checked,
       showSystemStats: document.getElementById('appSettingsShowSystemStats').checked,
-      showTokenCount: document.getElementById('appSettingsShowTokenCount').checked,
-      showCost: document.getElementById('appSettingsShowCost').checked,
       showLifecycleLog: document.getElementById('appSettingsShowLifecycleLog').checked,
+      showResponseViewer: document.getElementById('appSettingsShowResponseViewer').checked,
+      showFileViewerButton: document.getElementById('appSettingsShowFileViewerButton').checked,
+      showAttachmentsButton: document.getElementById('appSettingsShowAttachmentsButton').checked,
       showMonitor: document.getElementById('appSettingsShowMonitor').checked,
       showProjectInsights: document.getElementById('appSettingsShowProjectInsights').checked,
       showFileBrowser: document.getElementById('appSettingsShowFileBrowser').checked,
       showSubagents: document.getElementById('appSettingsShowSubagents').checked,
+      showUltracodeAgents: document.getElementById('appSettingsShowUltracodeAgents').checked,
+      approvalsInboxEnabled: document.getElementById('appSettingsApprovalsInbox').checked,
+      readMyMindEnabled: document.getElementById('appSettingsReadMyMind').checked,
+      ultracodeFloatingWindows: document.getElementById('appSettingsUltracodeFloatingWindows').checked,
+      showMultiMonitorButton: document.getElementById('appSettingsShowMultiMonitorButton').checked,
+      showPlanUsageLimits: document.getElementById('appSettingsShowPlanUsageLimits').checked,
+      showRedrawButton: document.getElementById('appSettingsShowRedrawButton').checked,
+      mobileOverviewEnabled: document.getElementById('appSettingsMobileOverview').checked,
+      sessionLineageLines: document.getElementById('appSettingsLineageLines').checked,
+      showSessionButton: document.getElementById('appSettingsShowSessionButton').checked,
+      showAwayDigestButton: document.getElementById('appSettingsShowAwayDigestButton').checked,
+      showCronButton: document.getElementById('appSettingsShowCronButton').checked,
+      gestureControlEnabled: document.getElementById('appSettingsGestureControl').checked,
       subagentTrackingEnabled: document.getElementById('appSettingsSubagentTracking').checked,
       subagentActiveTabOnly: document.getElementById('appSettingsSubagentActiveTabOnly').checked,
       imageWatcherEnabled: document.getElementById('appSettingsImageWatcherEnabled').checked,
       tunnelEnabled: document.getElementById('appSettingsTunnelEnabled').checked,
       localEchoEnabled: document.getElementById('appSettingsLocalEcho').checked,
+      autoCopySelection: document.getElementById('appSettingsAutoCopySelection').checked,
+      terminalFontFamily: document.getElementById('appSettingsTerminalFont').value.trim(),
+      terminalWheelLocalScrollback: document.getElementById('appSettingsTerminalWheelLocal').checked,
       cjkInputEnabled: document.getElementById('appSettingsCjkInput').checked,
+      webglRendererEnabled: document.getElementById('appSettingsWebglRenderer').checked,
       extendedKeyboardBar: document.getElementById('appSettingsExtendedKeyboardBar').checked,
       tabTwoRows: document.getElementById('appSettingsTabTwoRows').checked,
+      tabOrientation: document.getElementById('appSettingsTabOrientation').value,
+      tabRailWidth: this.readTabRailWidthSetting?.() ?? 256,
+      tabRailDetail: document.getElementById('appSettingsTabRailDetail').value,
+      showTabDetachButton: document.getElementById('appSettingsShowTabDetachButton').checked,
+      sessionListLayout: document.getElementById('appSettingsSessionListLayout').value,
+      sessionSidebarFontSize: this.resolveSessionSidebarFontSize(
+        document.getElementById('appSettingsSessionSidebarFontSize').value
+      ),
+      skin: document.getElementById('appSettingsSkin').value,
       // Claude CLI settings
       claudeMode: document.getElementById('appSettingsClaudeMode').value,
       allowedTools: document.getElementById('appSettingsAllowedTools').value.trim(),
+      // Codex CLI settings
+      codexDangerouslyBypassApprovals: document.getElementById('appSettingsCodexDangerouslyBypassApprovals').checked,
+      codexAnimationsEnabled: document.getElementById('appSettingsCodexAnimations').checked,
       // Claude Permissions settings
       agentTeamsEnabled: document.getElementById('appSettingsAgentTeams').checked,
+      agentSkillEnabled: document.getElementById('appSettingsAgentSkill').checked,
+      workspaceHooksEnabled: document.getElementById('appSettingsWorkspaceHooks').checked,
+      claudeVoiceEnabled: document.getElementById('appSettingsClaudeVoice').checked,
+      claudeModel: document.getElementById('appSettingsClaudeModel').value,
       opusContext1mEnabled: document.getElementById('appSettingsOpusContext1m').checked,
+      remoteAutoReconnect: document.getElementById('appSettingsRemoteAutoReconnect').checked,
+      thinkingEffort: document.getElementById('appSettingsThinkingEffort').value,
       // CPU Priority settings
       nice: {
         enabled: document.getElementById('appSettingsNiceEnabled').checked,
@@ -1141,12 +2125,36 @@ Object.assign(CodemanApp.prototype, {
       },
     };
 
+    // The "Token Count" / "Show Cost ($)" header toggles were removed from the
+    // UI, but their features still read settings.showTokenCount / settings.showCost
+    // (applyHeaderVisibilitySettings, the header cost render). saveAppSettings
+    // rebuilds `settings` fresh from the DOM (a full replacement, not a merge), so
+    // without this these keys would be DROPPED on every save and fall back to their
+    // defaults — silently re-enabling the token chip for anyone who'd turned it off,
+    // with no UI left to turn it back off. Preserve the prior stored preference.
+    if (_prev.showTokenCount !== undefined) settings.showTokenCount = _prev.showTokenCount;
+    if (_prev.showCost !== undefined) settings.showCost = _prev.showCost;
+    // Shortcut overrides are edited from the Shortcuts tab (not rebuilt from the
+    // general-settings DOM), so the fresh rebuild would drop them on every save.
+    if (_prev.shortcutOverrides !== undefined) settings.shortcutOverrides = _prev.shortcutOverrides;
+
     // Save to localStorage
     this.saveAppSettingsToStorage(settings);
     this._updateLocalEchoState();
+    this.applyTerminalFontFamily?.(settings.terminalFontFamily);
+
+    // A real OFF→ON flip of the WebGL toggle retires the GPU-stall auto-fallback
+    // marker so the next reload actually re-tries WebGL. Only the transition
+    // clears it — an incidental save with the checkbox default-checked must NOT
+    // defeat the sticky safety net (shouldSkipWebGL treats stored true like the
+    // untouched default at page load).
+    if (!_prevWebglEnabled && settings.webglRendererEnabled) {
+      try { localStorage.removeItem('codeman-webgl-disabled'); } catch {}
+    }
 
     // Save voice settings to localStorage + include in server payload for cross-device sync
     const voiceSettings = {
+      provider: document.getElementById('voiceProvider').value,
       apiKey: document.getElementById('voiceDeepgramKey').value.trim(),
       language: document.getElementById('voiceLanguage').value,
       keyterms: document.getElementById('voiceKeyterms').value.trim(),
@@ -1226,7 +2234,7 @@ Object.assign(CodemanApp.prototype, {
           audio: document.getElementById('eventSubagentAudio').checked,
         },
       },
-      _version: 4,
+      _version: 5,
     };
     if (this.notificationManager) {
       this.notificationManager.preferences = notifPrefsToSave;
@@ -1238,23 +2246,93 @@ Object.assign(CodemanApp.prototype, {
 
     // Apply header visibility immediately
     this.applyHeaderVisibilitySettings();
-    this.applyTabWrapSettings();
+    this.applySkin();
+    this.applyLocalization();
+    // Re-parents #sessionTabs between header host and sidebar if the layout
+    // changed, then calls applyTabWrapSettings() itself — do not call both.
+    this.applySessionListLayout();
+    this.applyTabOrientation({ settleRailWidth: true });
+    this.applyLineageLineSettings?.();
     this._updateTokensImmediate();  // Re-render token display (picks up showCost change)
     this.applyMonitorVisibility();
+    this.renderApprovals?.();  // Approvals Inbox toggle (hide/show bell + drawer)
     this.renderProjectInsightsPanel();  // Re-render to apply visibility setting
     this.updateSubagentWindowVisibility();  // Apply subagent window visibility setting
 
     // Apply CJK input visibility immediately
     this._updateCjkInputState();
 
+    // The phone home surface (overview vs welcome) may have just been toggled.
+    // Only re-decide while a home screen is actually up.
+    if (!this.activeSessionId) this.showWelcome();
+
     // Apply keyboard bar mode
     KeyboardAccessoryBar.setMode(settings.extendedKeyboardBar ? 'extended' : 'simple');
 
-    // Save to server (includes notification prefs for cross-browser persistence)
-    // Strip device-specific keys — localEchoEnabled/cjkInputEnabled are per-platform
-    const { localEchoEnabled: _leo, cjkInputEnabled: _cjk, extendedKeyboardBar: _ekb, ...serverSettings } = settings;
+    // Save to server (includes notification prefs for cross-browser persistence).
+    // Strip device-specific DISPLAY keys so they never sync across devices —
+    // localEcho/cjk/extendedKeyboard/skin are per-platform, and showPlanUsageLimits
+    // is per-device too (desktop can show the usage chip while mobile stays hidden).
+    // webglRendererEnabled is per-device as well (renderer choice is GPU-specific,
+    // and syncing would leak mobile's hidden-checkbox false onto desktop); it's
+    // also absent from SettingsUpdateSchema, which is .strict() — sending it
+    // would 400 the whole settings PUT.
+    // Telemetry COLLECTION is requested out-of-band via statusLineTelemetry (sent on
+    // ENABLE only, so a device with the chip OFF never strips the exporter that
+    // another device's chip depends on — see system-routes settings handler).
+    const {
+      localEchoEnabled: _leo,
+      cjkInputEnabled: _cjk,
+      extendedKeyboardBar: _ekb,
+      skin: _skin,
+      language: _language,
+      showPlanUsageLimits: _pul,
+      showAttachmentsButton: _ahb,
+      showFileViewerButton: _fvb,
+      webglRendererEnabled: _wgl,
+      terminalWheelLocalScrollback: _twls,
+      // Copy-on-select. Per-device (clipboard access differs by device and by
+      // origin: the plain-HTTP LAN install has no navigator.clipboard at all)
+      // and absent from SettingsUpdateSchema (.strict()), so sending it would
+      // 400 the whole settings PUT.
+      autoCopySelection: _acs,
+      // Per-device by nature (the font must exist on the device) and absent
+      // from SettingsUpdateSchema (.strict()) — sending it would 400 the PUT.
+      terminalFontFamily: _tff,
+      // Per-device header/toolbar button toggles — client-only, and absent from
+      // SettingsUpdateSchema (.strict()), so sending them would 400 the PUT.
+      showSessionButton: _ssb,
+      showAwayDigestButton: _adb,
+      showCronButton: _crb,
+      showTabDetachButton: _tdb,
+      // Phone-only home surface, and absent from SettingsUpdateSchema (.strict()).
+      mobileOverviewEnabled: _mov,
+      // Desktop-only tab decoration, per-device, and likewise absent from the
+      // .strict() schema — syncing it would push a desktop-shaped choice onto
+      // devices that cannot render it at all.
+      sessionLineageLines: _sll,
+      ...serverSettings
+    } = settings;
     try {
-      await this._apiPut('/api/settings', { ...serverSettings, notificationPreferences: notifPrefsToSave, voiceSettings });
+      const res = await this._apiPut('/api/settings', {
+        ...serverSettings,
+        ...(settings.showPlanUsageLimits ? { statusLineTelemetry: true } : {}),
+        notificationPreferences: notifPrefsToSave,
+        voiceSettings,
+      });
+
+      // COD-55: the server refuses an unauthenticated public tunnel with a 403 — which
+      // rejects the WHOLE settings PUT. Surface the message and revert the tunnel toggle
+      // (in the UI + localStorage) so it doesn't look enabled. Other settings persisted
+      // to localStorage above still apply locally.
+      if (settings.tunnelEnabled && (await this._handleTunnelEnableRefusal(res))) {
+        settings.tunnelEnabled = false;
+        this.saveAppSettingsToStorage(settings);
+        const cb = document.getElementById('appSettingsTunnelEnabled');
+        if (cb) cb.checked = false;
+        this.closeAppSettings();
+        return;
+      }
 
       // Save model configuration separately
       await this.saveModelConfigFromSettings();
@@ -1271,6 +2349,22 @@ Object.assign(CodemanApp.prototype, {
     }
 
     this.closeAppSettings();
+
+    // Voice availability is a server-side answer, so re-probe after a save:
+    // otherwise the mic keeps using the pre-save provider until the next reload.
+    VoiceInput.refreshClaudeStatus();
+
+    // The gesture overlay is injected at page render (server reads
+    // gestureControlEnabled from settings.json), so a change only takes effect on
+    // reload. Reload when it actually changed — the server PUT above already
+    // persisted the new value.
+    if (settings.gestureControlEnabled !== _prevGestureEnabled) {
+      this.showToast(
+        settings.gestureControlEnabled ? 'Enabling gesture control — reloading…' : 'Disabling gesture control — reloading…',
+        'info'
+      );
+      setTimeout(() => location.reload(), 400);
+    }
   },
 
   // Load model configuration from server for the settings modal
@@ -1349,17 +2443,21 @@ Object.assign(CodemanApp.prototype, {
     return settings.ralphTrackerEnabled ?? false;
   },
 
-  // Get the settings storage key based on device type (mobile vs desktop)
+  // Keep the settings namespace stable across foldable posture changes. Layout
+  // still follows viewport width, but an unfolded phone remains the same
+  // handheld device and must not silently switch to desktop preferences.
   getSettingsStorageKey() {
-    const isMobile = MobileDetection.getDeviceType() === 'mobile';
-    return isMobile ? 'codeman-app-settings-mobile' : 'codeman-app-settings';
+    const isHandheld =
+      MobileDetection.isHandheldDevice?.() ?? MobileDetection.getDeviceType() === 'mobile';
+    return isHandheld ? 'codeman-app-settings-mobile' : 'codeman-app-settings';
   },
 
   // Get default settings based on device type
   // Note: Notification prefs are handled separately by NotificationManager
   getDefaultSettings() {
-    const isMobile = MobileDetection.getDeviceType() === 'mobile';
-    if (isMobile) {
+    const isHandheld =
+      MobileDetection.isHandheldDevice?.() ?? MobileDetection.getDeviceType() === 'mobile';
+    if (isHandheld) {
       // Mobile defaults: minimal UI for small screens
       return {
         // Header visibility - hide everything on mobile
@@ -1372,12 +2470,42 @@ Object.assign(CodemanApp.prototype, {
         showProjectInsights: false,
         showFileBrowser: false,
         showSubagents: false,
+        showUltracodeAgents: false,
+        ultracodeFloatingWindows: false,
+        showMultiMonitorButton: false,
+        // Desktop defaults this ON (see planUsageChipEnabled); handhelds keep it
+        // OFF so the phone header stays minimal and the mobile-header-buttons
+        // policy guard keeps passing.
+        showPlanUsageLimits: false,
+        showAttachmentsButton: false,
+        showFileViewerButton: false,
+        showRedrawButton: false,
+        showSessionButton: false,
+        showAwayDigestButton: false,
+        showCronButton: false,
+        // Phone home screen: the C logo opens the session overview instead of the
+        // welcome screen. ON by default here, and the escape hatch if it ever
+        // misbehaves on a device (the gate treats only an explicit false as off).
+        mobileOverviewEnabled: true,
+        // Remote auto-reconnect (COD-108) — on by default
+        remoteAutoReconnect: true,
+        // Input
+        gestureControlEnabled: false,
         // Feature toggles - keep tracking on even on mobile
         subagentTrackingEnabled: true,
         subagentActiveTabOnly: true, // Only show subagents for active tab
         imageWatcherEnabled: false,
         ralphTrackerEnabled: false,
         tabTwoRows: false,
+        tabOrientation: 'horizontal',
+        tabRailWidth: 256,
+        tabRailDetail: 'rich',
+        sessionListLayout: 'header',
+        sessionSidebarFontSize: 12,
+        cjkInputEnabled: false,
+        terminalWheelLocalScrollback: false, // mobile scrolls via touch, not wheel
+        webglRendererEnabled: false, // mobile always uses the DOM renderer
+        skin: 'daylight-blue',
       };
     }
     // Desktop defaults - rely on ?? operators in apply functions
@@ -1415,12 +2543,67 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  // Apply the chosen skin live: sets the html[data-skin] attribute, syncs BOTH
+  // localStorage locations (the standalone 'codeman:skin' key the pre-paint head
+  // script reads + the app-settings blob field written by saveAppSettingsToStorage),
+  // updates window.__codemanSkin, and re-themes any live terminals.
+  applySkin() {
+    const settings = this.loadAppSettingsFromStorage();
+    const defaults = this.getDefaultSettings();
+    const skin = settings.skin ?? defaults.skin ?? 'daylight-blue';
+    document.documentElement.setAttribute('data-skin', skin);
+    window.__codemanSkin = skin;
+    const themeColor = getComputedStyle(document.documentElement).getPropertyValue('--bg-dark').trim();
+    if (themeColor) document.querySelector('meta[name="theme-color"]')?.setAttribute('content', themeColor);
+    try {
+      localStorage.setItem('codeman:skin', skin);
+    } catch (_e) {
+      /* private mode */
+    }
+    if (typeof this.applyTerminalSkin === 'function') this.applyTerminalSkin(skin);
+  },
+
+  // Apply the per-device language and the synced user-facing product name.
+  // The i18n layer updates both existing static nodes and future dynamic DOM.
+  applyLocalization() {
+    const settings = this.loadAppSettingsFromStorage();
+    const result = window.CodemanI18n?.configure({
+      language: settings.language,
+      displayName: settings.displayName,
+    });
+    if (result && this.notificationManager) {
+      this.notificationManager.originalTitle = document.title;
+    }
+  },
+
+  // Resolved per-device state of the plan-usage chip. Desktop defaults ON,
+  // handhelds default OFF (the mobile block in getDefaultSettings() sets false,
+  // and the mobile-header-buttons-policy guard depends on that staying false).
+  // Single source of truth for THREE call sites that must never disagree: the
+  // App Settings checkbox, the chip's visibility, and the statusLineTelemetry
+  // flag sent on session create. A chip shown without telemetry renders "—"
+  // forever, which is exactly the drift this helper prevents.
+  planUsageChipEnabled(settings = null) {
+    const s = settings ?? this.loadAppSettingsFromStorage();
+    return s.showPlanUsageLimits ?? this.getDefaultSettings().showPlanUsageLimits ?? true;
+  },
+
   applyHeaderVisibilitySettings() {
     const settings = this.loadAppSettingsFromStorage();
     const defaults = this.getDefaultSettings();
-    const showFontControls = settings.showFontControls ?? defaults.showFontControls ?? false;
-    const showSystemStats = settings.showSystemStats ?? defaults.showSystemStats ?? true;
-    const showTokenCount = settings.showTokenCount ?? defaults.showTokenCount ?? true;
+
+    // Tab pop-out (open-in-new-window) button: opt-in (App Settings → Tab Bar,
+    // default OFF, per-device). Mirrored as a class on <html>: styles.css hides
+    // .tab-detach without it (a tab that is already detached keeps its icon as
+    // the re-focus affordance for the popped-out window).
+    const showTabDetach = settings.showTabDetachButton ?? defaults.showTabDetachButton ?? false;
+    document.documentElement.classList.toggle('tabs-show-detach', showTabDetach);
+    const compactHeader = MobileDetection.getDeviceType() !== 'desktop';
+    const showFontControls = compactHeader ? false : (settings.showFontControls ?? defaults.showFontControls ?? false);
+    const showSystemStats = compactHeader ? false : (settings.showSystemStats ?? defaults.showSystemStats ?? true);
+    // Default OFF: the header stays gear + usage chips + files button unless a
+    // stored preference explicitly re-enables the token chip (no UI toggle exists).
+    const showTokenCount = compactHeader ? false : (settings.showTokenCount ?? defaults.showTokenCount ?? false);
 
     const fontControlsEl = document.querySelector('.header-font-controls');
     const systemStatsEl = document.getElementById('headerSystemStats');
@@ -1437,42 +2620,243 @@ Object.assign(CodemanApp.prototype, {
     }
 
     // Hide lifecycle log button when setting is disabled
-    const showLifecycleLog = settings.showLifecycleLog ?? defaults.showLifecycleLog ?? true;
+    // Default OFF: the lifecycle-log document icon is opt-in; the default header
+    // keeps only WS/CPU/MEM, the file-viewer folder, usage chips, and the gear.
+    const showLifecycleLog = settings.showLifecycleLog ?? defaults.showLifecycleLog ?? false;
     const lifecycleBtn = document.querySelector('.btn-lifecycle-log');
     if (lifecycleBtn) {
       lifecycleBtn.style.display = showLifecycleLog ? '' : 'none';
     }
 
-    // Hide notification bell when notifications are disabled
-    const notifEnabled = this.notificationManager?.preferences?.enabled ?? true;
+    // Hide the response viewer (eye) button when setting is disabled.
+    // Marker class, not inline style — the base rule is display:inline-flex !important.
+    const showResponseViewer = settings.showResponseViewer ?? defaults.showResponseViewer ?? false;
+    const responseViewerBtn = document.querySelector('.btn-response-viewer-header');
+    if (responseViewerBtn) {
+      responseViewerBtn.classList.toggle('btn-response-viewer-header--hidden', !showResponseViewer);
+    }
+
+    // Hide the attachments (history) button when disabled. Opt-in, default OFF —
+    // marker class, base is display:inline-flex !important.
+    const showAttachmentsButton = settings.showAttachmentsButton ?? defaults.showAttachmentsButton ?? false;
+    const attachmentsBtn = document.getElementById('attachmentsHistoryBtn');
+    if (attachmentsBtn) {
+      attachmentsBtn.classList.toggle('btn-attachments-history--hidden', !showAttachmentsButton);
+    }
+
+    // File Viewer header button — opt-in, default OFF. Marker class (base is
+    // display:inline-flex !important); clicking it toggles the file browser panel.
+    // Default ON (desktop): the folder button is part of the standard header now;
+    // phones still hide it via mobile.css (btn-file-viewer in the phone-hidden set).
+    const showFileViewerButton = settings.showFileViewerButton ?? defaults.showFileViewerButton ?? true;
+    const fileViewerBtn = document.querySelector('.btn-file-viewer');
+    if (fileViewerBtn) {
+      fileViewerBtn.classList.toggle('btn-file-viewer--hidden', !showFileViewerButton);
+    }
+
+    // Multi-monitor button — hidden by default (App Settings → Display → "Header
+    // Displays"). The server renders the correct initial state on every reload;
+    // this handles a live toggle from a settings save (no reload). Toggle the
+    // marker class (matches the server-side reveal) rather than an inline style.
+    const showMultiMonitorButton = settings.showMultiMonitorButton ?? defaults.showMultiMonitorButton ?? false;
+    const multiMonitorBtn = document.querySelector('.btn-multimonitor');
+    if (multiMonitorBtn) {
+      multiMonitorBtn.classList.toggle('btn-multimonitor--hidden', !showMultiMonitorButton);
+    }
+
+    // Ultracode/Workflow agents launcher — hidden by default; reveal when enabled.
+    // Marker class only (base is display:inline-flex !important) so it's auto-excluded
+    // from the mobile-header-buttons-policy guard.
+    const showUltracodeAgents = settings.showUltracodeAgents ?? defaults.showUltracodeAgents ?? false;
+    const ultracodeBtn = document.querySelector('.btn-ultracode-agents');
+    if (ultracodeBtn) {
+      ultracodeBtn.classList.toggle('btn-ultracode-agents--hidden', !showUltracodeAgents);
+    }
+
+    // Read My Mind 🧠 — hidden unless the synced opt-in `readMyMindEnabled` is
+    // ON (only an explicit true enables, mirroring the Approvals bell). Marker
+    // class (base is display:inline-flex !important); phones hide it in
+    // mobile.css regardless (their surface is the keyboard-accessory 🧠 key,
+    // re-synced right below).
+    const readMyMindBtn = document.querySelector('.btn-readmymind');
+    if (readMyMindBtn) {
+      readMyMindBtn.classList.toggle('btn-readmymind--hidden', settings.readMyMindEnabled !== true);
+    }
+    // The accessory-bar 🧠 key shares the setting; its marker class lives on
+    // the bar element (keyboard-accessory.js), so a live toggle from a
+    // settings save reveals/hides it without a reload.
+    if (typeof KeyboardAccessoryBar !== 'undefined') KeyboardAccessoryBar.syncReadMyMind?.();
+
+    // Plan-usage chip — shown by default on desktop, OFF on handhelds (App
+    // Settings → Display → "Plan Usage Limits"). The template always ships it
+    // hidden because display is per-device and the server cannot know a
+    // localStorage value, so THIS is what reveals it on every load as well as
+    // on a live toggle. Marker class (base is display:inline-flex !important),
+    // matching the response-viewer/multimonitor pattern.
+    const showPlanUsageLimits = this.planUsageChipEnabled(settings);
+    const planUsageChip = document.getElementById('planUsageChip');
+    if (planUsageChip) {
+      planUsageChip.classList.toggle('header-plan-usage--hidden', !showPlanUsageLimits);
+    }
+
+    const showRedrawButton = settings.showRedrawButton ?? defaults.showRedrawButton ?? false;
+    const redrawBtn = document.querySelector('.btn-redraw-terminal');
+    if (redrawBtn) {
+      redrawBtn.classList.toggle('btn-redraw-terminal--hidden', !showRedrawButton);
+    }
+
+    // Session Manager button — opt-in, hidden by default (App Settings → Display).
+    // Marker class (base is display:inline-flex !important); phones keep it hidden
+    // via mobile.css regardless. Sessions stay reachable via the Ctrl+K palette.
+    const showSessionButton = settings.showSessionButton ?? defaults.showSessionButton ?? false;
+    const sessionBtn = document.querySelector('.btn-session-manager');
+    if (sessionBtn) {
+      sessionBtn.classList.toggle('btn-session-manager--hidden', !showSessionButton);
+    }
+
+    // Away Digest button — opt-in, hidden by default. Same marker pattern.
+    const showAwayDigestButton = settings.showAwayDigestButton ?? defaults.showAwayDigestButton ?? false;
+    const awayDigestBtn = document.querySelector('.btn-away-digest');
+    if (awayDigestBtn) {
+      awayDigestBtn.classList.toggle('btn-away-digest--hidden', !showAwayDigestButton);
+    }
+
+    // Cron button (footer toolbar) — opt-in, hidden by default. Same marker pattern.
+    const showCronButton = settings.showCronButton ?? defaults.showCronButton ?? false;
+    const cronBtn = document.querySelector('.btn-cron');
+    if (cronBtn) {
+      cronBtn.classList.toggle('btn-cron--hidden', !showCronButton);
+    }
+
+    // Notification bell is retired (notifications live in Settings → Notifications
+    // + the drawer); keep it hidden regardless of the notification-enabled state.
     const notifBtn = document.querySelector('.btn-notifications');
     if (notifBtn) {
-      notifBtn.style.display = notifEnabled ? '' : 'none';
+      notifBtn.style.display = 'none';
     }
     // Close the drawer if notifications got disabled while it's open
+    const notifEnabled = this.notificationManager?.preferences?.enabled ?? true;
     if (!notifEnabled) {
       const drawer = document.getElementById('notifDrawer');
       if (drawer) drawer.classList.remove('open');
     }
   },
 
+  applyTabOrientation(options = {}) {
+    const settings = this.loadAppSettingsFromStorage();
+    const defaults = this.getDefaultSettings();
+    const sidebarOwnsTabs = this.isSessionSidebarActive?.() === true;
+    const orientation =
+      !this.isSoloWindow && !sidebarOwnsTabs && window.CodemanTabOverflow?.resolveTabOrientation
+        ? window.CodemanTabOverflow.resolveTabOrientation({
+            deviceType: MobileDetection.getDeviceType(),
+            setting: settings.tabOrientation ?? defaults.tabOrientation ?? 'horizontal',
+          })
+        : 'horizontal';
+
+    const root = document.documentElement;
+    const previous = root.getAttribute('data-tab-orientation') || 'horizontal';
+    root.setAttribute('data-tab-orientation', orientation);
+
+    // Row detail rides on its OWN attribute, exactly like the sidebar's
+    // data-sidebar-detail: every html[data-tab-orientation='vertical'] rule in
+    // styles.css keeps matching both variants untouched, and the gate in app.js
+    // reads one attribute instead of re-parsing localStorage per tab.
+    const previousDetail = root.dataset.tabRailDetail || 'rich';
+    const detail = (settings.tabRailDetail ?? defaults.tabRailDetail ?? 'rich') === 'simple' ? 'simple' : 'rich';
+    root.dataset.tabRailDetail = detail;
+
+    const tabsEl = document.getElementById('sessionTabs');
+    const rail = document.getElementById('tabRail');
+    const headerHost = document.getElementById('sessionTabsHost');
+    if (!sidebarOwnsTabs && tabsEl && rail && headerHost) {
+      if (orientation === 'vertical') {
+        if (tabsEl.parentElement !== rail) rail.appendChild(tabsEl);
+      } else if (tabsEl.parentElement !== headerHost) {
+        headerHost.appendChild(tabsEl);
+      }
+    }
+    if (tabsEl) {
+      tabsEl.setAttribute('aria-orientation', sidebarOwnsTabs || orientation === 'vertical' ? 'vertical' : 'horizontal');
+    }
+
+    const settleRailWidth =
+      options.settleRailWidth === true && (orientation === 'vertical' || previous !== orientation);
+    this.applyTabRailWidth?.({ settle: settleRailWidth });
+    const orientationChanged = previous !== orientation;
+    // A detail flip counts as a change on its own: simple ⟷ detailed leaves the
+    // orientation on 'vertical' both times, and the stamps line is emitted by
+    // the row template, not toggled by CSS — same reasoning as the sidebar's
+    // detail half in applySessionListLayout(). Taller rows also move every
+    // connector anchored to a tab rect.
+    const changed = orientationChanged || previousDetail !== detail;
+    if (orientationChanged) {
+      this.updateTabOverflowMode?.();
+      if (!settleRailWidth) this.fitAddon?.fit();
+    }
+    // applyTabWrapSettings() is the ONE owner of tabs-show-folder and is
+    // rail-aware, so it has to run AFTER the two attributes above — the
+    // applySessionListLayout() call that precedes this one on the settings-save
+    // path ran while data-tab-rail-detail still held the old value. It
+    // re-renders by itself when the folder row appears or disappears, which is
+    // why the render below is skipped in that case rather than doubled.
+    const prevTall = this._tallTabsEnabled;
+    if (changed) this.applyTabWrapSettings?.();
+    if (changed) {
+      // Mirror of applyTabWrapSettings()'s OWN render condition, which is
+      // `prevTallTabs !== undefined && prevTallTabs !== showFolder`: its first
+      // call ever only establishes the baseline and deliberately renders
+      // nothing. Reading an undefined previous value as "it rendered" skips
+      // BOTH renders and leaves the rows stale — reachable whenever this is the
+      // first call, i.e. when the pre-paint script threw and left the
+      // attributes on their fallbacks for applyTabOrientation() to correct.
+      const wrapRendered = prevTall !== undefined && prevTall !== this._tallTabsEnabled;
+      if (!wrapRendered) this._fullRenderSessionTabs?.();
+      this._updateConnectionLinesImmediate?.();
+      this._refreshHomeSessionsIfVisible?.();
+    }
+    // Only detailed rows carry stamps that go stale with no event behind them.
+    // _fullRenderSessionTabs() settles this too, but applyTabOrientation() runs
+    // on paths where nothing re-rendered (boot with the layout already applied).
+    if (this.isRichTabRows?.()) this._startSidebarRichClock?.();
+    else this._stopSidebarRichClock?.();
+  },
+
   applyTabWrapSettings() {
     const settings = this.loadAppSettingsFromStorage();
     const defaults = this.getDefaultSettings();
     const deviceType = MobileDetection.getDeviceType();
+    // The left sidebar is one vertical column with its own scroller: there is no
+    // row to wrap into, and its rows are always tall (name + folder) because that
+    // is the cheapest way to tell 25 sessions apart. Header strip keeps the old
+    // rules unchanged. Kept here rather than only in applySessionListLayout() so
+    // that a stray applyTabWrapSettings() call (this one is invoked from
+    // saveAppSettings and from the resize path) cannot leave the sidebar wrapped.
+    // Matches BOTH sidebar variants: isSessionSidebarActive() reads
+    // data-session-list, which applySessionListLayout() sets to 'sidebar' for
+    // 'sidebar' and 'sidebar-rich' alike. Row detail rides on a separate
+    // attribute and has no bearing on wrapping.
+    const sidebar = this.isSessionSidebarActive?.() === true;
     // Two-row tabs disabled on mobile/tablet — not enough screen space
-    const twoRows = deviceType === 'desktop'
+    const twoRows = !sidebar && deviceType === 'desktop'
       ? (settings.tabTwoRows ?? defaults.tabTwoRows ?? false)
       : false;
+    // The DETAILED vertical rail is the third tall-row surface, for the same
+    // reason as the sidebar: it is a docked column with a row per session, and
+    // the stamps line below the name says nothing about WHICH project the
+    // session is in. Read from the applied attribute, which applyTabOrientation()
+    // has already written (app.js calls it before this).
+    const railRich = this.isTabRailRich?.() === true;
+    const showFolder = sidebar || twoRows || railRich;
     const prevTallTabs = this._tallTabsEnabled;
-    this._tallTabsEnabled = twoRows;
+    this._tallTabsEnabled = showFolder;
     const tabsEl = document.getElementById('sessionTabs');
     if (tabsEl) {
       tabsEl.classList.toggle('tabs-two-rows', twoRows);
-      tabsEl.classList.toggle('tabs-show-folder', twoRows);
+      tabsEl.classList.toggle('tabs-show-folder', showFolder);
     }
     // Re-render tabs if folder visibility changed (folder spans are generated in JS)
-    if (prevTallTabs !== undefined && prevTallTabs !== twoRows) {
+    if (prevTallTabs !== undefined && prevTallTabs !== showFolder) {
       this._fullRenderSessionTabs();
     }
   },
@@ -1480,7 +2864,7 @@ Object.assign(CodemanApp.prototype, {
   applyMonitorVisibility() {
     const settings = this.loadAppSettingsFromStorage();
     const defaults = this.getDefaultSettings();
-    const showMonitor = settings.showMonitor ?? defaults.showMonitor ?? true;
+    const showMonitor = settings.showMonitor ?? defaults.showMonitor ?? false;
     const showSubagents = settings.showSubagents ?? defaults.showSubagents ?? false;
     const showFileBrowser = settings.showFileBrowser ?? defaults.showFileBrowser ?? false;
 
@@ -1501,6 +2885,27 @@ Object.assign(CodemanApp.prototype, {
       } else {
         subagentsPanel.classList.add('hidden');
       }
+    }
+
+    // Ultracode agents panel visibility (SYNCED setting — not in displayKeys)
+    const showUltracodeAgents = settings.showUltracodeAgents ?? defaults.showUltracodeAgents ?? false;
+    const ultracodePanel = document.getElementById('ultracodeAgentsPanel');
+    if (ultracodePanel) {
+      if (showUltracodeAgents) {
+        ultracodePanel.classList.remove('hidden');
+      } else {
+        ultracodePanel.classList.remove('open');
+        ultracodePanel.classList.add('hidden');
+      }
+    }
+    // Floating ultracode run windows have their OWN opt-in (default OFF), independent of the
+    // docked panel above: pop active runs when enabled, tear them all down when disabled
+    // (additional layer — ultracode-windows.js).
+    const ultracodeFloatingWindows = settings.ultracodeFloatingWindows ?? defaults.ultracodeFloatingWindows ?? false;
+    if (ultracodeFloatingWindows) {
+      if (typeof this.syncAllUltracodeFloatingWindows === 'function') this.syncAllUltracodeFloatingWindows();
+    } else if (typeof this.removeAllUltracodeWindows === 'function') {
+      this.removeAllUltracodeWindows();
     }
 
     // File browser panel visibility
@@ -1528,7 +2933,8 @@ Object.assign(CodemanApp.prototype, {
             this.fileBrowserDragListeners._onFirstDrag = onFirstDrag;
           }
         }
-      } else {
+      } else if (fileBrowserPanel.classList.contains('visible')) {
+        this._resetFileBrowserForHide?.();
         fileBrowserPanel.classList.remove('visible');
       }
     }
@@ -1624,8 +3030,27 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async loadAppSettingsFromServer(settingsPromise = null) {
+    // One-time migration: showPlanUsageLimits became a per-device display setting.
+    // Before this, it synced from the server, so the (separate) mobile settings blob
+    // may carry a stale `true` the user never enabled on this device. Clear it once
+    // so mobile defaults to OFF; the desktop blob is untouched and keeps its value.
     try {
-      const settings = settingsPromise ? await settingsPromise : await fetch('/api/settings').then(r => r.ok ? r.json() : null);
+      if (
+        (MobileDetection.isHandheldDevice?.() ?? MobileDetection.getDeviceType() === 'mobile') &&
+        !localStorage.getItem('codeman:planUsagePerDeviceMigrated')
+      ) {
+        const s = this.loadAppSettingsFromStorage();
+        if (s && s.showPlanUsageLimits) {
+          s.showPlanUsageLimits = false;
+          this.saveAppSettingsToStorage(s);
+        }
+        localStorage.setItem('codeman:planUsagePerDeviceMigrated', '1');
+      }
+    } catch {
+      /* best-effort migration */
+    }
+    try {
+      const settings = settingsPromise ? await settingsPromise : await fetch('/api/settings').then(r => r.ok ? r.json() : null).then(env => env?.success === true ? env.data : env);
       if (settings) {
         // Extract notification prefs before merging app settings
         const { notificationPreferences, voiceSettings, respawnPresets, runMode, ...appSettings } = settings;
@@ -1635,9 +3060,26 @@ Object.assign(CodemanApp.prototype, {
         // are NOT display keys — they control server-side behavior and must sync from server.
         const displayKeys = new Set([
           'showFontControls', 'showSystemStats', 'showTokenCount', 'showCost',
+          'showLifecycleLog', 'showResponseViewer', 'showRedrawButton',
           'showMonitor', 'showProjectInsights', 'showFileBrowser', 'showSubagents',
-          'subagentActiveTabOnly', 'tabTwoRows', 'localEchoEnabled', 'cjkInputEnabled', 'extendedKeyboardBar',
+          'subagentActiveTabOnly', 'tabTwoRows', 'tabOrientation', 'tabRailWidth', 'tabRailDetail', 'sessionListLayout', 'sessionSidebarFontSize', 'localEchoEnabled', 'cjkInputEnabled', 'extendedKeyboardBar',
+          'skin', 'showPlanUsageLimits', 'showAttachmentsButton', 'showFileViewerButton', 'webglRendererEnabled',
+          'terminalFontFamily',
+          'language',
+          'terminalWheelLocalScrollback',
+          'autoCopySelection',
+          'showSessionButton', 'showAwayDigestButton', 'showCronButton',
+          'showTabDetachButton',
+          'mobileOverviewEnabled',
+          'sessionLineageLines',
         ]);
+        // The plan-usage chip is a PER-DEVICE display setting (desktop default ON,
+        // handheld default OFF): desktop can show it while mobile stays hidden. It
+        // used to sync, so an older server.json may still carry a value — drop it
+        // so the server value is NEVER
+        // seeded into a device that didn't explicitly enable it (collection is handled
+        // separately via the statusLineTelemetry action, not this display flag).
+        delete appSettings.showPlanUsageLimits;
         // Merge settings: non-display keys always sync from server,
         // display keys only seed from server when localStorage has no value
         // (prevents cross-device overwrite while fixing settings re-enabling on fresh loads)
@@ -1660,7 +3102,8 @@ Object.assign(CodemanApp.prototype, {
         if (notificationPreferences && this.notificationManager) {
           const localNotifPrefs = localStorage.getItem(this.notificationManager.getStorageKey());
           if (!localNotifPrefs) {
-            this.notificationManager.preferences = notificationPreferences;
+            this.notificationManager.preferences =
+              this.notificationManager.normalizePreferences(notificationPreferences);
             this.notificationManager.savePreferences();
           }
         }
@@ -1717,7 +3160,8 @@ Object.assign(CodemanApp.prototype, {
     try {
       const res = await fetch('/api/subagent-window-states');
       if (res.ok) {
-        states = await res.json();
+        const env = await res.json();
+        states = env?.success === true ? env.data : env;
         // Also update localStorage
         localStorage.setItem('codeman-subagent-window-states', JSON.stringify(states));
       }
@@ -1784,7 +3228,8 @@ Object.assign(CodemanApp.prototype, {
     try {
       const res = await fetch('/api/subagent-parents');
       if (res.ok) {
-        mapData = await res.json();
+        const env = await res.json();
+        mapData = env?.success === true ? env.data : env;
         // Update localStorage as cache
         localStorage.setItem('codeman-subagent-parents', JSON.stringify(mapData));
       }
@@ -1871,6 +3316,138 @@ Object.assign(CodemanApp.prototype, {
       this.activeFocusTrap.deactivate();
       this.activeFocusTrap = null;
     }
+  },
+
+  // ─── Shortcut Settings (App Settings → Shortcuts tab) ────────────────────────
+  // Renders the list of shortcuts with capture buttons for key rebinding,
+  // and persists overrides under settings.shortcutOverrides (saved through
+  // saveAppSettingsToStorage so the device key + settings cache stay coherent).
+
+  renderShortcutSettingsList() {
+    const list = document.getElementById('appSettingsShortcutsList');
+    if (!list) return;
+    const registry = this.getShortcutRegistry
+      ? this.getShortcutRegistry()
+      : typeof DEFAULT_SHORTCUTS !== 'undefined'
+        ? DEFAULT_SHORTCUTS
+        : [];
+    const overrides = this.readShortcutOverridesFromSettings();
+    list.innerHTML = registry
+      .map((shortcut) => {
+        const bindingLabel = shortcut.displayBindings
+          ? shortcut.displayBindings.join(' / ')
+          : (shortcut.bindings || []).map((b) => [...(b.modifiers || []), b.key || b.code || ''].join('+')).join(' / ');
+        // Only registry entries dispatched through matchesShortcutEvent() are
+        // configurable; fixed keys (Escape, tab arrows, …) render read-only.
+        const configurable = !!shortcut.action && Array.isArray(shortcut.bindings);
+        const overridden = !!overrides[shortcut.id];
+        const controls = configurable
+          ? `<button type="button" class="shortcut-capture-btn" data-shortcut-action="capture" title="Capture new binding">Edit</button>
+        <button type="button" class="shortcut-reset-btn" data-shortcut-action="reset" title="Reset to default"${overridden ? '' : ' disabled'}>Reset</button>
+        <input class="shortcut-enabled-checkbox" type="checkbox" ${shortcut.disabled ? '' : 'checked'} data-shortcut-action="toggle" title="Enable/disable">`
+          : '';
+        return `<div class="shortcut-setting-row${configurable ? '' : ' shortcut-setting-row--fixed'}" data-shortcut-id="${escapeHtml(shortcut.id)}">
+        <label class="shortcut-setting-label">${escapeHtml(shortcut.label)}</label>
+        <input class="shortcut-binding-input" type="text" readonly value="${escapeHtml(bindingLabel)}" placeholder="(none)" data-id="${escapeHtml(shortcut.id)}">
+        ${controls}
+      </div>`;
+      })
+      .join('');
+    this._wireShortcutSettingsList(list);
+  },
+
+  // Delegated handlers (no inline onclick — registry ids never land inside a
+  // JS string context, and the listeners survive re-renders).
+  _wireShortcutSettingsList(list) {
+    if (list.dataset.shortcutListenersAdded) return;
+    list.dataset.shortcutListenersAdded = 'true';
+    list.addEventListener('click', (e) => {
+      const btn = e.target?.closest?.('[data-shortcut-action]');
+      if (!btn) return;
+      const id = btn.closest?.('[data-shortcut-id]')?.dataset?.shortcutId;
+      if (!id) return;
+      if (btn.dataset.shortcutAction === 'capture') this.startShortcutCapture(id);
+      else if (btn.dataset.shortcutAction === 'reset') this.resetShortcutOverride(id);
+    });
+    list.addEventListener('change', (e) => {
+      const box = e.target;
+      if (!box?.matches?.('[data-shortcut-action="toggle"]')) return;
+      const id = box.closest?.('[data-shortcut-id]')?.dataset?.shortcutId;
+      if (id) this.toggleShortcutEnabled(id, box.checked);
+    });
+  },
+
+  readShortcutOverridesFromSettings() {
+    const settings = this.loadAppSettingsFromStorage();
+    return settings.shortcutOverrides || {};
+  },
+
+  startShortcutCapture(shortcutId) {
+    const input = document.querySelector(`.shortcut-binding-input[data-id="${shortcutId}"]`);
+    if (!input) return;
+    input.value = 'Press keys…';
+    input.focus();
+    this._capturingShortcutId = shortcutId;
+    // Persistent listener (NOT {once}) — the first keydown of a combo like
+    // Ctrl+Shift+P is the modifier itself ('Control'), which must not end the
+    // capture. The first non-modifier key completes it.
+    const onCaptureKeydown = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Control' || e.key === 'Shift' || e.key === 'Alt' || e.key === 'Meta') return;
+      input.removeEventListener('keydown', onCaptureKeydown);
+      this.onShortcutCaptureKeydown(e, shortcutId);
+    };
+    input.addEventListener('keydown', onCaptureKeydown);
+  },
+
+  onShortcutCaptureKeydown(e, shortcutId) {
+    e.preventDefault();
+    e.stopPropagation();
+    this._capturingShortcutId = null;
+    if (e.key === 'Escape') {
+      this.renderShortcutSettingsList();
+      return;
+    }
+    // Require a real chord: the dispatcher has no focus-target guard, so a
+    // bare-key binding would fire while typing in any input.
+    if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+      this.renderShortcutSettingsList();
+      this.showToast?.('Shortcut must include Ctrl, Cmd, or Alt', 'error');
+      return;
+    }
+    const modifiers = [];
+    if (e.ctrlKey) modifiers.push('ctrl');
+    if (e.metaKey) modifiers.push('meta');
+    if (e.shiftKey) modifiers.push('shift');
+    if (e.altKey) modifiers.push('alt');
+    const settings = this.loadAppSettingsFromStorage();
+    const shortcutOverrides = { ...(settings.shortcutOverrides || {}) };
+    shortcutOverrides[shortcutId] = {
+      ...(shortcutOverrides[shortcutId] || {}),
+      bindings: [{ modifiers, key: e.key, code: e.code }],
+    };
+    settings.shortcutOverrides = shortcutOverrides;
+    this.saveAppSettingsToStorage(settings);
+    this.renderShortcutSettingsList();
+  },
+
+  resetShortcutOverride(shortcutId) {
+    const settings = this.loadAppSettingsFromStorage();
+    const shortcutOverrides = { ...(settings.shortcutOverrides || {}) };
+    delete shortcutOverrides[shortcutId];
+    settings.shortcutOverrides = shortcutOverrides;
+    this.saveAppSettingsToStorage(settings);
+    this.renderShortcutSettingsList();
+  },
+
+  toggleShortcutEnabled(shortcutId, enabled) {
+    const settings = this.loadAppSettingsFromStorage();
+    const shortcutOverrides = { ...(settings.shortcutOverrides || {}) };
+    shortcutOverrides[shortcutId] = { ...(shortcutOverrides[shortcutId] || {}), disabled: !enabled };
+    settings.shortcutOverrides = shortcutOverrides;
+    this.saveAppSettingsToStorage(settings);
+    this.renderShortcutSettingsList();
   },
 
   closeAllPanels() {

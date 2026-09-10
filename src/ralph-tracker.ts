@@ -19,7 +19,6 @@
  * Key exports:
  * - `RalphTracker` class — main tracker, extends EventEmitter
  * - `RalphTrackerEvents` interface — typed event map
- * - Re-exports: `EnhancedPlanTask`, `CheckpointReview` from ralph-plan-tracker
  *
  * Key methods: `processData(data)` — feed terminal output, `getState()`,
  * `getTodos()`, `getCompletionHistory()`, `getPlanTasks()`, `reset()`
@@ -65,9 +64,6 @@ import { RalphFixPlanWatcher, generateFixPlanMarkdown, importFixPlanMarkdown } f
 import { RalphStallDetector } from './ralph-stall-detector.js';
 import { RalphStatusParser } from './ralph-status-parser.js';
 import { STALE_DATA_MAX_AGE_MS, INACTIVITY_TIMEOUT_MS } from './config/server-timing.js';
-
-// Re-export sub-module types for backward compatibility
-export type { EnhancedPlanTask, CheckpointReview } from './ralph-plan-tracker.js';
 
 // ========== Configuration Constants ==========
 // Note: MAX_TODOS_PER_SESSION and MAX_LINE_BUFFER_SIZE are imported from config modules
@@ -390,32 +386,6 @@ const P2_PRIORITY_PATTERNS = [
  * @event circuitBreakerUpdate - Fired when circuit breaker state changes
  * @event exitGateMet - Fired when dual-condition exit gate is met
  */
-export interface RalphTrackerEvents {
-  /** Emitted when loop state changes */
-  loopUpdate: (state: RalphTrackerState) => void;
-  /** Emitted when todo list is modified */
-  todoUpdate: (todos: RalphTodoItem[]) => void;
-  /** Emitted when completion phrase detected (loop finished) */
-  completionDetected: (phrase: string) => void;
-  /** Emitted when tracker auto-enables from disabled state */
-  enabled: () => void;
-  /** Emitted when a RALPH_STATUS block is parsed */
-  statusBlockDetected: (block: RalphStatusBlock) => void;
-  /** Emitted when circuit breaker state changes */
-  circuitBreakerUpdate: (status: CircuitBreakerStatus) => void;
-  /** Emitted when dual-condition exit gate is met (completion indicators >= 2 AND EXIT_SIGNAL: true) */
-  exitGateMet: (data: { completionIndicators: number; exitSignal: boolean }) => void;
-  /** Emitted when iteration count hasn't changed for an extended period (stall warning) */
-  iterationStallWarning: (data: { iteration: number; stallDurationMs: number }) => void;
-  /** Emitted when iteration count hasn't changed for critical period (stall critical) */
-  iterationStallCritical: (data: { iteration: number; stallDurationMs: number }) => void;
-  /** Emitted when a common/risky completion phrase is detected (P1-002) */
-  phraseValidationWarning: (data: {
-    phrase: string;
-    reason: 'common' | 'short' | 'numeric';
-    suggestedPhrase: string;
-  }) => void;
-}
 
 /**
  * RalphTracker - Parses terminal output to detect Ralph Wiggum loops and todos
@@ -496,6 +466,12 @@ export class RalphTracker extends EventEmitter {
 
   /** Timestamp of last cleanup check for throttling */
   private _lastCleanupTime: number = 0;
+
+  /** Maximum number of todos retained for this session (defaults to global cap) */
+  private _maxTodos: number = MAX_TODOS_PER_SESSION;
+
+  /** Todo auto-expiry duration in milliseconds (defaults to global constant) */
+  private _todoExpiryMs: number = TODO_EXPIRY_MS;
 
   /** Debouncer for todoUpdate events */
   private _todoDeb = new Debouncer(EVENT_DEBOUNCE_MS);
@@ -1083,6 +1059,10 @@ export class RalphTracker extends EventEmitter {
       planVersion: this.planTracker.planVersion,
       planHistoryLength: this.planTracker.getPlanHistory().length,
       completionConfidence: this._lastCompletionConfidence,
+      // Surface the live todo-config so it persists (toState) and reads back into
+      // the Session Options modal (broadcast) — mirrors maxIterations round-trip.
+      maxTodos: this._maxTodos,
+      todoExpirationMinutes: this.todoExpirationMinutes,
     };
   }
 
@@ -1870,7 +1850,7 @@ export class RalphTracker extends EventEmitter {
         return;
       }
 
-      while (this._todos.size >= MAX_TODOS_PER_SESSION) {
+      while (this._todos.size >= this._maxTodos) {
         const oldest = this.findOldestTodo();
         if (oldest) {
           this._todos.delete(oldest.id);
@@ -2194,14 +2174,14 @@ export class RalphTracker extends EventEmitter {
   }
 
   /**
-   * Remove todo items older than TODO_EXPIRY_MS.
+   * Remove todo items older than the configured expiry duration.
    */
   private cleanupExpiredTodos(): void {
     const now = Date.now();
     const toDelete: string[] = [];
 
     for (const [id, todo] of this._todos) {
-      if (now - todo.detectedAt > TODO_EXPIRY_MS) {
+      if (now - todo.detectedAt > this._todoExpiryMs) {
         toDelete.push(id);
       }
     }
@@ -2239,6 +2219,34 @@ export class RalphTracker extends EventEmitter {
     this._loopState.maxIterations = maxIterations;
     this._loopState.lastActivity = Date.now();
     this.emit('loopUpdate', this.loopState);
+  }
+
+  /** Maximum number of todos retained for this session. */
+  get maxTodos(): number {
+    return this._maxTodos;
+  }
+
+  /** Todo auto-expiry duration in minutes for this session. */
+  get todoExpirationMinutes(): number {
+    return Math.round(this._todoExpiryMs / 60000);
+  }
+
+  /**
+   * Update the maximum number of retained todos (external API).
+   * Ignores non-positive values.
+   */
+  setMaxTodos(maxTodos: number): void {
+    if (!Number.isFinite(maxTodos) || maxTodos <= 0) return;
+    this._maxTodos = Math.floor(maxTodos);
+  }
+
+  /**
+   * Update the todo auto-expiry duration (external API), specified in minutes.
+   * Converts to milliseconds internally. Ignores non-positive values.
+   */
+  setTodoExpirationMinutes(minutes: number): void {
+    if (!Number.isFinite(minutes) || minutes <= 0) return;
+    this._todoExpiryMs = Math.floor(minutes) * 60000;
   }
 
   /**
@@ -2341,6 +2349,12 @@ export class RalphTracker extends EventEmitter {
       ...loopState,
       enabled: loopState.enabled ?? false,
     };
+    // Restore the per-session todo-config into the live fields used by the hot
+    // paths (eviction cap + expiry). Setters ignore non-positive values.
+    if (typeof loopState.maxTodos === 'number') this.setMaxTodos(loopState.maxTodos);
+    if (typeof loopState.todoExpirationMinutes === 'number') {
+      this.setTodoExpirationMinutes(loopState.todoExpirationMinutes);
+    }
     this._todos.clear();
     for (const todo of todos) {
       this._todos.set(todo.id, {

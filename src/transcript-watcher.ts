@@ -6,6 +6,7 @@
  * - Tool execution state
  * - Error conditions
  * - Plan mode prompts
+ * - User-authored prompts (`transcript:user_prompt`, Read My Mind intent capture)
  *
  * The transcript path is provided by Claude Code hooks in the `transcript_path` field.
  */
@@ -20,7 +21,7 @@ import { createInterface } from 'node:readline';
 /**
  * Parsed transcript entry from the JSONL file
  */
-export interface TranscriptEntry {
+interface TranscriptEntry {
   type: 'user' | 'assistant' | 'system' | 'result';
   timestamp: string;
   message?: {
@@ -35,11 +36,12 @@ export interface TranscriptEntry {
   };
 }
 
-export interface TranscriptContentBlock {
+interface TranscriptContentBlock {
   type: 'text' | 'tool_use' | 'tool_result';
   text?: string;
   name?: string;
   input?: Record<string, unknown>;
+  tool_use_id?: string;
   content?: string;
   is_error?: boolean;
 }
@@ -66,15 +68,6 @@ export interface TranscriptState {
   entryCount: number;
   /** Last update timestamp */
   lastUpdateAt: string | null;
-}
-
-export interface TranscriptWatcherEvents {
-  'transcript:update': (state: TranscriptState) => void;
-  'transcript:complete': (state: TranscriptState) => void;
-  'transcript:tool_start': (toolName: string) => void;
-  'transcript:tool_end': (toolName: string, isError: boolean) => void;
-  'transcript:error': (error: Error) => void;
-  'transcript:plan_mode': () => void;
 }
 
 // ========== Constants ==========
@@ -188,6 +181,15 @@ export class TranscriptWatcher extends EventEmitter {
    */
   getState(): TranscriptState {
     return { ...this.state };
+  }
+
+  /**
+   * Path currently being watched, or null. Read My Mind's transcript collector
+   * (readmymind-collectors.ts) tail-reads the file directly: the watcher keeps
+   * only a 500-char snippet and starts empty after a server restart.
+   */
+  getPath(): string | null {
+    return this.transcriptPath;
   }
 
   /**
@@ -337,10 +339,7 @@ export class TranscriptWatcher extends EventEmitter {
         this.handleResultEntry(entry);
         break;
       case 'user':
-        // User message means new turn, reset some state
-        this.state.isComplete = false;
-        this.state.hasError = false;
-        this.state.errorMessage = null;
+        this.handleUserEntry(entry);
         break;
       case 'system':
         // System messages are informational
@@ -369,20 +368,50 @@ export class TranscriptWatcher extends EventEmitter {
           this.state.currentTool = block.name;
           this.emit('transcript:tool_start', block.name);
         } else if (block.type === 'tool_result') {
-          // Tool completed
-          const wasError = block.is_error === true;
-          const toolName = this.state.currentTool;
-          this.state.toolExecuting = false;
-          this.state.currentTool = null;
-          if (toolName) {
-            this.emit('transcript:tool_end', toolName, wasError);
-          }
-          if (wasError && block.content) {
-            this.state.hasError = true;
-            this.state.errorMessage = String(block.content).slice(0, 200);
-          }
+          this.handleToolResult(block);
         }
       }
+    }
+  }
+
+  private handleUserEntry(entry: TranscriptEntry): void {
+    // A user-authored prompt starts a turn, while Claude tool results also use
+    // user entries. Reset turn state first, then close any completed tool.
+    this.state.isComplete = false;
+    this.state.hasError = false;
+    this.state.errorMessage = null;
+
+    const content = entry.message?.content;
+    if (typeof content === 'string') {
+      if (content.trim()) this.emit('transcript:user_prompt', content, entry.timestamp);
+      return;
+    }
+    if (!Array.isArray(content)) return;
+    let promptText = '';
+    for (const block of content) {
+      if (block.type === 'tool_result') {
+        this.handleToolResult(block);
+      } else if (block.type === 'text' && block.text) {
+        promptText += (promptText ? ' ' : '') + block.text;
+      }
+    }
+    // Text blocks mean a typed prompt; tool_result-only entries are Claude's own
+    // tool plumbing, not intent. Filtering of command echo / system wrappers is
+    // the intent store's job (`isCapturablePrompt`), not the watcher's.
+    if (promptText.trim()) this.emit('transcript:user_prompt', promptText, entry.timestamp);
+  }
+
+  private handleToolResult(block: TranscriptContentBlock): void {
+    const wasError = block.is_error === true;
+    const toolName = this.state.currentTool;
+    this.state.toolExecuting = false;
+    this.state.currentTool = null;
+    if (toolName) {
+      this.emit('transcript:tool_end', toolName, wasError);
+    }
+    if (wasError && block.content) {
+      this.state.hasError = true;
+      this.state.errorMessage = String(block.content).slice(0, 200);
     }
   }
 
@@ -435,7 +464,3 @@ export class TranscriptWatcher extends EventEmitter {
     }
   }
 }
-
-// ========== Singleton Export ==========
-
-export const transcriptWatcher = new TranscriptWatcher();

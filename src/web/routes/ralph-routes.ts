@@ -9,16 +9,26 @@ import { join, dirname, resolve, relative, isAbsolute } from 'node:path';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { ApiErrorCode, createErrorResponse, getErrorMessage, type ApiResponse } from '../../types.js';
-import { Session } from '../../session.js';
+import { Session, isExternalCliMode } from '../../session.js';
 import { RespawnController } from '../../respawn-controller.js';
 import { RalphConfigSchema, FixPlanImportSchema, RalphPromptWriteSchema, RalphLoopStartSchema } from '../schemas.js';
 import { SseEvent } from '../sse-events.js';
-import { autoConfigureRalph, CASES_DIR, SETTINGS_PATH, findSessionOrFail, parseBody } from '../route-helpers.js';
-import { writeHooksConfig } from '../../hooks-config.js';
+import {
+  autoConfigureRalph,
+  getAuthUser,
+  ownerFor,
+  resolveCasesDir,
+  sessionCapacityMessage,
+  SETTINGS_PATH,
+  findSessionOrFail,
+  parseBody,
+} from '../route-helpers.js';
+import { resolveClaudeModeForUsername } from '../../user-store.js';
+import { writeHooksConfig, stripCaseEnvKeys } from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
+import { buildRalphLoopPrompt } from '../../prompts/index.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
 import type { SessionPort, EventPort, RespawnPort, ConfigPort, InfraPort } from '../ports/index.js';
-import { MAX_CONCURRENT_SESSIONS } from '../../config/map-limits.js';
 
 export function registerRalphRoutes(
   app: FastifyInstance,
@@ -31,22 +41,24 @@ export function registerRalphRoutes(
   // Configure Ralph tracker for a session
   app.post('/api/sessions/:id/ralph-config', async (req) => {
     const { id } = req.params as { id: string };
-    const { enabled, completionPhrase, maxIterations, reset, disableAutoEnable } = parseBody(
-      RalphConfigSchema,
-      req.body,
-      'Invalid request body'
-    ) as {
-      enabled?: boolean;
-      completionPhrase?: string;
-      maxIterations?: number;
-      reset?: boolean | 'full';
-      disableAutoEnable?: boolean;
-    };
-    const session = findSessionOrFail(ctx, id);
+    const { enabled, completionPhrase, maxIterations, maxTodos, todoExpirationMinutes, reset, disableAutoEnable } =
+      parseBody(RalphConfigSchema, req.body, 'Invalid request body') as {
+        enabled?: boolean;
+        completionPhrase?: string;
+        maxIterations?: number;
+        maxTodos?: number;
+        todoExpirationMinutes?: number;
+        reset?: boolean | 'full';
+        disableAutoEnable?: boolean;
+      };
+    const session = findSessionOrFail(ctx, id, req);
 
-    // Ralph tracker is not supported for opencode sessions
-    if (session.mode === 'opencode') {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Ralph tracker is not supported for opencode sessions');
+    // Ralph tracker is not supported for external-CLI sessions (opencode/codex)
+    if (isExternalCliMode(session.mode)) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        `Ralph tracker is not supported for ${session.mode} sessions`
+      );
     }
 
     // Handle reset first (before other config)
@@ -94,6 +106,14 @@ export function registerRalphRoutes(
       session.ralphTracker.setMaxIterations(maxIterations || null);
     }
 
+    if (maxTodos !== undefined) {
+      session.ralphTracker.setMaxTodos(maxTodos);
+    }
+
+    if (todoExpirationMinutes !== undefined) {
+      session.ralphTracker.setTodoExpirationMinutes(todoExpirationMinutes);
+    }
+
     // Persist and broadcast the update
     ctx.persistSessionState(session);
     ctx.broadcast(SseEvent.SessionRalphLoopUpdate, {
@@ -101,22 +121,22 @@ export function registerRalphRoutes(
       state: session.ralphLoopState,
     });
 
-    return { success: true };
+    return {};
   });
 
   // Reset circuit breaker for Ralph tracker
   app.post('/api/sessions/:id/ralph-circuit-breaker/reset', async (req) => {
     const { id } = req.params as { id: string };
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
     session.ralphTracker.resetCircuitBreaker();
-    return { success: true };
+    return {};
   });
 
   // Get Ralph status block and circuit breaker state
   app.get('/api/sessions/:id/ralph-status', async (req) => {
     const { id } = req.params as { id: string };
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
     return {
       success: true,
@@ -136,7 +156,7 @@ export function registerRalphRoutes(
   // Generate @fix_plan.md content from todos
   app.get('/api/sessions/:id/fix-plan', async (req) => {
     const { id } = req.params as { id: string };
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
     const content = session.ralphTracker.generateFixPlanMarkdown();
     return {
@@ -152,7 +172,7 @@ export function registerRalphRoutes(
   app.post('/api/sessions/:id/fix-plan/import', async (req) => {
     const { id } = req.params as { id: string };
     const { content } = parseBody(FixPlanImportSchema, req.body, 'Invalid request body');
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
     const importedCount = session.ralphTracker.importFixPlanMarkdown(content);
     ctx.persistSessionState(session);
@@ -169,7 +189,7 @@ export function registerRalphRoutes(
   // Write @fix_plan.md to session's working directory
   app.post('/api/sessions/:id/fix-plan/write', async (req) => {
     const { id } = req.params as { id: string };
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
     const workingDir = session.workingDir;
     if (!workingDir) {
@@ -196,7 +216,7 @@ export function registerRalphRoutes(
   // Read @fix_plan.md from session's working directory and import
   app.post('/api/sessions/:id/fix-plan/read', async (req) => {
     const { id } = req.params as { id: string };
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
     const workingDir = session.workingDir;
     if (!workingDir) {
@@ -235,7 +255,7 @@ export function registerRalphRoutes(
   app.post('/api/sessions/:id/ralph-prompt/write', async (req) => {
     const { id } = req.params as { id: string };
     const { content } = parseBody(RalphPromptWriteSchema, req.body, 'Invalid request body');
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
     const workingDir = session.workingDir;
     if (!workingDir) {
@@ -260,24 +280,28 @@ export function registerRalphRoutes(
 
   // Start a Ralph Loop — creates a new session with autonomous cycling
   app.post('/api/ralph-loop/start', async (req): Promise<ApiResponse> => {
-    // Prevent unbounded session creation
-    if (ctx.sessions.size >= MAX_CONCURRENT_SESSIONS) {
-      return createErrorResponse(
-        ApiErrorCode.SESSION_BUSY,
-        `Maximum concurrent sessions (${MAX_CONCURRENT_SESSIONS}) reached.`
-      );
-    }
+    const rlOwner = ownerFor(req);
+    const capMsg = sessionCapacityMessage(ctx.sessions, rlOwner);
+    if (capMsg) return createErrorResponse(ApiErrorCode.SESSION_BUSY, capMsg);
 
-    const { caseName, taskDescription, completionPhrase, maxIterations, enableRespawn, planItems } = parseBody(
-      RalphLoopStartSchema,
-      req.body
-    );
+    const {
+      caseName,
+      taskDescription,
+      completionPhrase,
+      maxIterations,
+      enableRespawn,
+      planItems,
+      envOverrides,
+      effort,
+    } = parseBody(RalphLoopStartSchema, req.body);
 
-    const casePath = join(CASES_DIR, caseName);
+    // Multi-user: cases live in the requesting user's space.
+    const rlCasesBase = resolveCasesDir(getAuthUser(req));
+    const casePath = join(rlCasesBase, caseName);
 
     // Security: Path traversal protection
     const rlResolvedPath = resolve(casePath);
-    const rlResolvedBase = resolve(CASES_DIR);
+    const rlResolvedBase = resolve(rlCasesBase);
     const rlRelPath = relative(rlResolvedBase, rlResolvedPath);
     if (rlRelPath.startsWith('..') || isAbsolute(rlRelPath)) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case path');
@@ -298,10 +322,16 @@ export function registerRalphRoutes(
       }
     }
 
+    // Strip stale disk entries for keys this request is actively setting.
+    if (envOverrides && Object.keys(envOverrides).length > 0) {
+      await stripCaseEnvKeys(casePath, Object.keys(envOverrides));
+    }
+
     // Create session
     const niceConfig = await ctx.getGlobalNiceConfig();
     const rlModelConfig = await ctx.getModelConfig();
     const rlClaudeModeConfig = await ctx.getClaudeModeConfig();
+    const rlClaudeMode = await resolveClaudeModeForUsername(rlClaudeModeConfig.claudeMode, rlOwner);
     const session = new Session({
       workingDir: casePath,
       mux: ctx.mux,
@@ -309,8 +339,11 @@ export function registerRalphRoutes(
       mode: 'claude',
       niceConfig,
       model: rlModelConfig?.defaultModel || undefined,
-      claudeMode: rlClaudeModeConfig.claudeMode,
+      claudeMode: rlClaudeMode,
       allowedTools: rlClaudeModeConfig.allowedTools,
+      envOverrides,
+      effort,
+      owner: rlOwner,
     });
 
     // Configure Ralph tracker
@@ -366,44 +399,19 @@ export function registerRalphRoutes(
       writeFileSync(fixPlanPath, planContent, 'utf-8');
     }
 
-    // Build full prompt
-    const hasPlan = enabledItems.length > 0;
-    let fullPrompt = taskDescription + '\n\n---\n\n';
-    if (hasPlan) {
-      fullPrompt += '## Task Plan\n\n';
-      fullPrompt += 'A task plan has been written to `@fix_plan.md`. Use this to track progress:\n';
-      fullPrompt += '- Reference the plan at the start of each iteration\n';
-      fullPrompt += '- Update task checkboxes as you complete items\n';
-      fullPrompt += '- Work through items in priority order (P0 > P1 > P2)\n\n';
-    }
-    fullPrompt += '## Iteration Protocol\n\n';
-    fullPrompt += 'This is an autonomous loop. Files from previous iterations persist. On each iteration:\n';
-    fullPrompt += '1. Check what work has already been done\n';
-    fullPrompt += '2. Make incremental progress toward completion\n';
-    fullPrompt += '3. Commit meaningful changes with descriptive messages\n\n';
-    fullPrompt += '## Verification\n\n';
-    fullPrompt += 'After each significant change:\n';
-    fullPrompt += '- Run tests to verify (npm test, pytest, etc.)\n';
-    fullPrompt += '- Check for type/lint errors if applicable\n';
-    fullPrompt += '- If tests fail, read the error, fix it, and retry\n\n';
-    fullPrompt += '## Completion Criteria\n\n';
-    fullPrompt += `Output \`<promise>${completionPhrase}</promise>\` when ALL of the following are true:\n`;
-    fullPrompt += '- All requirements from the task description are implemented\n';
-    fullPrompt += '- All tests pass\n';
-    fullPrompt += '- Changes are committed\n\n';
-    fullPrompt += '## If Stuck\n\n';
-    fullPrompt += 'If you encounter the same error for 3+ iterations:\n';
-    fullPrompt += "1. Document what you've tried\n";
-    fullPrompt += '2. Identify the specific blocker\n';
-    fullPrompt += '3. Try an alternative approach\n';
-    fullPrompt += '4. If truly blocked, output `<promise>BLOCKED</promise>` with an explanation\n';
+    // Build full prompt (includes the RALPH_STATUS contract)
+    const fullPrompt = buildRalphLoopPrompt({
+      taskDescription,
+      completionPhrase,
+      hasPlan: enabledItems.length > 0,
+    });
 
     // Write prompt to file
     const promptPath = join(casePath, '@ralph_prompt.md');
     writeFileSync(promptPath, fullPrompt, 'utf-8');
 
     // Register session
-    ctx.addSession(session);
+    await ctx.addSession(session);
     ctx.store.incrementSessionsCreated();
     ctx.persistSessionState(session);
     await ctx.setupSessionListeners(session);

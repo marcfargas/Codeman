@@ -9,6 +9,7 @@
  * - CleanupRegistration / CleanupResourceType — entries for the centralized CleanupManager
  * - NiceConfig / DEFAULT_NICE_CONFIG — process priority settings for `nice`/`ionice`
  * - ProcessStats — memory/CPU/child-count snapshot for resource monitoring
+ * - FilesystemBrowseData — bounded path-picker directory listing returned to the web UI
  */
 
 /**
@@ -66,6 +67,50 @@ export interface ProcessStats {
   childCount: number;
   /** Timestamp of stats collection */
   updatedAt: number;
+}
+
+/** A selectable entry returned by the filesystem path-picker API. */
+export type FilesystemPreviewKind = 'image' | 'text' | 'document';
+
+export interface FilesystemBrowseEntry {
+  name: string;
+  path: string;
+  type: 'file' | 'directory';
+  size?: number;
+  symlink?: boolean;
+  previewKind?: FilesystemPreviewKind;
+}
+
+/** A named root the path picker may browse without escaping its allowlist. */
+export interface FilesystemBrowseRoot {
+  label: string;
+  path: string;
+}
+
+/** Response payload for `GET /api/filesystem/browse`. */
+export interface FilesystemBrowseData {
+  path: string;
+  parent: string | null;
+  root: string;
+  roots: FilesystemBrowseRoot[];
+  entries: FilesystemBrowseEntry[];
+  truncated: boolean;
+}
+
+/** Response payload for `PUT /api/sessions/:id/file-content` (File Viewer edit mode). */
+export interface FileWriteData {
+  /** Workspace-relative path as submitted */
+  path: string;
+  /** Size of the written content in bytes */
+  size: number;
+  /** mtime of the file after the write */
+  mtimeMs: number;
+  /** sha256 hex of the written bytes — the client's next baseHash */
+  hash: string;
+  /** Line count of the written content */
+  totalLines: number;
+  /** Line-ending style that was applied */
+  eol: 'lf' | 'crlf';
 }
 
 export type CleanupResourceType = 'timer' | 'interval' | 'watcher' | 'listener' | 'stream';

@@ -3,7 +3,8 @@
  *
  * Covers:
  * - SSE subscription filter edge cases (empty params, whitespace, duplicates)
- * - extractSessionId logic (sessionId vs id field, global events)
+ * - Lifecycle-event broadcast contract (session:*, case:* fan out to all clients;
+ *   only session:terminal is filtered by subscription)
  * - Tab switching: terminal buffer loading, session creation + switch
  * - Terminal data cap / backpressure recovery
  * - Lazy teammate terminal lifecycle
@@ -11,7 +12,9 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { WebServer } from '../src/web/server.js';
-
+import { safeRmHomeTree } from './mocks/index.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 const TEST_PORT = 3215;
 
 // Helper to parse SSE events from raw text
@@ -87,10 +90,10 @@ async function createSession(baseUrl: string): Promise<string> {
     body: JSON.stringify({ workingDir: '/tmp' }),
   });
   const data = await res.json();
-  if (!data.session?.id) {
+  if (!data.data?.session?.id) {
     throw new Error(`Failed to create session: ${JSON.stringify(data)}`);
   }
-  return data.session.id;
+  return data.data.session.id;
 }
 
 // Helper to delete a session
@@ -254,11 +257,11 @@ describe('Operation Lightspeed', () => {
   });
 
   // ═══════════════════════════════════════════════════════════════
-  // extractSessionId — Event Classification
+  // Lifecycle Event Broadcast — Event Classification
   // ═══════════════════════════════════════════════════════════════
 
-  describe('extractSessionId via SSE Filtering', () => {
-    it('should route session:updated events by id field', async () => {
+  describe('Lifecycle Event Broadcast Contract', () => {
+    it('should deliver session:updated events to all clients regardless of filter', async () => {
       // Create two sessions
       const session1 = await createSession(baseUrl);
       const session2 = await createSession(baseUrl);
@@ -310,21 +313,23 @@ describe('Operation Lightspeed', () => {
 
       const events = parseSSEEvents(receivedData);
 
-      // Should receive session:updated for session1 only
+      // New contract: session:updated is a lifecycle event that broadcasts to ALL clients.
+      // The subscription filter only applies to session:terminal.
       const updatedEvents = events.filter((e) => e.event === 'session:updated');
       const session1Updated = updatedEvents.find((e) => (e.data as any).id === session1);
       const session2Updated = updatedEvents.find((e) => (e.data as any).id === session2);
 
       expect(session1Updated).toBeDefined();
-      expect(session2Updated).toBeUndefined();
+      expect(session2Updated).toBeDefined();
 
       // Cleanup
       await deleteSession(baseUrl, session1);
       await deleteSession(baseUrl, session2);
     });
 
-    it('should filter session:deleted by session ID (sessionId extraction from id field)', async () => {
-      // Tests extractSessionId's fallback path: session:* events use `id` not `sessionId`
+    it('should deliver session:deleted events to all clients regardless of filter', async () => {
+      // New contract: lifecycle events (session:*) broadcast to every connected client;
+      // the per-client filter no longer gates them. Only session:terminal is filtered.
       const target = await createSession(baseUrl);
       const other = await createSession(baseUrl);
 
@@ -367,13 +372,12 @@ describe('Operation Lightspeed', () => {
 
       const events = parseSSEEvents(receivedData);
 
-      // Target deletion should arrive (extractSessionId matches `id` field for session:* events)
+      // Both deletions arrive regardless of the per-client filter
       const targetDeleted = events.find((e) => e.event === 'session:deleted' && (e.data as any).id === target);
       expect(targetDeleted).toBeDefined();
 
-      // Other deletion should NOT arrive
       const otherDeleted = events.find((e) => e.event === 'session:deleted' && (e.data as any).id === other);
-      expect(otherDeleted).toBeUndefined();
+      expect(otherDeleted).toBeDefined();
     });
   });
 
@@ -390,9 +394,9 @@ describe('Operation Lightspeed', () => {
 
       expect(res.status).toBe(200);
       // terminalBuffer may be empty for a fresh session, but field should exist
-      expect(data).toHaveProperty('terminalBuffer');
-      expect(data).toHaveProperty('truncated');
-      expect(data.truncated).toBe(false);
+      expect(data.data).toHaveProperty('terminalBuffer');
+      expect(data.data).toHaveProperty('truncated');
+      expect(data.data.truncated).toBe(false);
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -405,7 +409,7 @@ describe('Operation Lightspeed', () => {
       const data = await res.json();
 
       expect(res.status).toBe(200);
-      expect(data).toHaveProperty('terminalBuffer');
+      expect(data.data).toHaveProperty('terminalBuffer');
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -429,7 +433,7 @@ describe('Operation Lightspeed', () => {
 
       // All should succeed
       for (const data of results) {
-        expect(data).toHaveProperty('terminalBuffer');
+        expect(data.data).toHaveProperty('terminalBuffer');
       }
 
       // Cleanup
@@ -488,13 +492,13 @@ describe('Operation Lightspeed', () => {
       expect(events.find((e) => e.event === 'init')).toBeDefined();
     });
 
-    it('should handle multiple SSE clients with different filters', async () => {
+    it('should fan lifecycle events out to all SSE clients regardless of filter', async () => {
       const session1 = await createSession(baseUrl);
       const session2 = await createSession(baseUrl);
 
-      // Client A: subscribes to session1
-      // Client B: subscribes to session2
-      // Client C: no filter (all events)
+      // Client A: subscribes to session1, Client B: subscribes to session2, Client C: no filter.
+      // Under the broadcast contract, all three see every session:deleted event — the filter
+      // only narrows session:terminal traffic.
       const controllerA = new AbortController();
       const controllerB = new AbortController();
       const controllerC = new AbortController();
@@ -585,15 +589,13 @@ describe('Operation Lightspeed', () => {
       const eventsB = parseSSEEvents(dataB);
       const eventsC = parseSSEEvents(dataC);
 
-      // Client A: sees session1 deleted, not session2
+      // Every client sees both deletions — lifecycle events are not filter-gated.
       expect(eventsA.find((e) => e.event === 'session:deleted' && (e.data as any).id === session1)).toBeDefined();
-      expect(eventsA.find((e) => e.event === 'session:deleted' && (e.data as any).id === session2)).toBeUndefined();
+      expect(eventsA.find((e) => e.event === 'session:deleted' && (e.data as any).id === session2)).toBeDefined();
 
-      // Client B: sees session2 deleted, not session1
+      expect(eventsB.find((e) => e.event === 'session:deleted' && (e.data as any).id === session1)).toBeDefined();
       expect(eventsB.find((e) => e.event === 'session:deleted' && (e.data as any).id === session2)).toBeDefined();
-      expect(eventsB.find((e) => e.event === 'session:deleted' && (e.data as any).id === session1)).toBeUndefined();
 
-      // Client C: sees both
       expect(eventsC.find((e) => e.event === 'session:deleted' && (e.data as any).id === session1)).toBeDefined();
       expect(eventsC.find((e) => e.event === 'session:deleted' && (e.data as any).id === session2)).toBeDefined();
     });
@@ -692,7 +694,8 @@ describe('Operation Lightspeed', () => {
       const sessionId = await createSession(baseUrl);
 
       const res = await fetch(`${baseUrl}/api/sessions`);
-      const sessions = await res.json();
+      const body = await res.json();
+      const sessions = body.data;
 
       expect(Array.isArray(sessions)).toBe(true);
       const session = sessions.find((s: any) => s.id === sessionId);
@@ -718,7 +721,8 @@ describe('Operation Lightspeed', () => {
       await new Promise((resolve) => setTimeout(resolve, 1100));
 
       const res = await fetch(`${baseUrl}/api/sessions`);
-      const sessions = await res.json();
+      const body = await res.json();
+      const sessions = body.data;
 
       // All 3 should be present in the response
       const foundIds = sessions.map((s: any) => s.id);
@@ -911,10 +915,10 @@ describe('Operation Lightspeed', () => {
 
       expect(res.status).toBe(200);
       // Local echo overlay needs session status to know when to show/hide
-      expect(data).toHaveProperty('status');
-      expect(typeof data.status).toBe('string');
+      expect(data.data).toHaveProperty('status');
+      expect(typeof data.data.status).toBe('string');
       // Fresh session starts as 'starting'
-      expect(['starting', 'running', 'idle', 'error']).toContain(data.status);
+      expect(['starting', 'running', 'idle', 'error']).toContain(data.data.status);
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -926,9 +930,9 @@ describe('Operation Lightspeed', () => {
       const data = await res.json();
 
       expect(res.status).toBe(200);
-      expect(data).toHaveProperty('fullSize');
-      expect(typeof data.fullSize).toBe('number');
-      expect(data.fullSize).toBeGreaterThanOrEqual(0);
+      expect(data.data).toHaveProperty('fullSize');
+      expect(typeof data.data.fullSize).toBe('number');
+      expect(data.data.fullSize).toBeGreaterThanOrEqual(0);
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -942,9 +946,9 @@ describe('Operation Lightspeed', () => {
       ]);
 
       // tail=0 means "don't tail" — should return same as no tail param
-      expect(fullRes.truncated).toBe(false);
-      expect(tailZeroRes.truncated).toBe(false);
-      expect(fullRes.terminalBuffer).toBe(tailZeroRes.terminalBuffer);
+      expect(fullRes.data.truncated).toBe(false);
+      expect(tailZeroRes.data.truncated).toBe(false);
+      expect(fullRes.data.terminalBuffer).toBe(tailZeroRes.data.terminalBuffer);
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -957,8 +961,8 @@ describe('Operation Lightspeed', () => {
       const data = await res.json();
 
       expect(res.status).toBe(200);
-      expect(data).toHaveProperty('terminalBuffer');
-      expect(data.truncated).toBe(false); // Can't truncate if tail > fullSize
+      expect(data.data).toHaveProperty('terminalBuffer');
+      expect(data.data.truncated).toBe(false); // Can't truncate if tail > fullSize
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -971,7 +975,7 @@ describe('Operation Lightspeed', () => {
 
       // Should handle gracefully (either return full buffer or error cleanly)
       expect(res.status).toBe(200);
-      expect(data).toHaveProperty('terminalBuffer');
+      expect(data.data).toHaveProperty('terminalBuffer');
 
       await deleteSession(baseUrl, sessionId);
     });
@@ -984,20 +988,20 @@ describe('Operation Lightspeed', () => {
 
       // NaN tail should be handled (parseInt('abc') = NaN, which is falsy)
       expect(res.status).toBe(200);
-      expect(data).toHaveProperty('terminalBuffer');
+      expect(data.data).toHaveProperty('terminalBuffer');
 
       await deleteSession(baseUrl, sessionId);
     });
   });
 
   // ═══════════════════════════════════════════════════════════════
-  // extractSessionId — Additional Edge Cases
+  // Lifecycle Event Broadcast — Additional Edge Cases
   // ═══════════════════════════════════════════════════════════════
 
-  describe('extractSessionId — Edge Cases via SSE', () => {
+  describe('Lifecycle Event Broadcast — Edge Cases via SSE', () => {
     it('should treat non-session: events with id field as global (not filtered)', async () => {
       // Events like case:created have an `id` field but aren't session:* events.
-      // extractSessionId should NOT use the `id` field for non-session:* events.
+      // Under the broadcast contract they reach every connected client.
       const controller = new AbortController();
       let receivedData = '';
 
@@ -1041,19 +1045,13 @@ describe('Operation Lightspeed', () => {
       const caseEvent = events.find((e) => e.event === 'case:created');
       expect(caseEvent).toBeDefined();
 
-      // Cleanup
-      const { rmSync } = await import('node:fs');
-      const { join } = await import('node:path');
-      const { homedir } = await import('node:os');
-      try {
-        rmSync(join(homedir(), 'codeman-cases', caseName), { recursive: true });
-      } catch {
-        /* may not exist */
-      }
+      // Cleanup (containment-gated: never touch prod ~/codeman-cases)
+      safeRmHomeTree(join(homedir(), 'codeman-cases', caseName));
     });
 
-    it('should deliver session:created for a newly created session to unfiltered client but not mismatched filter', async () => {
-      // session:created uses `id` field and starts with `session:` — extractSessionId should match it
+    it('should deliver session:created to every client, even those with a mismatched filter', async () => {
+      // Under the broadcast contract, lifecycle events ignore the per-client filter.
+      // A client subscribed only to `existing` still receives `session:created` for `newSession`.
       const existing = await createSession(baseUrl);
 
       // Subscribe to existing session only
@@ -1091,9 +1089,9 @@ describe('Operation Lightspeed', () => {
       }
 
       const events = parseSSEEvents(receivedData);
-      // session:created for newSession should be filtered OUT (id doesn't match our filter)
+      // session:created reaches the filtered client even though its id doesn't match the filter.
       const createdEvent = events.find((e) => e.event === 'session:created' && (e.data as any).id === newSession);
-      expect(createdEvent).toBeUndefined();
+      expect(createdEvent).toBeDefined();
 
       await Promise.all([deleteSession(baseUrl, existing), deleteSession(baseUrl, newSession)]);
     });
@@ -1234,7 +1232,7 @@ describe('Operation Lightspeed', () => {
         )
       );
 
-      const ids = results.map((r) => r.session.id);
+      const ids = results.map((r) => r.data.session.id);
       expect(ids.length).toBe(5);
       expect(new Set(ids).size).toBe(5); // All unique
 
@@ -1255,7 +1253,7 @@ describe('Operation Lightspeed', () => {
       await Promise.all(ids.map((id) => deleteSession(baseUrl, id)));
     });
 
-    it('should correctly filter SSE under concurrent session lifecycle', async () => {
+    it('should broadcast lifecycle events while filtering concurrent session terminal streams', async () => {
       // Create 2 sessions
       const target = await createSession(baseUrl);
       const other = await createSession(baseUrl);
@@ -1308,15 +1306,21 @@ describe('Operation Lightspeed', () => {
 
       const events = parseSSEEvents(receivedData);
 
-      // Should see target's rename but not other's events
-      const targetUpdated = events.find((e) => e.event === 'session:updated' && (e.data as any).id === target);
+      // session:updated is a lifecycle event broadcast to all clients; the
+      // subscription filter applies only to high-volume terminal streams.
+      const updatedEvents = events.filter((e) => e.event === 'session:updated');
+      const targetUpdated = updatedEvents.find((e) => (e.data as any).id === target);
       expect(targetUpdated).toBeDefined();
 
-      // Should NOT see other's events
-      const otherEvents = events.filter(
-        (e) => ((e.data as any)?.id === other || (e.data as any)?.sessionId === other) && e.event !== 'init'
+      const otherLifecycleEvents = events.filter(
+        (e) => e.event !== 'init' && e.event !== 'session:terminal' && (e.data as any)?.id === other
       );
-      expect(otherEvents.length).toBe(0);
+      expect(otherLifecycleEvents.length).toBeGreaterThan(0);
+
+      const otherTerminalEvents = events.filter(
+        (e) => e.event === 'session:terminal' && (e.data as any)?.sessionId === other
+      );
+      expect(otherTerminalEvents.length).toBe(0);
 
       await deleteSession(baseUrl, target);
     });

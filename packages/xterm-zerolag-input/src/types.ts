@@ -22,9 +22,15 @@ export interface XtermTerminal {
     readonly active: {
       readonly viewportY: number;
       readonly baseY: number;
+      /** Cursor column (0-based). Used by PredictiveEchoAddon. */
+      readonly cursorX?: number;
+      /** Cursor row, relative to baseY (0-based). Used by PredictiveEchoAddon. */
+      readonly cursorY?: number;
       getLine(y: number):
         | {
             translateToString(trimRight?: boolean): string;
+            /** Cell access (xterm public API). Optional: mocks/exotic hosts may omit it. */
+            getCell?(x: number): { getChars(): string; getWidth(): number } | undefined;
           }
         | undefined;
     };
@@ -34,6 +40,10 @@ export interface XtermTerminal {
     getStringCellWidth(str: string): number;
     activeVersion?: string;
   };
+  /** Fires after the parser finishes a write chunk. Used by PredictiveEchoAddon. */
+  onWriteParsed?(cb: () => void): { dispose(): void };
+  /** Fires on terminal resize. Used by PredictiveEchoAddon. */
+  onResize?(cb: (size: { cols: number; rows: number }) => void): { dispose(): void };
 }
 
 /**
@@ -162,6 +172,13 @@ export interface RenderParams {
   /** Height of the character rendering area (px). */
   charHeight: number;
   promptRow: number;
+  /**
+   * Visible terminal rows. When given, the overlay is kept ON SCREEN: it grows
+   * upward instead of running off the bottom edge, and a wrapped prompt taller
+   * than the viewport keeps its tail. Omit to lay out straight down from
+   * `promptRow` (the historical behaviour).
+   */
+  totalRows?: number;
   font: FontStyle;
   showCursor: boolean;
   cursorColor: string;

@@ -13,7 +13,6 @@ import {
   createInitialState,
   ApiErrorCode,
   DEFAULT_CONFIG,
-  isError,
   getErrorMessage,
 } from '../src/types.js';
 
@@ -102,7 +101,14 @@ describe('types utility functions', () => {
       const state2 = createInitialRalphTrackerState();
 
       expect(state1).not.toBe(state2);
-      expect(state1).toEqual(state2);
+      // `lastActivity` is stamped with Date.now(), so two calls that straddle a
+      // millisecond boundary differ by 1ms. Compare the rest of the initial
+      // state for equality and assert the timestamp is a number separately.
+      const { lastActivity: lastActivity1, ...rest1 } = state1;
+      const { lastActivity: lastActivity2, ...rest2 } = state2;
+      expect(rest1).toEqual(rest2);
+      expect(typeof lastActivity1).toBe('number');
+      expect(typeof lastActivity2).toBe('number');
     });
 
     it('should have correct types for all fields', () => {
@@ -265,33 +271,8 @@ describe('types utility functions', () => {
     });
   });
 
-  describe('isError', () => {
-    it('should return true for Error instances', () => {
-      expect(isError(new Error('test'))).toBe(true);
-      expect(isError(new TypeError('test'))).toBe(true);
-      expect(isError(new RangeError('test'))).toBe(true);
-      expect(isError(new SyntaxError('test'))).toBe(true);
-    });
-
-    it('should return false for non-Error values', () => {
-      expect(isError('error string')).toBe(false);
-      expect(isError(123)).toBe(false);
-      expect(isError(null)).toBe(false);
-      expect(isError(undefined)).toBe(false);
-      expect(isError({})).toBe(false);
-      expect(isError({ message: 'fake error' })).toBe(false);
-    });
-
-    it('should return false for arrays', () => {
-      expect(isError([])).toBe(false);
-      expect(isError([new Error('test')])).toBe(false);
-    });
-
-    it('should return false for functions', () => {
-      expect(isError(() => {})).toBe(false);
-      expect(isError(Error)).toBe(false);
-    });
-  });
+  // (isError is now an internal helper in src/types/api.ts — no longer a public
+  // export; it is covered indirectly via getErrorMessage below.)
 
   describe('getErrorMessage', () => {
     it('should extract message from Error objects', () => {
@@ -359,7 +340,12 @@ describe('types utility functions', () => {
 
     describe('TaskStatus', () => {
       it('should support all status values', () => {
-        const statuses: Array<'pending' | 'running' | 'completed' | 'failed'> = ['pending', 'running', 'completed', 'failed'];
+        const statuses: Array<'pending' | 'running' | 'completed' | 'failed'> = [
+          'pending',
+          'running',
+          'completed',
+          'failed',
+        ];
         expect(statuses).toHaveLength(4);
       });
     });
@@ -389,9 +375,17 @@ describe('types utility functions', () => {
       expect(ApiErrorCode.INTERNAL_ERROR).toBe('INTERNAL_ERROR');
     });
 
-    it('should have 6 error codes', () => {
+    it('should have 14 error codes', () => {
       const codes = Object.values(ApiErrorCode);
-      expect(codes).toHaveLength(6);
+      expect(codes).toHaveLength(14);
+    });
+
+    it('includes the multi-user error codes', () => {
+      expect(ApiErrorCode.FORBIDDEN).toBe('FORBIDDEN');
+      expect(ApiErrorCode.PASSWORD_CHANGE_REQUIRED).toBe('PASSWORD_CHANGE_REQUIRED');
+      expect(ApiErrorCode.USER_EXISTS).toBe('USER_EXISTS');
+      expect(ApiErrorCode.USER_NOT_FOUND).toBe('USER_NOT_FOUND');
+      expect(ApiErrorCode.LAST_ADMIN).toBe('LAST_ADMIN');
     });
   });
 });

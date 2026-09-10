@@ -43,6 +43,35 @@ const MobileDetection = {
     );
   },
 
+  /**
+   * Check whether this browser belongs to a handheld device.
+   *
+   * Unlike getDeviceType(), this classification must remain stable when a
+   * foldable changes posture. An unfolded phone can expose a desktop-width
+   * viewport, but it still needs the same per-device settings that were saved
+   * while folded. User-Agent Client Hints are preferred where available; the
+   * legacy token fallback covers Android WebView and iPhone browsers.
+   */
+  isHandheldDevice() {
+    if (!this.isTouchDevice()) return false;
+
+    const userAgent = navigator.userAgent || '';
+
+    // Prefer explicit UA form-factor signals. Besides matching real browsers,
+    // this avoids Chromium emulation reporting userAgentData.mobile=true for
+    // an iPad/tablet context created with isMobile=true.
+    if (/iPad|Tablet|Silk|PlayBook|Kindle|Windows NT|CrOS|Macintosh/i.test(userAgent)) {
+      return false;
+    }
+    if (/Android/i.test(userAgent) && !/Mobile/i.test(userAgent)) return false;
+    if (/Mobi|iPhone|iPod/i.test(userAgent)) return true;
+
+    const uaDataMobile = navigator.userAgentData?.mobile;
+    if (typeof uaDataMobile === 'boolean') return uaDataMobile;
+
+    return false;
+  },
+
   /** Check if device is iOS (iPhone, iPad, iPod) */
   isIOS() {
     return (
@@ -119,6 +148,13 @@ const MobileDetection = {
     if (typeof KeyboardHandler !== 'undefined' && KeyboardHandler.keyboardVisible) return;
     const vh = window.visualViewport?.height || window.innerHeight;
     document.documentElement.style.setProperty('--app-height', `${vh}px`);
+    // How far the layout viewport (which anchors position: fixed) extends below
+    // the visual viewport, i.e. behind the browser's bottom bar. 0 on iPhone
+    // Safari, where fixed elements already stop above the bar; the overlap
+    // where they do not. mobile.css lifts the toolbar by this rather than by
+    // (100vh - --app-height), which on iPhone measures the collapsible chrome
+    // instead and left an empty band between the toolbar and the bar.
+    document.documentElement.style.setProperty('--chrome-overlap', `${Math.max(0, window.innerHeight - vh)}px`);
   },
 
   /** Initialize mobile detection and set up resize listener */
@@ -139,6 +175,14 @@ const MobileDetection = {
       resizeTimeout = setTimeout(() => {
         this.updateBodyClass();
         this.updateAppHeight();
+        // Whether the session sidebar is a docked column or a modal overlay is
+        // decided at 1024px, so crossing that width has to re-sync the drawer
+        // state — otherwise the `inert`/aria-hidden set on a closed overlay
+        // drawer survives into the docked rail and makes it unclickable.
+        if (typeof app !== 'undefined') app.applySessionListLayout?.();
+        // Tab auto-wrap is width-driven, so it must re-evaluate on resize — the only
+        // other trigger is a tab content render. No-op on mobile/tablet (method bails).
+        if (typeof app !== 'undefined') app.updateTabOverflowMode?.();
       }, 100);
     };
     window.addEventListener('resize', this._resizeHandler);
@@ -177,9 +221,18 @@ const MobileDetection = {
  * Also handles terminal scrolling and toolbar repositioning via visualViewport API.
  */
 const KeyboardHandler = {
+  VIEWPORT_SETTLE_MS: 80,
   lastViewportHeight: 0,
   keyboardVisible: false,
   initialViewportHeight: 0,
+  _viewportSettleTimer: null,
+  _settleRestoreScroll: false,
+  _settlePending: false,
+  // Scroll intent captured at the start of a settle cycle (#259). `true` =
+  // following live output, `false` = reading history and _settleAnchorY holds
+  // the top visible line to return to.
+  _settleFollowing: true,
+  _settleAnchorY: null,
 
   /** Initialize keyboard handling */
   init() {
@@ -244,6 +297,14 @@ const KeyboardHandler = {
       window.removeEventListener('scroll', this._windowScrollHandler);
       this._windowScrollHandler = null;
     }
+    if (this._viewportSettleTimer) {
+      clearTimeout(this._viewportSettleTimer);
+      this._viewportSettleTimer = null;
+    }
+    this._settleRestoreScroll = false;
+    this._settlePending = false;
+    this._settleFollowing = true;
+    this._settleAnchorY = null;
   },
 
   /** Handle viewport resize (keyboard show/hide) */
@@ -255,10 +316,9 @@ const KeyboardHandler = {
     if (heightDiff > 150 && !this.keyboardVisible) {
       this.keyboardVisible = true;
       document.body.classList.add('keyboard-visible');
-      // Restore --app-height: MobileDetection's resize listener fires before ours
-      // and may have already shrunk it for the keyboard viewport change.
-      // Use initialViewportHeight (captured before keyboard opened).
-      document.documentElement.style.setProperty('--app-height', `${this.initialViewportHeight}px`);
+      // While the keyboard is open, size the app to the visual viewport so
+      // xterm's bottom row and cursor sit above the OS keyboard.
+      document.documentElement.style.setProperty('--app-height', `${currentHeight}px`);
       this.onKeyboardShow();
     }
     // Keyboard hidden (viewport grew back close to initial)
@@ -277,9 +337,12 @@ const KeyboardHandler = {
     // state changes, orientation changes, and other viewport shifts
     if (!this.keyboardVisible) {
       this.initialViewportHeight = currentHeight;
+    } else {
+      document.documentElement.style.setProperty('--app-height', `${currentHeight}px`);
     }
 
     this.updateLayoutForKeyboard();
+    this._deferViewportSettle();
     this.lastViewportHeight = currentHeight;
   },
 
@@ -287,43 +350,60 @@ const KeyboardHandler = {
   updateLayoutForKeyboard() {
     if (!window.visualViewport) return;
 
-    // Only adjust on mobile
-    if (!MobileDetection.isSmallScreen() && !MobileDetection.isMediumScreen()) {
+    if (!MobileDetection.isTouchDevice()) {
       this.resetLayout();
       return;
     }
 
-    const toolbar = document.querySelector('.toolbar');
-    const accessoryBar = document.querySelector('.keyboard-accessory-bar');
-    const main = document.querySelector('.main');
+    const cjkInput = document.getElementById('cjkInput');
+    const isSmallMedium = MobileDetection.isSmallScreen() || MobileDetection.isMediumScreen();
 
     if (this.keyboardVisible) {
-      // Calculate how far the toolbar (position:fixed, bottom:0) needs to
-      // translate up so it sits at the bottom of the visual viewport.
-      // This formula accounts for iOS scrolling the visual viewport (offsetTop)
-      // when the user types in xterm's hidden textarea.
-      const layoutHeight = window.innerHeight;
-      const visualBottom = window.visualViewport.offsetTop + window.visualViewport.height;
-      const keyboardOffset = Math.max(0, layoutHeight - visualBottom);
-
-      // Move toolbar and accessory bar above keyboard.
-      // When keyboardOffset is 0 (viewport scrolled to layout bottom),
-      // the bars are naturally positioned via their CSS bottom values —
-      // just clear the transforms.  Never dismiss keyboard state here;
-      // that's handleViewportResize's job.
-      if (toolbar) {
-        toolbar.style.transform = keyboardOffset > 0 ? `translateY(${-keyboardOffset}px)` : '';
-      }
-      if (accessoryBar) {
-        accessoryBar.style.transform = keyboardOffset > 0 ? `translateY(${-keyboardOffset}px)` : '';
-      }
-
-      // Shrink main content area so terminal doesn't extend behind keyboard.
-      // Use stable keyboard height (not scroll-dependent) for padding.
-      // 84px = toolbar (40px) + accessory bar (44px).
       const keyboardHeight = this.initialViewportHeight - (window.visualViewport.height || window.innerHeight);
-      if (main && keyboardHeight > 0) {
-        main.style.paddingBottom = `${keyboardHeight + 84}px`;
+      const accessoryBar = document.querySelector('.keyboard-accessory-bar');
+
+      if (isSmallMedium) {
+        // Phones/small tablets: toolbar and accessory bar are position:fixed
+        // via CSS. Use translateY to lift them above the keyboard.
+        const toolbar = document.querySelector('.toolbar');
+        const main = document.querySelector('.main');
+
+        const layoutHeight = window.innerHeight;
+        const visualBottom = window.visualViewport.offsetTop + window.visualViewport.height;
+        const keyboardOffset = Math.max(0, layoutHeight - visualBottom);
+
+        if (toolbar) {
+          toolbar.style.transform = keyboardOffset > 0 ? `translateY(${-keyboardOffset}px)` : '';
+        }
+        if (accessoryBar) {
+          accessoryBar.style.transform = keyboardOffset > 0 ? `translateY(${-keyboardOffset}px)` : '';
+        }
+        if (main && keyboardHeight > 0) {
+          const cjkInputHeight = cjkInput?.classList.contains('cjk-input-visible') ? 44 : 0;
+          main.style.paddingBottom = `${84 + cjkInputHeight}px`;
+        }
+      } else if (keyboardHeight > 0) {
+        // iPad: use direct bottom positioning (translateY unreliable —
+        // iOS auto-scrolls the visual viewport, making keyboardOffset ≈ 0).
+        if (accessoryBar) {
+          accessoryBar.style.bottom = `${keyboardHeight}px`;
+        }
+      }
+
+      // CJK textarea positioning (always position:fixed on touch devices).
+      if (cjkInput?.classList.contains('cjk-input-visible') && keyboardHeight > 0) {
+        if (isSmallMedium) {
+          // Phones: use translateY like toolbar/accessory bar.
+          const layoutHeight = window.innerHeight;
+          const visualBottom = window.visualViewport.offsetTop + window.visualViewport.height;
+          const keyboardOffset = Math.max(0, layoutHeight - visualBottom);
+          cjkInput.style.transform = keyboardOffset > 0 ? `translateY(${-keyboardOffset}px)` : '';
+          cjkInput.style.bottom = '';
+        } else {
+          // iPad: direct bottom = keyboard + accessory bar height.
+          cjkInput.style.bottom = `${keyboardHeight + 44}px`;
+          cjkInput.style.transform = '';
+        }
       }
     } else {
       this.resetLayout();
@@ -334,6 +414,7 @@ const KeyboardHandler = {
   resetLayout() {
     const toolbar = document.querySelector('.toolbar');
     const accessoryBar = document.querySelector('.keyboard-accessory-bar');
+    const cjkInput = document.getElementById('cjkInput');
     const main = document.querySelector('.main');
 
     if (toolbar) {
@@ -341,6 +422,11 @@ const KeyboardHandler = {
     }
     if (accessoryBar) {
       accessoryBar.style.transform = '';
+      accessoryBar.style.bottom = '';
+    }
+    if (cjkInput) {
+      cjkInput.style.transform = '';
+      cjkInput.style.bottom = '';
     }
     if (main) {
       main.style.paddingBottom = '';
@@ -358,30 +444,9 @@ const KeyboardHandler = {
     // iOS Safari may scroll the document to reveal xterm's hidden textarea.
     window.scrollTo(0, 0);
 
-    // Refit terminal locally AND send resize to server so Claude Code (Ink)
-    // knows the actual terminal dimensions. Without this, Ink redraws at the
-    // old (larger) row count when the user types, causing content to scroll
-    // off the visible area with each keystroke.
-    // Note: the throttledResize handler still suppresses ongoing resize events
-    // while keyboard is up — this one-shot resize on open/close is sufficient.
-    setTimeout(() => {
-      if (typeof app !== 'undefined' && app.terminal) {
-        if (app.fitAddon)
-          try {
-            app.fitAddon.fit();
-          } catch {}
-        // Eliminate terminal row quantization gap: xterm can only show whole
-        // rows, so leftover pixels create dead space below the last row.
-        // Shrink .main's paddingBottom by the gap so the terminal fills flush
-        // to the accessory bar.
-        this._shrinkPaddingToFit();
-        app.terminal.scrollToBottom();
-        // Send resize to server so PTY dimensions match xterm
-        this._sendTerminalResize();
-      }
-      // Reset again after fit/resize in case layout changes triggered scroll
-      window.scrollTo(0, 0);
-    }, 150);
+    // visualViewport emits multiple heights throughout the OS animation.
+    // Re-schedule on every event and fit only after the final height settles.
+    this._scheduleViewportSettle({ restoreScroll: true });
 
     // Reposition subagent windows to stack from bottom (above keyboard)
     if (typeof app !== 'undefined') app.relayoutMobileSubagentWindows();
@@ -396,20 +461,96 @@ const KeyboardHandler = {
 
     this.resetLayout();
 
-    // Refit terminal, scroll to bottom, and send resize to restore original dimensions
-    setTimeout(() => {
-      if (typeof app !== 'undefined' && app.fitAddon) {
-        try {
-          app.fitAddon.fit();
-        } catch {}
-        if (app.terminal) app.terminal.scrollToBottom();
-        // Send resize to server to restore full terminal size
-        this._sendTerminalResize();
-      }
-    }, 100);
+    this._scheduleViewportSettle({ restoreScroll: true });
 
     // Reposition subagent windows to stack from top (below header)
     if (typeof app !== 'undefined') app.relayoutMobileSubagentWindows();
+  },
+
+  /**
+   * Coalesce the keyboard animation into one final xterm reflow and PTY resize.
+   * Only a real show/hide transition arms the settle work; ongoing viewport
+   * resize events merely push a pending settle back (_deferViewportSettle).
+   * A viewport change that never crosses the show/hide thresholds must not
+   * refit: keyboard detection can miss a fine-grained OS animation entirely
+   * (each step under 150px, with the baseline chasing the animation), and the
+   * container is then mid-animation with no keyboard CSS compensation, so a
+   * fit against it resizes the PTY to transient dims and the SIGWINCH thrash
+   * garbles the transcript.
+   */
+  _scheduleViewportSettle({ restoreScroll = false } = {}) {
+    // Capture scroll intent on the FIRST event of a settle cycle, BEFORE any
+    // fit() has reflowed the buffer — a later capture reads an already-moved
+    // viewportY. Issue #259: this path used to force scrollToBottom
+    // unconditionally, so opening the keyboard yanked a user who was reading
+    // history down to the live output.
+    if (!this._settlePending) this._captureTerminalScrollIntent();
+    this._settleRestoreScroll = this._settleRestoreScroll || restoreScroll;
+    this._settlePending = true;
+    this._armViewportSettleTimer();
+  },
+
+  /**
+   * Record whether the terminal is following live output, and if not, the top
+   * visible line to return to. `_settleFollowing` defaults to true so a
+   * terminal we cannot read keeps the historical scroll-to-bottom behavior.
+   */
+  _captureTerminalScrollIntent() {
+    this._settleFollowing = true;
+    this._settleAnchorY = null;
+    if (typeof app === 'undefined' || !app.terminal?.buffer?.active) return;
+    this._settleFollowing = app.isTerminalAtBottom();
+    if (!this._settleFollowing) this._settleAnchorY = app.terminal.buffer.active.viewportY;
+  },
+
+  /**
+   * Return to the captured anchor after the keyboard reflow. Reflow can rewrap
+   * lines, so the anchor is approximate by construction; it is clamped to the
+   * post-reflow buffer rather than trusted blindly.
+   */
+  _restoreTerminalScrollIntent() {
+    const term = typeof app !== 'undefined' ? app.terminal : null;
+    const anchor = this._settleAnchorY;
+    if (typeof anchor !== 'number' || typeof term?.scrollToLine !== 'function' || !term.buffer?.active) {
+      term?.scrollToBottom?.();
+      return;
+    }
+    term.scrollToLine(Math.max(0, Math.min(anchor, term.buffer.active.baseY)));
+  },
+
+  /** Push a pending settle back while the viewport is still animating; no-op otherwise. */
+  _deferViewportSettle() {
+    if (!this._settlePending) return;
+    this._armViewportSettleTimer();
+  },
+
+  _armViewportSettleTimer() {
+    if (this._viewportSettleTimer) clearTimeout(this._viewportSettleTimer);
+    this._viewportSettleTimer = setTimeout(() => {
+      this._viewportSettleTimer = null;
+      this._settlePending = false;
+      const shouldRestoreScroll = this._settleRestoreScroll;
+      this._settleRestoreScroll = false;
+
+      if (typeof app !== 'undefined' && app.terminal) {
+        if (app.fitAddon) {
+          try {
+            app.fitAddon.fit();
+          } catch {}
+        }
+        if (this.keyboardVisible) this._shrinkPaddingToFit();
+        // Following live output → bottom, as before. Reading history → back to
+        // the pre-reflow anchor instead of being yanked down (#259).
+        if (shouldRestoreScroll) {
+          if (this._settleFollowing === false) this._restoreTerminalScrollIntent();
+          else app.terminal.scrollToBottom();
+        }
+        app._syncMobileHelperTextareaToCursor?.();
+        app._localEchoOverlay?.rerender?.();
+        this._sendTerminalResize();
+      }
+      window.scrollTo(0, 0);
+    }, this.VIEWPORT_SETTLE_MS);
   },
 
   /** Send current terminal dimensions to the server (one-shot, for keyboard open/close) */
@@ -421,10 +562,13 @@ const KeyboardHandler = {
         const cols = Math.max(dims.cols, 40);
         const rows = Math.max(dims.rows, 10);
         app._lastResizeDims = { cols, rows };
+        // Declare the viewport type so resize arbitration can ignore this
+        // while a desktop connection is sizing the same session.
+        const viewportType = MobileDetection.getDeviceType ? MobileDetection.getDeviceType() : 'mobile';
         fetch(`/api/sessions/${app.activeSessionId}/resize`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cols, rows }),
+          body: JSON.stringify({ cols, rows, viewportType }),
         }).catch(() => {});
       }
     } catch {}
@@ -436,6 +580,42 @@ const KeyboardHandler = {
    * space below the last row. After fitAddon.fit(), measure the gap and
    * reduce padding by that amount so the terminal sits flush against the bars.
    */
+  /**
+   * Combined height of the fixed bars that overlay the terminal's bottom edge.
+   *
+   * On phones the toolbar and the accessory bar are `position: fixed`, so they
+   * occupy no layout space of their own — `main`'s padding-bottom is the only
+   * thing reserving room for them, and any pixel taken out of it is a pixel of
+   * terminal painted underneath them.
+   */
+  _fixedBottomBarsHeight() {
+    let px = 0;
+    for (const selector of ['.toolbar', '.keyboard-accessory-bar', '#cjkInput.cjk-input-visible']) {
+      const el = document.querySelector(selector);
+      if (!el) continue;
+      const style = window.getComputedStyle?.(el);
+      if (style && (style.display === 'none' || style.visibility === 'hidden')) continue;
+      px += el.offsetHeight || 0;
+    }
+    return px;
+  },
+
+  /**
+   * Reclaim sub-row slack at the bottom of the terminal — but never the space the
+   * fixed bars stand in.
+   *
+   * Shrinking the padding by the whole slack pulled the terminal's bottom edge
+   * DOWN under those bars, and the row the following re-fit then gained was
+   * painted behind them: on a long wrapped prompt the last line was clipped by
+   * the accessory bar, i.e. the bottom half of the text being typed. The floor is
+   * now the bars' MEASURED height, so a device where the hard-coded 84px
+   * over-reserves still reclaims the difference, while one that genuinely needs
+   * it keeps every pixel.
+   *
+   * ⚠️ The floor can only ever prevent a shrink, never cause a grow
+   * (`Math.min(currentPadding, …)`): a measured height LARGER than the current
+   * padding makes this a no-op rather than silently resizing the terminal.
+   */
   _shrinkPaddingToFit() {
     try {
       const container = document.getElementById('terminalContainer');
@@ -446,7 +626,8 @@ const KeyboardHandler = {
       const gap = container.clientHeight - app.terminal.rows * cellH;
       if (gap > 0 && gap < cellH) {
         const currentPadding = parseInt(main.style.paddingBottom) || 0;
-        main.style.paddingBottom = Math.max(0, currentPadding - gap) + 'px';
+        const floor = Math.min(currentPadding, this._fixedBottomBarsHeight());
+        main.style.paddingBottom = Math.max(floor, currentPadding - gap) + 'px';
         if (app.fitAddon)
           try {
             app.fitAddon.fit();
@@ -520,6 +701,7 @@ const SwipeHandler = {
   _touchStartHandler: null,
   _touchEndHandler: null,
   _element: null,
+  _ignoreGesture: false,
 
   /** Initialize swipe handling */
   init() {
@@ -548,6 +730,12 @@ const SwipeHandler = {
   },
 
   onTouchStart(e) {
+    // The session sidebar is an overlay child of .main, so its touches bubble in
+    // here. Swiping across the open session drawer — the natural "dismiss it"
+    // gesture — would otherwise fire nextSession() and drop the user into a
+    // session they never tapped.
+    this._ignoreGesture = !!e.target?.closest?.('.session-sidebar');
+    if (this._ignoreGesture) return;
     if (!e.touches || e.touches.length !== 1) return;
     this.startX = e.touches[0].clientX;
     this.startY = e.touches[0].clientY;
@@ -555,6 +743,10 @@ const SwipeHandler = {
   },
 
   onTouchEnd(e) {
+    if (this._ignoreGesture) {
+      this._ignoreGesture = false;
+      return;
+    }
     if (!e.changedTouches || e.changedTouches.length !== 1) return;
 
     const endX = e.changedTouches[0].clientX;

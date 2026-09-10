@@ -48,7 +48,7 @@ const STREAM_INACTIVITY_TIMEOUT_MS = INACTIVITY_TIMEOUT_MS;
 /**
  * Represents an active file stream.
  */
-export interface FileStream {
+interface FileStream {
   /** Unique stream identifier */
   id: string;
   /** Session this stream belongs to */
@@ -74,7 +74,7 @@ export interface FileStream {
 /**
  * Options for creating a file stream.
  */
-export interface CreateStreamOptions {
+interface CreateStreamOptions {
   /** Session ID requesting the stream */
   sessionId: string;
   /** Path to the file to stream */
@@ -94,7 +94,7 @@ export interface CreateStreamOptions {
 /**
  * Result of creating a stream.
  */
-export interface CreateStreamResult {
+interface CreateStreamResult {
   success: boolean;
   streamId?: string;
   error?: string;
@@ -395,8 +395,12 @@ export class FileStreamManager extends EventEmitter {
     // Normalize the working directory
     const normalizedWorkingDir = resolve(workingDir);
 
-    // Check if the resolved path is within the working directory
-    // or common log directories (/tmp intentionally excluded — world-writable)
+    // Allowed read roots for log tailing: the session working dir plus the
+    // INTENTIONAL log directories (/var/log, ~/logs). This is wider than the
+    // per-session boundary used by validateSessionFilePath — a deliberate,
+    // tested design choice for tailing system/app logs, documented as such in
+    // docs/security-architecture.md (security review M5). /tmp is excluded
+    // (world-writable).
     const allowedPaths = [normalizedWorkingDir, '/var/log', resolve(homedir(), 'logs')];
 
     const isAllowed = allowedPaths.some((allowed) => {

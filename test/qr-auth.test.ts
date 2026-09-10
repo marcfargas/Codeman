@@ -86,8 +86,7 @@ describe('QR Token Manager (unit)', () => {
 
     // Manually expire the token by manipulating its createdAt
     // Access the private map — this is a unit test, we need to verify the TTL logic
-    const tokenMap = (tm as unknown as { qrTokensByCode: Map<string, { createdAt: number }> })
-      .qrTokensByCode;
+    const tokenMap = (tm as unknown as { qrTokensByCode: Map<string, { createdAt: number }> }).qrTokensByCode;
     const record = tokenMap.get(code)!;
     record.createdAt = Date.now() - 91_000; // 91 seconds ago (beyond 90s grace)
 
@@ -99,8 +98,7 @@ describe('QR Token Manager (unit)', () => {
     const code = tm.getCurrentShortCode()!;
 
     // Set createdAt to 80 seconds ago (within 90s grace)
-    const tokenMap = (tm as unknown as { qrTokensByCode: Map<string, { createdAt: number }> })
-      .qrTokensByCode;
+    const tokenMap = (tm as unknown as { qrTokensByCode: Map<string, { createdAt: number }> }).qrTokensByCode;
     const record = tokenMap.get(code)!;
     record.createdAt = Date.now() - 80_000;
 
@@ -172,8 +170,7 @@ describe('QR Token Manager (unit)', () => {
 
   it('should accept token at exactly grace period (90000ms)', () => {
     const code = tm.getCurrentShortCode()!;
-    const tokenMap = (tm as unknown as { qrTokensByCode: Map<string, { createdAt: number }> })
-      .qrTokensByCode;
+    const tokenMap = (tm as unknown as { qrTokensByCode: Map<string, { createdAt: number }> }).qrTokensByCode;
     const record = tokenMap.get(code)!;
     record.createdAt = Date.now() - 90_000;
     // Condition is `> QR_TOKEN_GRACE_MS` (strict >), so exactly 90000 should pass
@@ -182,8 +179,7 @@ describe('QR Token Manager (unit)', () => {
 
   it('should reject token at grace period + 1ms (90001ms)', () => {
     const code = tm.getCurrentShortCode()!;
-    const tokenMap = (tm as unknown as { qrTokensByCode: Map<string, { createdAt: number }> })
-      .qrTokensByCode;
+    const tokenMap = (tm as unknown as { qrTokensByCode: Map<string, { createdAt: number }> }).qrTokensByCode;
     const record = tokenMap.get(code)!;
     record.createdAt = Date.now() - 90_001;
     expect(tm.consumeToken(code)).toBe(false);
@@ -254,6 +250,9 @@ describe('QR Token Manager (unit)', () => {
   });
 });
 
+/** Must match the alphabet in `generateShortCode` (tunnel-manager.ts). */
+const BASE62_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
 describe('Short code distribution (bias check)', () => {
   it('should produce roughly uniform character distribution', () => {
     // Generate 6000 codes (36000 chars) and check distribution
@@ -269,17 +268,36 @@ describe('Short code distribution (bias check)', () => {
       }
     }
 
-    // Expected count per char: 36000 / 62 ≈ 580.6
-    const expected = 36000 / 62;
-    let maxDeviation = 0;
-    for (const [, count] of charCounts) {
-      const deviation = Math.abs(count - expected) / expected;
-      maxDeviation = Math.max(maxDeviation, deviation);
+    // Chi-square goodness-of-fit against a uniform base62 alphabet.
+    //
+    // This deliberately does NOT assert on the max per-character deviation.
+    // That statistic is the maximum of 62 correlated near-normal cells, so its
+    // tail is fat: with n=36000 the per-cell relative SD is ~4.1%, which puts a
+    // 15% bound at |z| ~ 3.65 and, taken as a max over 62 cells, fails on a
+    // perfectly uniform generator about 1.6% of the time. Measured over 3000
+    // simulated runs: 48 spurious failures. That is the flake.
+    //
+    // Chi-square is the right tool for "is this multinomial uniform", and its
+    // threshold is derivable rather than eyeballed. df = 62 - 1 = 61, so under
+    // the null E[X²] = 61 and SD = sqrt(2*61) ~ 11.05; the Wilson-Hilferty
+    // approximation puts the p = 1e-6 critical value at ~129. Rounding to 130
+    // gives a false-positive rate around one run in a million.
+    //
+    // Power is unaffected. Dropping rejection sampling reintroduces modulo bias
+    // (256 % 62 = 8, so the first 8 characters draw 5 chances per 256 instead
+    // of 4, ~25% overrepresented), which scores X² ~ 237. Simulated: 3000 clean
+    // runs peaked at 104, while 200 biased runs bottomed out at 174.5, so the
+    // threshold sits in a wide empty gap between the two.
+    const alphabetSize = 62;
+    const expected = 36000 / alphabetSize;
+    let chiSquare = 0;
+    for (let i = 0; i < alphabetSize; i++) {
+      const count = charCounts.get(BASE62_ALPHABET[i]) ?? 0;
+      chiSquare += (count - expected) ** 2 / expected;
     }
 
-    // With rejection sampling, deviation should be < 15% (generous)
-    // Without rejection sampling (modulo bias), first 6 chars would be ~25% overrepresented
-    expect(maxDeviation).toBeLessThan(0.15);
+    expect(charCounts.size).toBe(alphabetSize);
+    expect(chiSquare).toBeLessThan(130);
 
     tm.stopTokenRotation();
   });
@@ -308,8 +326,7 @@ describe('QR Auth Integration', () => {
   beforeEach(() => {
     // Reset QR failure counter to prevent cross-test contamination
     // (all requests come from 127.0.0.1)
-    const qrFailures = (server as unknown as { qrAuthFailures: { clear(): void } | null })
-      .qrAuthFailures;
+    const qrFailures = (server as unknown as { qrAuthFailures: { clear(): void } | null }).qrAuthFailures;
     if (qrFailures) qrFailures.clear();
   });
 
@@ -568,9 +585,11 @@ describe('QR Auth Integration', () => {
       const setCookie = res.headers.get('set-cookie')!;
       const token = setCookie.match(/codeman_session=([^;]+)/)![1];
 
-      const authSessions = (server as unknown as {
-        authSessions: { get(k: string): { method: string } | undefined } | null;
-      }).authSessions;
+      const authSessions = (
+        server as unknown as {
+          authSessions: { get(k: string): { method: string } | undefined } | null;
+        }
+      ).authSessions;
       const record = authSessions?.get(token);
       expect(record).toBeDefined();
       expect(record!.method).toBe('qr');
@@ -631,9 +650,9 @@ describe('QR SVG Endpoint (GET /api/tunnel/qr)', () => {
       });
       expect(res.status).toBe(200);
       const data = await res.json();
-      expect(data.authEnabled).toBe(true);
-      expect(data.svg).toContain('<svg');
-      expect(data.svg).toContain('</svg>');
+      expect(data.data.authEnabled).toBe(true);
+      expect(data.data.svg).toContain('<svg');
+      expect(data.data.svg).toContain('</svg>');
     } finally {
       tm.stopTokenRotation();
       simulateTunnelStopped(tm);
@@ -653,9 +672,9 @@ describe('QR SVG Endpoint (GET /api/tunnel/qr)', () => {
       });
       expect(res.status).toBe(200);
       const data = await res.json();
-      expect(data.authEnabled).toBe(false);
-      expect(data.svg).toContain('<svg');
-      expect(data.svg).toContain('</svg>');
+      expect(data.data.authEnabled).toBe(false);
+      expect(data.data.svg).toContain('<svg');
+      expect(data.data.svg).toContain('</svg>');
     } finally {
       process.env.CODEMAN_PASSWORD = savedPass;
       simulateTunnelStopped(tm);
@@ -709,8 +728,8 @@ describe('QR SVG Endpoint (GET /api/tunnel/qr)', () => {
       });
       expect(res.status).toBe(200);
       const data = await res.json();
-      expect(data.svg).toContain('<svg');
-      expect(data.authEnabled).toBe(false);
+      expect(data.data.svg).toContain('<svg');
+      expect(data.data.authEnabled).toBe(false);
     } finally {
       process.env.CODEMAN_PASSWORD = savedPass;
       simulateTunnelStopped(tm);
@@ -732,7 +751,7 @@ describe('QR SVG Endpoint (GET /api/tunnel/qr)', () => {
       });
       const data2 = await res2.json();
 
-      expect(data1.svg).toBe(data2.svg);
+      expect(data1.data.svg).toBe(data2.data.svg);
     } finally {
       tm.stopTokenRotation();
       simulateTunnelStopped(tm);
@@ -756,7 +775,7 @@ describe('QR SVG Endpoint (GET /api/tunnel/qr)', () => {
       });
       const data2 = await res2.json();
 
-      expect(data1.svg).not.toBe(data2.svg);
+      expect(data1.data.svg).not.toBe(data2.data.svg);
     } finally {
       tm.stopTokenRotation();
       simulateTunnelStopped(tm);

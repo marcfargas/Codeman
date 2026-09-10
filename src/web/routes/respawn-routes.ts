@@ -8,9 +8,10 @@ import { ApiErrorCode, createErrorResponse, getErrorMessage, type PersistedRespa
 import { RespawnController, type RespawnConfig } from '../../respawn-controller.js';
 import { RespawnConfigSchema, InteractiveRespawnSchema, RespawnEnableSchema } from '../schemas.js';
 import { SseEvent } from '../sse-events.js';
-import { findSessionOrFail, autoConfigureRalph, parseBody } from '../route-helpers.js';
+import { findSessionOrFail, autoConfigureRalph, parseBody, canAccessOwned, getAuthUser } from '../route-helpers.js';
 import type { SessionPort, EventPort, RespawnPort, ConfigPort, InfraPort } from '../ports/index.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
+import { isExternalCliMode } from '../../session.js';
 import {
   AI_CHECK_MODEL,
   AI_IDLE_CHECK_MAX_CONTEXT,
@@ -45,7 +46,11 @@ export function registerRespawnRoutes(
     const { id } = req.params as { id: string };
     const controller = ctx.respawnControllers.get(id);
 
-    if (!controller) {
+    // Multi-user: gate on the owner from the same source the data comes from, and
+    // return the existing neutral shape (not 404) when foreign so existence isn't
+    // leaked. canAccessOwned is allow-all in single-user mode → byte-identical.
+    const owner = ctx.sessions.get(id)?.owner ?? ctx.mux.getSession(id)?.owner;
+    if (!controller || !canAccessOwned(getAuthUser(req), owner)) {
       return { enabled: false, status: null };
     }
 
@@ -59,19 +64,24 @@ export function registerRespawnRoutes(
 
   app.get('/api/sessions/:id/respawn/config', async (req) => {
     const { id } = req.params as { id: string };
+    // Multi-user: owner-gate each branch against the source of the data, preserving
+    // the neutral {config:null,active:false} shape when foreign (no existence leak).
+    // canAccessOwned is allow-all in single-user mode → byte-identical, and this keeps
+    // the mux-only pre-config path working (findSessionOrFail would break it).
+    const user = getAuthUser(req);
     const controller = ctx.respawnControllers.get(id);
 
-    if (controller) {
-      return { success: true, config: controller.getConfig(), active: true };
+    if (controller && canAccessOwned(user, ctx.sessions.get(id)?.owner)) {
+      return { config: controller.getConfig(), active: true };
     }
 
     // Return pre-saved config from mux-sessions.json
-    const preConfig = ctx.mux.getSession(id)?.respawnConfig;
-    if (preConfig) {
-      return { success: true, config: preConfig, active: false };
+    const mux = ctx.mux.getSession(id);
+    if (mux?.respawnConfig && canAccessOwned(user, mux.owner)) {
+      return { config: mux.respawnConfig, active: false };
     }
 
-    return { success: true, config: null, active: false };
+    return { config: null, active: false };
   });
 
   // ═══════════════════════════════════════════════════════════════
@@ -86,11 +96,11 @@ export function registerRespawnRoutes(
     if (req.body) {
       body = parseBody(RespawnConfigSchema, req.body, 'Invalid respawn config') as Partial<RespawnConfig>;
     }
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
-    // Respawn is not supported for opencode sessions
-    if (session.mode === 'opencode') {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Respawn is not supported for opencode sessions');
+    // Respawn is not supported for external-CLI sessions (opencode/codex)
+    if (isExternalCliMode(session.mode)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Respawn is not supported for ${session.mode} sessions`);
     }
 
     // Create or get existing controller
@@ -114,13 +124,16 @@ export function registerRespawnRoutes(
 
     ctx.broadcast(SseEvent.RespawnStarted, { sessionId: id, status: controller.getStatus() });
 
-    return { success: true, status: controller.getStatus() };
+    return { status: controller.getStatus() };
   });
 
   // ========== Stop Respawn ==========
 
   app.post('/api/sessions/:id/respawn/stop', async (req) => {
     const { id } = req.params as { id: string };
+    // Owner-gate before any side effects (matches start/config/enable): a non-owner
+    // gets NOT_FOUND and never reaches stop/delete/clearRespawnConfig/persist.
+    const session = findSessionOrFail(ctx, id, req);
     const controller = ctx.respawnControllers.get(id);
 
     if (!controller) {
@@ -143,14 +156,11 @@ export function registerRespawnRoutes(
     ctx.mux.clearRespawnConfig(id);
 
     // Update state.json (respawnConfig removed)
-    const session = ctx.sessions.get(id);
-    if (session) {
-      ctx.persistSessionState(session);
-    }
+    ctx.persistSessionState(session);
 
     ctx.broadcast(SseEvent.RespawnStopped, { sessionId: id });
 
-    return { success: true };
+    return {};
   });
 
   // ========== Update Respawn Config ==========
@@ -159,7 +169,7 @@ export function registerRespawnRoutes(
     const { id } = req.params as { id: string };
     // Validate respawn config to prevent arbitrary field injection
     const config = parseBody(RespawnConfigSchema, req.body, 'Invalid respawn config') as Partial<RespawnConfig>;
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
     const controller = ctx.respawnControllers.get(id);
 
@@ -169,7 +179,7 @@ export function registerRespawnRoutes(
       ctx.saveRespawnConfig(id, controller.getConfig());
       ctx.persistSessionState(session);
       ctx.broadcast(SseEvent.RespawnConfigUpdated, { sessionId: id, config: controller.getConfig() });
-      return { success: true, config: controller.getConfig() };
+      return { config: controller.getConfig() };
     }
 
     // No controller running - save as pre-config for when respawn starts
@@ -206,7 +216,7 @@ export function registerRespawnRoutes(
     ctx.mux.updateRespawnConfig(id, merged);
     ctx.persistSessionState(session);
     ctx.broadcast(SseEvent.RespawnConfigUpdated, { sessionId: id, config: merged });
-    return { success: true, config: merged };
+    return { config: merged };
   });
 
   // ═══════════════════════════════════════════════════════════════
@@ -225,15 +235,15 @@ export function registerRespawnRoutes(
       respawnConfig?: Partial<RespawnConfig>;
       durationMinutes?: number;
     };
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
     if (session.isBusy()) {
       return createErrorResponse(ApiErrorCode.SESSION_BUSY, 'Session is busy');
     }
 
-    // Respawn is not supported for opencode sessions
-    if (session.mode === 'opencode') {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Respawn is not supported for opencode sessions');
+    // Respawn is not supported for external-CLI sessions (opencode/codex)
+    if (isExternalCliMode(session.mode)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Respawn is not supported for ${session.mode} sessions`);
     }
 
     try {
@@ -244,6 +254,10 @@ export function registerRespawnRoutes(
           session.ralphTracker.enable();
         }
       }
+
+      // Re-attach listener wiring if a prior PTY exit detached it (the wiring exit
+      // handler removes ALL session listeners; idempotent — no-op while still attached).
+      await ctx.setupSessionListeners(session);
 
       // Start interactive session
       await session.startInteractive();
@@ -294,11 +308,11 @@ export function registerRespawnRoutes(
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid request body');
     }
     const body = reResult.data as { config?: Partial<RespawnConfig>; durationMinutes?: number };
-    const session = findSessionOrFail(ctx, id);
+    const session = findSessionOrFail(ctx, id, req);
 
-    // Respawn is not supported for opencode sessions
-    if (session.mode === 'opencode') {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Respawn is not supported for opencode sessions');
+    // Respawn is not supported for external-CLI sessions (opencode/codex)
+    if (isExternalCliMode(session.mode)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Respawn is not supported for ${session.mode} sessions`);
     }
 
     // Check if session is running (has a PID)
@@ -332,7 +346,6 @@ export function registerRespawnRoutes(
     ctx.broadcast(SseEvent.RespawnStarted, { sessionId: id, status: controller.getStatus() });
 
     return {
-      success: true,
       message: 'Respawn enabled on existing session',
       respawnStatus: controller.getStatus(),
     };

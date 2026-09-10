@@ -27,7 +27,7 @@
  * - `RespawnController` class — state machine, extends EventEmitter
  * - `RespawnConfig` interface — all configuration options
  * - `RespawnState` type — union of all state machine states
- * - `DetectionStatus`, `ActiveTimerInfo`, `RespawnEvents` — status/event types
+ * - `DetectionStatus`, `ActiveTimerInfo` — status types
  *
  * Key methods: `start()`, `stop()`, `getStatus()`, `getConfig()`,
  * `getDetectionStatus()`, `getActiveTimers()`, `getAggregateMetrics()`,
@@ -46,8 +46,8 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { Session } from './session.js';
-import { AiIdleChecker, type AiCheckResult, type AiCheckState } from './ai-idle-checker.js';
-import { AiPlanChecker, type AiPlanCheckResult } from './ai-plan-checker.js';
+import { AiIdleChecker, type AiCheckState } from './ai-idle-checker.js';
+import { AiPlanChecker } from './ai-plan-checker.js';
 import type { TeamWatcher } from './team-watcher.js';
 import { BufferAccumulator, ANSI_ESCAPE_PATTERN_SIMPLE, assertNever, CleanupManager } from './utils/index.js';
 import { MAX_RESPAWN_BUFFER_SIZE, TRIM_RESPAWN_BUFFER_TO as RESPAWN_BUFFER_TRIM_SIZE } from './config/buffer-limits.js';
@@ -99,13 +99,13 @@ const PLAN_MODE_SELECTOR_PATTERN = /[❯>]\s*\d+\./;
  * Each layer provides a confidence signal that Claude has finished working.
  */
 /** Active timer info for UI display */
-export interface ActiveTimerInfo {
+interface ActiveTimerInfo {
   name: string;
   remainingMs: number;
   totalMs: number;
 }
 
-export interface DetectionStatus {
+interface DetectionStatus {
   /** Layer 0: Stop hook received (highest priority - definitive signal) */
   stopHookReceived: boolean;
   /** Timestamp when Stop hook was received */
@@ -488,68 +488,11 @@ export interface RespawnConfig {
  * @event error - Fired on errors
  * @event log - Fired for debug logging
  */
-/** Timer info for countdown display */
-export interface TimerInfo {
-  name: string;
-  durationMs: number;
-  endsAt: number;
-  reason?: string;
-}
-
 /** Action log entry for detailed UI feedback */
-export interface ActionLogEntry {
+interface ActionLogEntry {
   type: string;
   detail: string;
   timestamp: number;
-}
-
-export interface RespawnEvents {
-  /** State machine transition */
-  stateChanged: (state: RespawnState, prevState: RespawnState) => void;
-  /** New respawn cycle started */
-  respawnCycleStarted: (cycleNumber: number) => void;
-  /** Respawn cycle finished */
-  respawnCycleCompleted: (cycleNumber: number) => void;
-  /** Command sent to session */
-  stepSent: (step: string, input: string) => void;
-  /** Step completed (ready indicator detected) */
-  stepCompleted: (step: string) => void;
-  /** Detection status update for UI display */
-  detectionUpdate: (status: DetectionStatus) => void;
-  /** Auto-accept sent for plan mode approval */
-  autoAcceptSent: () => void;
-  /** AI idle check started */
-  aiCheckStarted: () => void;
-  /** AI idle check completed with verdict */
-  aiCheckCompleted: (result: AiCheckResult) => void;
-  /** AI idle check failed */
-  aiCheckFailed: (error: string) => void;
-  /** AI idle check cooldown state changed */
-  aiCheckCooldown: (active: boolean, endsAt: number | null) => void;
-  /** AI plan check started */
-  planCheckStarted: () => void;
-  /** AI plan check completed with verdict */
-  planCheckCompleted: (result: AiPlanCheckResult) => void;
-  /** AI plan check failed */
-  planCheckFailed: (error: string) => void;
-  /** Timer started for countdown display */
-  timerStarted: (timer: TimerInfo) => void;
-  /** Timer cancelled */
-  timerCancelled: (timerName: string, reason?: string) => void;
-  /** Timer completed */
-  timerCompleted: (timerName: string) => void;
-  /** Verbose action log for detailed UI feedback */
-  actionLog: (action: ActionLogEntry) => void;
-  /** Error occurred */
-  error: (error: Error) => void;
-  /** Debug log message */
-  log: (message: string) => void;
-  /** Stuck state warning emitted */
-  stuckStateWarning: (state: RespawnState, durationMs: number) => void;
-  /** Stuck state recovery triggered */
-  stuckStateRecovery: (state: RespawnState, durationMs: number, attempt: number) => void;
-  /** Respawn blocked by external signal */
-  respawnBlocked: (data: { reason: string; details: string }) => void;
 }
 
 /**
@@ -570,7 +513,7 @@ const DEFAULT_CONFIG: RespawnConfig = {
   sendInit: true, // send /init after /clear
   completionConfirmMs: 10000, // 10 seconds of silence after completion message
   noOutputTimeoutMs: 30000, // 30 seconds fallback if no output at all
-  autoAcceptPrompts: true, // auto-accept plan mode prompts (not questions)
+  autoAcceptPrompts: true, // auto-accept numbered selection menus (plan approvals + question dialogs)
   autoAcceptDelayMs: 8000, // 8 seconds before auto-accepting
   aiIdleCheckEnabled: true, // use AI to confirm idle state
   aiIdleCheckModel: AI_CHECK_MODEL,
@@ -679,9 +622,6 @@ export class RespawnController extends EventEmitter {
 
   /** Whether any terminal output has been received since start/last-auto-accept */
   private hasReceivedOutput: boolean = false;
-
-  /** Whether an elicitation dialog (AskUserQuestion) was detected via hook signal */
-  private elicitationDetected: boolean = false;
 
   // ========== Hook-Based Detection State (Layer 0 - Highest Priority) ==========
 
@@ -1426,7 +1366,12 @@ export class RespawnController extends EventEmitter {
     this.clearWorkingPatternWindow();
     this.workingDetected = false;
     this.completionMessageTime = now;
-    this.cancelAutoAcceptTimer(); // Normal idle flow handles this
+    // Don't cancel the auto-accept timer here — modern Claude Code emits "Worked for X"
+    // immediately before a plan-approval menu, and the auto-accept pre-filter is
+    // responsible for distinguishing menu-present from menu-absent. Cancelling here
+    // would silently block auto-accept for every plan approval and AskUserQuestion
+    // dialog. If no menu is in the buffer, the pre-filter rejects and the
+    // completion-confirm timer (started below) drives the normal idle flow.
     this.log(`Completion message detected: "${data.trim().substring(0, 50)}..."`);
 
     // In watching state, start completion confirmation timer
@@ -1474,7 +1419,6 @@ export class RespawnController extends EventEmitter {
 
     this.workingDetected = true;
     this.promptDetected = false;
-    this.elicitationDetected = false; // Clear on new work cycle
     this.resetHookState(); // Clear hook signals on new work
     this.lastWorkingPatternTime = now;
 
@@ -1680,6 +1624,11 @@ export class RespawnController extends EventEmitter {
         const prompt = this.config.kickstartPrompt!;
         this.logAction('command', `Sending kickstart: "${prompt.substring(0, 40)}..."`);
         await this.session.writeViaMux(prompt + '\r'); // \r triggers key.return in Ink/Claude CLI
+        // COD-51: stop() may have run during the await; re-check before reviving the
+        // state machine. Reads the public getter, not `_state`: TypeScript narrows
+        // `_state` across the await from the guard above and cannot see that stop()
+        // mutated it, so the comparison would be flagged as impossible.
+        if (this.state === 'stopped') return;
         this.emit('stepSent', 'kickstart', prompt);
         this.setState('waiting_kickstart');
         this.promptDetected = false;
@@ -2279,11 +2228,11 @@ export class RespawnController extends EventEmitter {
    * @returns True if auto-accept should proceed to the AI confirmation stage
    */
   private canAutoAccept(): boolean {
-    // Only auto-accept in watching state (not during a respawn cycle)
-    if (this._state !== 'watching') return false;
-
-    // Don't auto-accept if a completion message was detected (normal idle handles it)
-    if (this.completionMessageTime !== null) return false;
+    // Allow auto-accept from 'watching' AND 'confirming_idle'. The latter is reached
+    // when "Worked for X" was detected — which Claude Code now emits in the same PTY
+    // burst as a plan-approval menu. `sendAutoAcceptEnter()` self-transitions back to
+    // 'watching' before sending Enter. Reject any other state (respawn cycle, etc.).
+    if (this._state !== 'watching' && this._state !== 'confirming_idle') return false;
 
     // Don't auto-accept if disabled
     if (!this.config.autoAcceptPrompts) return false;
@@ -2291,15 +2240,15 @@ export class RespawnController extends EventEmitter {
     // Don't auto-accept if we haven't received any output yet (prevents spurious Enter on fresh start)
     if (!this.hasReceivedOutput) return false;
 
-    // Don't auto-accept if an elicitation dialog (AskUserQuestion) was detected
-    if (this.elicitationDetected) {
-      this.log('Skipping auto-accept: elicitation dialog detected (AskUserQuestion)');
-      return false;
-    }
+    // Note: completionMessageTime and elicitationDetected used to block here, but both
+    // legitimately co-occur with selection menus (Claude Code emits "Worked for X"
+    // before plan approvals, and AskUserQuestion fires the elicitation hook). The
+    // pre-filter below is the authoritative gate for "is there a numbered menu?".
 
-    // Stage 1: Pre-filter — check if buffer looks like plan mode
+    // Stage 1: Pre-filter — check if buffer looks like a numbered selection menu
+    // (covers both plan-mode approvals and AskUserQuestion dialogs)
     if (!this.isPlanModePreFilterMatch(this.terminalBuffer.value)) {
-      this.log('Skipping auto-accept: pre-filter did not match plan mode patterns');
+      this.log('Skipping auto-accept: pre-filter did not match selection-menu patterns');
       return false;
     }
 
@@ -2365,8 +2314,10 @@ export class RespawnController extends EventEmitter {
         }
 
         if (result.verdict === 'PLAN_MODE') {
-          // Don't send Enter if state changed (e.g., AI idle check started or respawn cycle began)
-          if (this._state !== 'watching') {
+          // Don't send Enter if state moved into a respawn cycle while the check ran.
+          // 'watching' and 'confirming_idle' are both valid — sendAutoAcceptEnter()
+          // self-transitions to 'watching' before sending.
+          if (this._state !== 'watching' && this._state !== 'confirming_idle') {
             this.logAction('plan-check', `Verdict: PLAN_MODE but state is ${this._state}, not sending Enter`);
             return;
           }
@@ -2425,13 +2376,18 @@ export class RespawnController extends EventEmitter {
 
   /**
    * Signal that an elicitation dialog (AskUserQuestion) was detected via hook.
-   * This prevents auto-accept from firing, since the user needs to make a selection.
-   * The flag is cleared when working patterns are detected (new turn starts).
+   * Used as a positive hint that a numbered selection menu is about to render —
+   * we restart the auto-accept timer so the pre-filter gets a fresh shot at it
+   * once the menu finishes drawing. The actual gate is `isPlanModePreFilterMatch()`
+   * plus (optionally) the AI plan check; this hook just primes the timer.
+   * No-op if respawn isn't `'watching'`/`'confirming_idle'` or `autoAcceptPrompts`
+   * is off, so this can never fire Enter when the user has disabled auto-accept.
    */
   signalElicitation(): void {
-    this.elicitationDetected = true;
-    this.cancelAutoAcceptTimer();
-    this.log('Elicitation dialog signaled - auto-accept blocked until next work cycle');
+    this.log('Elicitation dialog signaled - auto-accept will trigger if pre-filter matches');
+    if (this.config.autoAcceptPrompts && (this._state === 'watching' || this._state === 'confirming_idle')) {
+      this.startAutoAcceptTimer();
+    }
   }
 
   /**
@@ -2828,6 +2784,19 @@ export class RespawnController extends EventEmitter {
       return;
     }
 
+    // Usage-limit pause: Claude can't work and the cycle's /clear would wipe
+    // the paused conversation — the auto-resume scheduler owns recovery here.
+    if (this.session.isLimitPaused) {
+      this.log('Skipping respawn cycle - usage-limit pause active (auto-resume armed)');
+      this.logAction('health', 'Respawn skipped: usage-limit pause (auto-resume armed)');
+      this.emit('respawnBlocked', {
+        reason: 'usage_limit',
+        details: 'Usage limit reached — waiting for scheduled auto-resume',
+      });
+      this.setState('watching');
+      return;
+    }
+
     // Start the respawn cycle
     this.cycleCount++;
     this.log(`Starting respawn cycle #${this.cycleCount}`);
@@ -2869,6 +2838,11 @@ export class RespawnController extends EventEmitter {
         const input = updatePrompt + '\r'; // \r triggers Enter in Ink/Claude CLI
         this.logAction('command', `Sending: "${updatePrompt.substring(0, 50)}..."`);
         await this.session.writeViaMux(input);
+        // COD-51: stop() may have run during the await; re-check before reviving the
+        // state machine. Reads the public getter, not `_state`: TypeScript narrows
+        // `_state` across the await from the guard above and cannot see that stop()
+        // mutated it, so the comparison would be flagged as impossible.
+        if (this.state === 'stopped') return;
         this.emit('stepSent', 'update', updatePrompt);
         this.setState('waiting_update');
         this.promptDetected = false;
@@ -2896,6 +2870,11 @@ export class RespawnController extends EventEmitter {
         if (this._state === 'stopped') return;
         this.logAction('command', 'Sending: /clear');
         await this.session.writeViaMux('/clear\r'); // \r triggers Enter in Ink/Claude CLI
+        // COD-51: stop() may have run during the await; re-check before reviving the
+        // state machine. Reads the public getter, not `_state`: TypeScript narrows
+        // `_state` across the await from the guard above and cannot see that stop()
+        // mutated it, so the comparison would be flagged as impossible.
+        if (this.state === 'stopped') return;
         this.emit('stepSent', 'clear', '/clear');
         this.setState('waiting_clear');
         this.promptDetected = false;
@@ -2938,6 +2917,11 @@ export class RespawnController extends EventEmitter {
         if (this._state === 'stopped') return;
         this.logAction('command', 'Sending: /init');
         await this.session.writeViaMux('/init\r'); // \r triggers Enter in Ink/Claude CLI
+        // COD-51: stop() may have run during the await; re-check before reviving the
+        // state machine. Reads the public getter, not `_state`: TypeScript narrows
+        // `_state` across the await from the guard above and cannot see that stop()
+        // mutated it, so the comparison would be flagged as impossible.
+        if (this.state === 'stopped') return;
         this.emit('stepSent', 'init', '/init');
         this.setState('waiting_init');
         this.promptDetected = false;

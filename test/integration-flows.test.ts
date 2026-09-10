@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { WebServer } from '../src/web/server.js';
-import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { safeRmHomeTree } from './mocks/index.js';
 
 const TEST_PORT = 3115;
 const CASES_DIR = join(homedir(), 'codeman-cases');
@@ -24,13 +24,11 @@ describe('Integration Flows', () => {
   });
 
   afterEach(() => {
-    // Clean up cases created during this test
+    // Clean up cases created during this test (containment-gated: never
+    // delete a case dir outside the temp HOME, e.g. prod ~/codeman-cases on
+    // platforms where os.homedir() ignores $HOME).
     while (createdCases.length > 0) {
-      const caseName = createdCases.pop()!;
-      const casePath = join(CASES_DIR, caseName);
-      if (existsSync(casePath)) {
-        rmSync(casePath, { recursive: true, force: true });
-      }
+      safeRmHomeTree(join(CASES_DIR, createdCases.pop()!));
     }
   });
 
@@ -58,24 +56,24 @@ describe('Integration Flows', () => {
       const quickStartData = await quickStartRes.json();
 
       expect(quickStartData.success).toBe(true);
-      expect(quickStartData.sessionId).toBeDefined();
-      expect(quickStartData.caseName).toBe(caseName);
-      createdSessions.push(quickStartData.sessionId);
+      expect(quickStartData.data.sessionId).toBeDefined();
+      expect(quickStartData.data.caseName).toBe(caseName);
+      createdSessions.push(quickStartData.data.sessionId);
 
       // Step 2: Verify session is in interactive mode
-      const sessionRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.sessionId}`);
+      const sessionRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.data.sessionId}`);
       const sessionData = await sessionRes.json();
 
-      expect(sessionData.id).toBe(quickStartData.sessionId);
-      expect(sessionData.workingDir).toContain(caseName);
-      expect(['busy', 'idle', 'running']).toContain(sessionData.status); // May transition quickly in test mode
+      expect(sessionData.data.id).toBe(quickStartData.data.sessionId);
+      expect(sessionData.data.workingDir).toContain(caseName);
+      expect(['busy', 'idle', 'running']).toContain(sessionData.data.status); // May transition quickly in test mode
 
       // Step 3: Verify case was created with CLAUDE.md
       const caseRes = await fetch(`${baseUrl}/api/cases/${caseName}`);
       const caseData = await caseRes.json();
 
-      expect(caseData.name).toBe(caseName);
-      expect(caseData.hasClaudeMd).toBe(true);
+      expect(caseData.data.name).toBe(caseName);
+      expect(caseData.data.hasClaudeMd).toBe(true);
     });
 
     it('should reuse existing case when quick starting with existing case name', async () => {
@@ -90,10 +88,10 @@ describe('Integration Flows', () => {
       });
       const firstData = await firstRes.json();
       expect(firstData.success).toBe(true);
-      createdSessions.push(firstData.sessionId);
+      createdSessions.push(firstData.data.sessionId);
 
       // Delete the session but keep the case
-      await fetch(`${baseUrl}/api/sessions/${firstData.sessionId}`, { method: 'DELETE' });
+      await fetch(`${baseUrl}/api/sessions/${firstData.data.sessionId}`, { method: 'DELETE' });
 
       // Second quick start - should reuse the case
       const secondRes = await fetch(`${baseUrl}/api/quick-start`, {
@@ -104,9 +102,9 @@ describe('Integration Flows', () => {
       const secondData = await secondRes.json();
 
       expect(secondData.success).toBe(true);
-      expect(secondData.caseName).toBe(caseName);
-      expect(secondData.casePath).toBe(firstData.casePath);
-      createdSessions.push(secondData.sessionId);
+      expect(secondData.data.caseName).toBe(caseName);
+      expect(secondData.data.casePath).toBe(firstData.data.casePath);
+      createdSessions.push(secondData.data.sessionId);
     });
   });
 
@@ -132,20 +130,20 @@ describe('Integration Flows', () => {
       });
       const sessionData = await sessionRes.json();
       expect(sessionData.success).toBe(true);
-      createdSessions.push(sessionData.session.id);
+      createdSessions.push(sessionData.data.session.id);
 
       // Step 3: Start interactive mode
-      const interactiveRes = await fetch(`${baseUrl}/api/sessions/${sessionData.session.id}/interactive`, {
+      const interactiveRes = await fetch(`${baseUrl}/api/sessions/${sessionData.data.session.id}/interactive`, {
         method: 'POST',
       });
       const interactiveData = await interactiveRes.json();
       expect(interactiveData.success).toBe(true);
 
       // Verify session state
-      const verifyRes = await fetch(`${baseUrl}/api/sessions/${sessionData.session.id}`);
+      const verifyRes = await fetch(`${baseUrl}/api/sessions/${sessionData.data.session.id}`);
       const verifyData = await verifyRes.json();
-      expect(['busy', 'idle', 'running']).toContain(verifyData.status);
-      expect(verifyData.workingDir).toContain(caseName);
+      expect(['busy', 'idle', 'running']).toContain(verifyData.data.status);
+      expect(verifyData.data.workingDir).toContain(caseName);
     });
   });
 
@@ -162,13 +160,13 @@ describe('Integration Flows', () => {
       });
       const quickStartData = await quickStartRes.json();
       expect(quickStartData.success).toBe(true);
-      createdSessions.push(quickStartData.sessionId);
+      createdSessions.push(quickStartData.data.sessionId);
 
       // Wait for Claude to start up
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise((resolve) => setTimeout(resolve, 2000));
 
       // Send input
-      const inputRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.sessionId}/input`, {
+      const inputRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.data.sessionId}/input`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ input: '/help\n' }),
@@ -177,12 +175,12 @@ describe('Integration Flows', () => {
       expect(inputData.success).toBe(true);
 
       // Wait for response
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 1000));
 
       // Check terminal buffer has content
-      const terminalRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.sessionId}/terminal`);
+      const terminalRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.data.sessionId}/terminal`);
       const terminalData = await terminalRes.json();
-      expect(terminalData.terminalBuffer.length).toBeGreaterThan(0);
+      expect(terminalData.data.terminalBuffer.length).toBeGreaterThan(0);
     });
 
     it('should handle terminal resize', async () => {
@@ -197,15 +195,21 @@ describe('Integration Flows', () => {
       });
       const quickStartData = await quickStartRes.json();
       expect(quickStartData.success).toBe(true);
-      createdSessions.push(quickStartData.sessionId);
+      createdSessions.push(quickStartData.data.sessionId);
 
-      // Resize terminal
-      const resizeRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.sessionId}/resize`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cols: 200, rows: 50 }),
-      });
-      const resizeData = await resizeRes.json();
+      // Resize terminal (retry briefly — a just-quick-started session can be
+      // momentarily busy, which would return SESSION_BUSY; this is a transient race).
+      let resizeData;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const resizeRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.data.sessionId}/resize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cols: 200, rows: 50 }),
+        });
+        resizeData = await resizeRes.json();
+        if (resizeData.success) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
       expect(resizeData.success).toBe(true);
     });
   });
@@ -225,16 +229,16 @@ describe('Integration Flows', () => {
       expect(quickStartData.success).toBe(true);
 
       // Delete the session
-      const deleteRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.sessionId}`, {
+      const deleteRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.data.sessionId}`, {
         method: 'DELETE',
       });
       const deleteData = await deleteRes.json();
       expect(deleteData.success).toBe(true);
 
       // Verify session is gone
-      const verifyRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.sessionId}`);
+      const verifyRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.data.sessionId}`);
       const verifyData = await verifyRes.json();
-      expect(verifyData.error).toBe('Session not found');
+      expect(verifyData.error).toContain('not found');
     });
   });
 
@@ -251,20 +255,20 @@ describe('Integration Flows', () => {
       });
       const quickStartData = await quickStartRes.json();
       expect(quickStartData.success).toBe(true);
-      createdSessions.push(quickStartData.sessionId);
+      createdSessions.push(quickStartData.data.sessionId);
 
       // Get full status
       const statusRes = await fetch(`${baseUrl}/api/status`);
       const statusData = await statusRes.json();
 
-      expect(statusData.sessions).toBeDefined();
-      expect(Array.isArray(statusData.sessions)).toBe(true);
-      expect(statusData.scheduledRuns).toBeDefined();
-      expect(statusData.respawnStatus).toBeDefined();
-      expect(statusData.timestamp).toBeDefined();
+      expect(statusData.data.sessions).toBeDefined();
+      expect(Array.isArray(statusData.data.sessions)).toBe(true);
+      expect(statusData.data.scheduledRuns).toBeDefined();
+      expect(statusData.data.respawnStatus).toBeDefined();
+      expect(statusData.data.timestamp).toBeDefined();
 
       // Verify our session is in the list
-      const ourSession = statusData.sessions.find((s: any) => s.id === quickStartData.sessionId);
+      const ourSession = statusData.data.sessions.find((s: any) => s.id === quickStartData.data.sessionId);
       expect(ourSession).toBeDefined();
       expect(ourSession.workingDir).toContain(caseName);
     });
@@ -290,10 +294,7 @@ describe('SSE Event Flow', () => {
       } catch {}
     }
     for (const caseName of createdCases) {
-      const casePath = join(CASES_DIR, caseName);
-      if (existsSync(casePath)) {
-        rmSync(casePath, { recursive: true, force: true });
-      }
+      safeRmHomeTree(join(CASES_DIR, caseName));
     }
     await server.stop();
   }, 60000);
@@ -309,7 +310,7 @@ describe('SSE Event Flow', () => {
 
     const fetchPromise = fetch(`${baseUrl}/api/events`, {
       signal: controller.signal,
-    }).then(async response => {
+    }).then(async (response) => {
       const reader = response.body?.getReader();
       if (reader) {
         try {
@@ -331,7 +332,7 @@ describe('SSE Event Flow', () => {
     });
 
     // Wait for connection
-    await new Promise(resolve => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 100));
 
     // Perform quick start
     const quickStartRes = await fetch(`${baseUrl}/api/quick-start`, {
@@ -341,14 +342,16 @@ describe('SSE Event Flow', () => {
     });
     const quickStartData = await quickStartRes.json();
     expect(quickStartData.success).toBe(true);
-    createdSessions.push(quickStartData.sessionId);
+    createdSessions.push(quickStartData.data.sessionId);
 
     // Wait for events
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, 500));
 
     // Stop SSE
     controller.abort();
-    try { await fetchPromise; } catch {}
+    try {
+      await fetchPromise;
+    } catch {}
 
     // Verify expected events were received
     expect(receivedEvents).toContain('init');

@@ -93,6 +93,259 @@ describe('Tab Navigation', () => {
         expect(maxWidthPx).toBeGreaterThan(0);
       }
     });
+
+    it('active tab menu target is touch-sized and opens session options', async () => {
+      const hasActiveTab = await page.locator('.session-tab.active').count();
+      if (!hasActiveTab) {
+        await page.evaluate(() => {
+          const container = document.querySelector('.session-tabs');
+          if (!container) return;
+          container.innerHTML = `
+            <div class="session-tab active" data-id="mobile-menu-test">
+              <span class="tab-number">1</span>
+              <span class="tab-status idle"></span>
+              <span class="tab-info">
+                <span class="tab-name-row"><span class="tab-name">Session</span></span>
+              </span>
+              <span class="tab-gear" onclick="event.stopPropagation(); app.openSessionOptions('mobile-menu-test')" title="Session options" aria-label="Session options" tabindex="0">&#9881;</span>
+              <span class="tab-close">&times;</span>
+            </div>`;
+          (window as any).app.sessions.set('mobile-menu-test', {
+            id: 'mobile-menu-test',
+            name: 'Session',
+            status: 'idle',
+            mode: 'shell',
+            workingDir: '/tmp',
+          });
+        });
+      }
+
+      const gear = page.locator('.session-tab.active .tab-gear').first();
+      expect(await gear.isVisible()).toBe(true);
+      const box = await gear.boundingBox();
+
+      expect(box?.width ?? 0).toBeGreaterThanOrEqual(32);
+      expect(box?.height ?? 0).toBeGreaterThanOrEqual(32);
+
+      await gear.click();
+      const modalClass = await page.locator('#sessionOptionsModal').getAttribute('class');
+      expect(modalClass).toMatch(/active/);
+    });
+
+    it('header has no utility toggle and the tray is reachable inline on mobile', async () => {
+      // The three-dot header utility toggle was removed (owner decision,
+      // 2026-06-10) and the collapsible position:fixed headerRight tray it
+      // controlled was dropped (PR #122): with the toggle gone, leaving the
+      // tray collapsed made every header-right utility — including the opt-in
+      // response-viewer eye button — permanently unreachable on phones. The
+      // utilities now flow INLINE and must stay reachable on small viewports;
+      // nothing interactive may occupy the top-left corner.
+      await page.evaluate(() => {
+        document.querySelectorAll('.modal.active').forEach((modal) => modal.classList.remove('active'));
+      });
+
+      const toggleCount = await page.locator('#mobileHeaderUtilityToggle').count();
+      expect(toggleCount).toBe(0);
+
+      const trayVisible = await page.evaluate(() => {
+        const tray = document.getElementById('headerRight');
+        return tray ? getComputedStyle(tray).display !== 'none' : false;
+      });
+      expect(trayVisible).toBe(true);
+    });
+
+    it('tabs remain visible on large phone and tablet headers', async () => {
+      for (const device of [REPRESENTATIVE_DEVICES['large-phone'], REPRESENTATIVE_DEVICES['small-tablet']]) {
+        const { context: deviceContext, page: devicePage } = await createDevicePage(device, BASE_URL, 'chromium');
+        try {
+          await devicePage.waitForTimeout(WAIT.PAGE_SETTLE);
+          await devicePage.evaluate(() => {
+            const container = document.querySelector('.session-tabs');
+            if (!container) return;
+            container.innerHTML = '';
+            for (let i = 1; i <= 3; i++) {
+              const tab = document.createElement('div');
+              tab.className = i === 1 ? 'session-tab active' : 'session-tab';
+              tab.innerHTML = `<span class="tab-status idle"></span><span class="tab-name">Session ${i}</span>`;
+              container.appendChild(tab);
+            }
+          });
+
+          const tabsWidth = await devicePage.evaluate(() => {
+            return document.querySelector('.session-tabs')?.clientWidth ?? 0;
+          });
+
+          expect(tabsWidth).toBeGreaterThanOrEqual(120);
+        } finally {
+          await deviceContext.close();
+        }
+      }
+    });
+  });
+
+  // ─── Tab Strip Scrolling (issue #257) ────────────────────────────────────
+
+  describe('Tab Strip Scrolling', () => {
+    /**
+     * Seed `count` real sessions and render the strip through the production
+     * code path (_fullRenderSessionTabs), so the tabs carry the real markup,
+     * widths and CSS rather than hand-built stand-ins.
+     */
+    async function seedTabs(page: Page, count: number, activeIndex = 0): Promise<void> {
+      await page.evaluate(`(function (n, activeIndex) {
+        app.sessions.clear();
+        app.sessionOrder = [];
+        for (let i = 1; i <= n; i++) {
+          const id = 'scroll-sess-' + i;
+          app.sessions.set(id, { id, name: 'w' + i + '-project', status: 'idle', mode: 'claude', workingDir: '/tmp/p' + i });
+          app.sessionOrder.push(id);
+        }
+        app.activeSessionId = app.sessionOrder[activeIndex];
+        app._lastRenderedActiveTabId = null;
+        app._fullRenderSessionTabs();
+      })(${count}, ${activeIndex})`);
+      await page.waitForTimeout(200);
+    }
+
+    async function stripState(page: Page, sessionId: string) {
+      return page.evaluate(`(function (id) {
+        const c = document.getElementById('sessionTabs');
+        const tab = c.querySelector('.session-tab[data-id="' + id + '"]');
+        const cRect = c.getBoundingClientRect();
+        const tRect = tab ? tab.getBoundingClientRect() : null;
+        return {
+          scrollLeft: Math.round(c.scrollLeft),
+          maxScroll: Math.round(c.scrollWidth - c.clientWidth),
+          order: [...c.querySelectorAll('.session-tab[data-id]')].map((t) => t.dataset.id),
+          visible: tRect ? tRect.left >= cRect.left - 1 && tRect.right <= cRect.right + 1 : false,
+        };
+      })('${sessionId}')`) as Promise<{ scrollLeft: number; maxScroll: number; order: string[]; visible: boolean }>;
+    }
+
+    it('reveals a rightmost tab that selection would otherwise leave off-screen', async () => {
+      const { context, page } = await createDevicePage(standardPhone, BASE_URL, 'chromium');
+      try {
+        await page.waitForTimeout(WAIT.PAGE_SETTLE);
+        await seedTabs(page, 5);
+
+        const before = await stripState(page, 'scroll-sess-5');
+        // Precondition: the strip really does overflow and the last tab is hidden.
+        expect(before.maxScroll).toBeGreaterThan(0);
+        expect(before.visible).toBe(false);
+
+        // The selection path selectSession() uses (class toggle, no rebuild).
+        await page.evaluate(`(function () {
+          app.activeSessionId = 'scroll-sess-5';
+          app._updateActiveTabImmediate('scroll-sess-5');
+        })()`);
+        await page.waitForTimeout(600); // smooth scroll
+
+        const after = await stripState(page, 'scroll-sess-5');
+        expect(after.visible).toBe(true);
+        expect(after.scrollLeft).toBeGreaterThan(before.scrollLeft);
+      } finally {
+        await context.close();
+      }
+    });
+
+    it('scrolls back to reveal a leftmost tab', async () => {
+      const { context, page } = await createDevicePage(standardPhone, BASE_URL, 'chromium');
+      try {
+        await page.waitForTimeout(WAIT.PAGE_SETTLE);
+        await seedTabs(page, 5);
+        await page.evaluate(`document.getElementById('sessionTabs').scrollLeft = 9999`);
+
+        await page.evaluate(`(function () {
+          app.activeSessionId = 'scroll-sess-1';
+          app._updateActiveTabImmediate('scroll-sess-1');
+        })()`);
+        await page.waitForTimeout(600);
+
+        const after = await stripState(page, 'scroll-sess-1');
+        expect(after.visible).toBe(true);
+        expect(after.scrollLeft).toBe(0);
+      } finally {
+        await context.close();
+      }
+    });
+
+    it('keeps the scroll position across an ambient full re-render', async () => {
+      const { context, page } = await createDevicePage(standardPhone, BASE_URL, 'chromium');
+      try {
+        await page.waitForTimeout(WAIT.PAGE_SETTLE);
+        await seedTabs(page, 5);
+
+        // User swipes to the end of the strip, then a background rebuild fires
+        // (a task badge appearing forces the full-render path).
+        await page.evaluate(`document.getElementById('sessionTabs').scrollLeft = 9999`);
+        const scrolled = await stripState(page, 'scroll-sess-5');
+        expect(scrolled.scrollLeft).toBeGreaterThan(0);
+
+        await page.evaluate(`(function () {
+          app.sessions.get('scroll-sess-2').taskStats = { running: 2, total: 3 };
+          app._fullRenderSessionTabs();
+        })()`);
+        await page.waitForTimeout(200);
+
+        const after = await stripState(page, 'scroll-sess-5');
+        expect(after.scrollLeft).toBe(scrolled.scrollLeft);
+      } finally {
+        await context.close();
+      }
+    });
+
+    it('renders tabs in sessionOrder on phones instead of hoisting the active one', async () => {
+      const { context, page } = await createDevicePage(standardPhone, BASE_URL, 'chromium');
+      try {
+        await page.waitForTimeout(WAIT.PAGE_SETTLE);
+        await seedTabs(page, 5, 3); // 4th tab active
+
+        const state = await stripState(page, 'scroll-sess-4');
+        expect(state.order).toEqual([
+          'scroll-sess-1',
+          'scroll-sess-2',
+          'scroll-sess-3',
+          'scroll-sess-4',
+          'scroll-sess-5',
+        ]);
+        // ...and the active tab is still brought into view by the render.
+        expect(state.visible).toBe(true);
+      } finally {
+        await context.close();
+      }
+    });
+
+    it('reaches the last tab with a horizontal touch drag', async () => {
+      const { context, page } = await createDevicePage(standardPhone, BASE_URL, 'chromium');
+      try {
+        await page.waitForTimeout(WAIT.PAGE_SETTLE);
+        await seedTabs(page, 5);
+
+        const cdp = await context.newCDPSession(page);
+        const box = await page.locator(SELECTORS.TABS_CONTAINER).boundingBox();
+        if (!box) throw new Error('tab strip not found');
+        const y = box.y + box.height / 2;
+        const startX = box.x + box.width * 0.85;
+        const endX = box.x + box.width * 0.1;
+
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: startX, y }] });
+        for (let i = 1; i <= 10; i++) {
+          await cdp.send('Input.dispatchTouchEvent', {
+            type: 'touchMove',
+            touchPoints: [{ x: startX + ((endX - startX) * i) / 10, y }],
+          });
+          await page.waitForTimeout(16);
+        }
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+        await page.waitForTimeout(400);
+
+        const after = await stripState(page, 'scroll-sess-5');
+        expect(after.scrollLeft).toBeGreaterThan(0);
+        expect(after.visible).toBe(true);
+      } finally {
+        await context.close();
+      }
+    });
   });
 
   // ─── Swipe Navigation (CDP - Chromium) ───────────────────────────────────
@@ -134,7 +387,9 @@ describe('Tab Navigation', () => {
     }
 
     async function clearSwipeLog(): Promise<void> {
-      await page.evaluate(() => { (window as any).__swipeLog = []; });
+      await page.evaluate(() => {
+        (window as any).__swipeLog = [];
+      });
     }
 
     it('swipe left calls nextSession', async () => {
@@ -193,10 +448,12 @@ describe('Tab Navigation', () => {
       const steps = 5;
       for (let i = 1; i <= steps; i++) {
         const progress = i / steps;
-        await dispatchTouchEvent(cdp, 'touchMove', [{
-          x: startX + (endX - startX) * progress,
-          y: startY + (endY - startY) * progress,
-        }]);
+        await dispatchTouchEvent(cdp, 'touchMove', [
+          {
+            x: startX + (endX - startX) * progress,
+            y: startY + (endY - startY) * progress,
+          },
+        ]);
         await page.waitForTimeout(20);
       }
       await dispatchTouchEvent(cdp, 'touchEnd', []);
@@ -451,6 +708,51 @@ describe('Tab Navigation', () => {
     });
   });
 
+  describe('Tab Touch Focus', () => {
+    it('switching tabs with the keyboard closed does not leave the terminal textarea focused', async () => {
+      const { context, page } = await createDevicePage(standardPhone, BASE_URL, 'chromium');
+      try {
+        await page.waitForTimeout(WAIT.PAGE_SETTLE);
+
+        const result = await page.evaluate(() => {
+          if (typeof app === 'undefined') return { hasHandler: false };
+          const textarea = document.querySelector('.xterm-helper-textarea');
+          if (textarea) textarea.focus();
+          if (typeof KeyboardHandler !== 'undefined') KeyboardHandler.keyboardVisible = false;
+
+          let selected: string | null = null;
+          let selectedOptions: { preserveKeyboard?: boolean } | null = null;
+          const originalSelect = app.selectSession;
+          app.selectSession = function (id, options) {
+            selected = id;
+            selectedOptions = options || {};
+            return Promise.resolve();
+          };
+
+          const event = new Event('click', { bubbles: true, cancelable: true });
+          if (typeof app.handleSessionTabClick === 'function') {
+            app.handleSessionTabClick(event, 'mock-session-2');
+          }
+          const activeIsTextarea = document.activeElement === textarea;
+          app.selectSession = originalSelect;
+          return {
+            hasHandler: typeof app.handleSessionTabClick === 'function',
+            selected: selected,
+            preserveKeyboard: selectedOptions ? selectedOptions.preserveKeyboard : undefined,
+            activeIsTextarea: activeIsTextarea,
+          };
+        });
+
+        expect(result.hasHandler).toBe(true);
+        expect(result.selected).toBe('mock-session-2');
+        expect(result.preserveKeyboard).toBe(false);
+        expect(result.activeIsTextarea).toBe(false);
+      } finally {
+        await context.close();
+      }
+    });
+  });
+
   // ─── Tab Close Button Visibility ─────────────────────────────────────────
 
   describe('Tab Close Button Visibility', () => {
@@ -521,10 +823,11 @@ describe('Tab Navigation', () => {
             const isActive = tab?.classList.contains('active') ?? false;
             const style = getComputedStyle(gear);
             // Gear hidden via display:none (mobile) or opacity:0 + width:0 (desktop)
-            const isVisible = style.display !== 'none'
-              && style.visibility !== 'hidden'
-              && parseFloat(style.opacity) > 0
-              && parseFloat(style.width) > 0;
+            const isVisible =
+              style.display !== 'none' &&
+              style.visibility !== 'hidden' &&
+              parseFloat(style.opacity) > 0 &&
+              parseFloat(style.width) > 0;
             return { isActive, isVisible };
           });
         });

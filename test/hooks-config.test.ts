@@ -6,10 +6,23 @@
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from 'vitest';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { generateHooksConfig, writeHooksConfig } from '../src/hooks-config.js';
+import { spawn } from 'node:child_process';
+import {
+  applyStatusLineConfig,
+  ensureCodemanHooks,
+  generateBackgroundWakeScript,
+  generateHooksConfig,
+  generateSubagentStopGuardScript,
+  refreshStaleCodemanHooks,
+  settingsWriteBlocker,
+  stripCaseEnvKeys,
+  updateCaseEnvVars,
+  updateCaseModel,
+  writeHooksConfig,
+} from '../src/hooks-config.js';
 
 describe('generateHooksConfig', () => {
   it('should return an object with hooks key', () => {
@@ -20,7 +33,7 @@ describe('generateHooksConfig', () => {
   it('should have Notification hooks array', () => {
     const config = generateHooksConfig();
     expect(config.hooks.Notification).toBeInstanceOf(Array);
-    expect(config.hooks.Notification).toHaveLength(3);
+    expect(config.hooks.Notification).toHaveLength(5);
   });
 
   it('should have Stop hooks array', () => {
@@ -29,24 +42,90 @@ describe('generateHooksConfig', () => {
     expect(config.hooks.Stop).toHaveLength(1);
   });
 
+  it('reports the live conversation id on every prompt, with stdout discarded', () => {
+    const config = generateHooksConfig();
+    expect(config.hooks.UserPromptSubmit).toBeInstanceOf(Array);
+    expect(config.hooks.UserPromptSubmit).toHaveLength(1);
+    const command = (config.hooks.UserPromptSubmit as Array<{ hooks: Array<{ command: string }> }>)[0].hooks[0].command;
+    expect(command).toContain('"event":"prompt_submitted"');
+    expect(command).toContain('$CODEMAN_SESSION_ID');
+    // ⚠️ Claude Code injects a UserPromptSubmit hook's stdout into the model's
+    // context ("Exit code 0 - stdout shown to Claude"), so without this the API
+    // envelope is pasted into the user's own prompt on every turn. Every other
+    // event's stdout is harmless (it feeds SSE).
+    // ⚠️ Assert curl's OWN flag, not a trailing redirect: the command already
+    // ends `… 2>/dev/null || true`, and in `pipeline || true >/dev/null` the
+    // shell binds the redirect to `true`, which never runs on the success path.
+    // A `endsWith('>/dev/null')` assertion passes on exactly that broken form.
+    expect(command).toContain('curl -sk -o /dev/null -X POST');
+    expect(command.trimEnd().endsWith('>/dev/null')).toBe(false);
+  });
+
+  it("leaves every other hook event's command text byte-identical", () => {
+    // The opt-in discard exists so the five SSE-fed events do not change shape:
+    // rewriting their command churns every workspace's settings.local.json.
+    const config = generateHooksConfig();
+    const stop = (config.hooks.Stop as Array<{ hooks: Array<{ command: string }> }>)[0].hooks[0].command;
+    expect(stop).toContain('curl -sk -X POST');
+    expect(stop).not.toContain('-o /dev/null');
+  });
+
+  it('should guard subagent stops while their background work is active', () => {
+    const config = generateHooksConfig();
+    const subagentHooks = config.hooks.SubagentStop as Array<{
+      hooks: Array<{ type: string; command: string; args: string[]; timeout: number }>;
+    }>;
+
+    expect(subagentHooks).toHaveLength(1);
+    expect(subagentHooks[0].hooks[0]).toMatchObject({
+      type: 'command',
+      command: 'node',
+      args: ['-e', generateSubagentStopGuardScript()],
+    });
+  });
+
+  it('should configure a self-contained Bash background-task rewake hook', () => {
+    const config = generateHooksConfig();
+    const postToolHooks = config.hooks.PostToolUse as Array<{
+      matcher: string;
+      hooks: Array<{
+        type: string;
+        command: string;
+        args: string[];
+        asyncRewake: boolean;
+        timeout: number;
+      }>;
+    }>;
+
+    expect(postToolHooks).toHaveLength(1);
+    expect(postToolHooks[0].matcher).toBe('Bash');
+    expect(postToolHooks[0].hooks[0]).toMatchObject({
+      type: 'command',
+      command: 'node',
+      asyncRewake: true,
+    });
+    expect(postToolHooks[0].hooks[0].args).toEqual(['-e', generateBackgroundWakeScript()]);
+    expect(postToolHooks[0].hooks[0].timeout).toBeGreaterThanOrEqual(3600);
+  });
+
   it('should configure idle_prompt matcher', () => {
     const config = generateHooksConfig();
     const notifHooks = config.hooks.Notification as Array<{ matcher?: string }>;
-    const idleHook = notifHooks.find(h => h.matcher === 'idle_prompt');
+    const idleHook = notifHooks.find((h) => h.matcher === 'idle_prompt');
     expect(idleHook).toBeDefined();
   });
 
   it('should configure permission_prompt matcher', () => {
     const config = generateHooksConfig();
     const notifHooks = config.hooks.Notification as Array<{ matcher?: string }>;
-    const permHook = notifHooks.find(h => h.matcher === 'permission_prompt');
+    const permHook = notifHooks.find((h) => h.matcher === 'permission_prompt');
     expect(permHook).toBeDefined();
   });
 
   it('should configure elicitation_dialog matcher', () => {
     const config = generateHooksConfig();
     const notifHooks = config.hooks.Notification as Array<{ matcher?: string }>;
-    const elicitHook = notifHooks.find(h => h.matcher === 'elicitation_dialog');
+    const elicitHook = notifHooks.find((h) => h.matcher === 'elicitation_dialog');
     expect(elicitHook).toBeDefined();
   });
 
@@ -65,10 +144,21 @@ describe('generateHooksConfig', () => {
     expect(notifHooks[0].hooks[0].command).toContain('|| true');
   });
 
-  it('should set timeout to 10000ms', () => {
+  // On --https/tailscale installs CODEMAN_API_URL is HTTPS with a self-signed cert.
+  // A `-k`-less hook curl exits 60 there, the `|| true` swallows it, and every hook
+  // event (stop, permission_prompt, elicitation_dialog, idle_prompt, teammate_idle,
+  // task_completed) dies silently — killing respawn's idle signals and the wait
+  // endpoints' stop/blocked. The statusline exporter always carried -k; the hooks must too.
+  it('every hook curl tolerates a self-signed HTTPS API (curl -sk)', () => {
+    const serialized = JSON.stringify(generateHooksConfig());
+    expect(serialized).toContain('curl -sk -X POST');
+    expect(serialized).not.toContain('curl -s -X POST');
+  });
+
+  it('should set timeout to 10 seconds (hook timeout fields are seconds)', () => {
     const config = generateHooksConfig();
     const notifHooks = config.hooks.Notification as Array<{ hooks: Array<{ timeout: number }> }>;
-    expect(notifHooks[0].hooks[0].timeout).toBe(10000);
+    expect(notifHooks[0].hooks[0].timeout).toBe(10);
   });
 
   it('should include correct event names in curl payloads', () => {
@@ -137,8 +227,64 @@ describe('writeHooksConfig', () => {
     const settingsPath = join(testDir, '.claude', 'settings.local.json');
     const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
     expect(parsed.hooks).toBeDefined();
-    expect(parsed.hooks.Notification).toHaveLength(3);
+    expect(parsed.hooks.Notification).toHaveLength(5);
     expect(parsed.hooks.Stop).toHaveLength(1);
+  });
+
+  it('refuses to write through a symlinked .claude directory (#251 review)', async () => {
+    // Case contents can be foreign (a freshly cloned repository): a symlinked
+    // .claude would redirect the scaffold write outside the case.
+    const outside = join(testDir, 'outside-target');
+    mkdirSync(outside);
+    const caseDir = join(testDir, 'case');
+    mkdirSync(caseDir);
+    symlinkSync(outside, join(caseDir, '.claude'));
+    expect(await settingsWriteBlocker(caseDir)).toMatch(/symlink/);
+    await writeHooksConfig(caseDir);
+    expect(existsSync(join(outside, 'settings.local.json'))).toBe(false);
+  });
+
+  it('refuses to write through a symlinked settings.local.json (#251 review)', async () => {
+    const outsideFile = join(testDir, 'victim-settings.json');
+    writeFileSync(outsideFile, '{"model":"precious"}\n');
+    const caseDir = join(testDir, 'case2');
+    mkdirSync(join(caseDir, '.claude'), { recursive: true });
+    symlinkSync(outsideFile, join(caseDir, '.claude', 'settings.local.json'));
+    expect(await settingsWriteBlocker(caseDir)).toMatch(/symlink/);
+    await writeHooksConfig(caseDir);
+    // The link target is untouched: no hooks were merged into it.
+    expect(readFileSync(outsideFile, 'utf-8')).toBe('{"model":"precious"}\n');
+  });
+
+  it('reports a real, confined .claude as safe', async () => {
+    const caseDir = join(testDir, 'case3');
+    mkdirSync(join(caseDir, '.claude'), { recursive: true });
+    expect(await settingsWriteBlocker(caseDir)).toBeNull();
+  });
+
+  it('EVERY settings writer refuses a symlinked settings.local.json (#251 review round 2)', async () => {
+    // Round 1 guarded only writeHooksConfig/updateCaseModel; the reviewer
+    // demonstrated applyStatusLineConfig writing through the link. All
+    // writers now share one safe-write gate, so pin all of them at once.
+    const outsideFile = join(testDir, 'victim-all-writers.json');
+    const precious =
+      '{"env":{"CLAUDE_CODE_KEEP":"me"},"hooks":{"Stop":[{"hooks":[{"command":"curl /api/hook-event"}]}]}}\n';
+    writeFileSync(outsideFile, precious);
+    const caseDir = join(testDir, 'case-writers');
+    mkdirSync(join(caseDir, '.claude'), { recursive: true });
+    symlinkSync(outsideFile, join(caseDir, '.claude', 'settings.local.json'));
+
+    await writeHooksConfig(caseDir);
+    await ensureCodemanHooks(caseDir);
+    await refreshStaleCodemanHooks(caseDir);
+    await updateCaseModel(caseDir, 'opus');
+    await updateCaseEnvVars(caseDir, { CLAUDE_CODE_NEW: 'value' });
+    await stripCaseEnvKeys(caseDir, ['CLAUDE_CODE_KEEP']);
+    await applyStatusLineConfig(caseDir, true);
+    await applyStatusLineConfig(caseDir, false);
+
+    // The link target is byte-identical: none of the writers went through it.
+    expect(readFileSync(outsideFile, 'utf-8')).toBe(precious);
   });
 
   it('should merge with existing settings.local.json', async () => {
@@ -146,7 +292,7 @@ describe('writeHooksConfig', () => {
     mkdirSync(claudeDir, { recursive: true });
     writeFileSync(
       join(claudeDir, 'settings.local.json'),
-      JSON.stringify({ existingKey: 'existingValue', permissions: { allow: ['Read'] } }, null, 2),
+      JSON.stringify({ existingKey: 'existingValue', permissions: { allow: ['Read'] } }, null, 2)
     );
 
     await writeHooksConfig(testDir);
@@ -157,19 +303,166 @@ describe('writeHooksConfig', () => {
     expect(parsed.hooks).toBeDefined();
   });
 
-  it('should overwrite existing hooks key', async () => {
+  it('should upgrade Codeman-owned hooks that predate background rewake', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const oldHooks = generateHooksConfig().hooks;
+    delete oldHooks.PostToolUse;
+    writeFileSync(settingsPath, JSON.stringify({ hooks: oldHooks }, null, 2));
+
+    await refreshStaleCodemanHooks(testDir);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(parsed.hooks.PostToolUse).toHaveLength(1);
+    expect(JSON.stringify(parsed.hooks.PostToolUse)).toContain('CODEMAN_BACKGROUND_REWAKE_V3');
+    expect(JSON.stringify(parsed.hooks.SubagentStop)).toContain('CODEMAN_SUBAGENT_STOP_GUARD_V1');
+  });
+
+  it('should replace an older rewake script version without duplicating it', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    // Simulate a case healed by the previous release: current curls (secret present)
+    // plus a V1 rewake handler. The version bump must swap the handler in place.
+    const hooks = generateHooksConfig().hooks;
+    hooks.PostToolUse = [
+      {
+        matcher: 'Bash',
+        hooks: [
+          {
+            type: 'command',
+            command: 'node',
+            args: ['-e', 'const CODEMAN_BACKGROUND_REWAKE_V1 = true; process.exit(0);'],
+            asyncRewake: true,
+            timeout: 21600,
+          },
+        ],
+      },
+    ];
+    writeFileSync(settingsPath, JSON.stringify({ hooks }, null, 2));
+
+    await refreshStaleCodemanHooks(testDir);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const serialized = JSON.stringify(parsed.hooks.PostToolUse);
+    expect(parsed.hooks.PostToolUse).toHaveLength(1);
+    expect(parsed.hooks.PostToolUse[0].hooks).toHaveLength(1);
+    expect(serialized).toContain('CODEMAN_BACKGROUND_REWAKE_V3');
+    expect(serialized).not.toContain('CODEMAN_BACKGROUND_REWAKE_V1');
+  });
+
+  it('heals a hooks block written before UserPromptSubmit existed', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    // An otherwise-current block from the previous release: the pane would keep
+    // guessing its conversation from ~/.claude/history.jsonl forever.
+    const hooks = generateHooksConfig().hooks;
+    delete hooks.UserPromptSubmit;
+    writeFileSync(settingsPath, JSON.stringify({ hooks }, null, 2));
+
+    await refreshStaleCodemanHooks(testDir);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(JSON.stringify(parsed.hooks.UserPromptSubmit)).toContain('prompt_submitted');
+  });
+
+  it('leaves an already-current hooks block untouched', async () => {
+    // ⚠️ The staleness gate reads a JSON.stringify'd blob, so a marker written
+    // with surrounding quotes never matches and the gate is permanently false —
+    // which rewrites every workspace's settings.local.json on every Claude
+    // spawn instead of never. This asserts the no-op, which is the property a
+    // quoted needle silently breaks.
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify({ hooks: generateHooksConfig().hooks }, null, 2));
+    const before = readFileSync(settingsPath, 'utf-8');
+
+    await refreshStaleCodemanHooks(testDir);
+
+    expect(readFileSync(settingsPath, 'utf-8')).toBe(before);
+  });
+
+  it('replaces the V2 background hook without duplicating it', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const oldSettings = JSON.stringify({ hooks: generateHooksConfig().hooks }, null, 2).replaceAll(
+      'CODEMAN_BACKGROUND_REWAKE_V3',
+      'CODEMAN_BACKGROUND_REWAKE_V2'
+    );
+    writeFileSync(settingsPath, oldSettings);
+
+    await refreshStaleCodemanHooks(testDir);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const postToolUse = JSON.stringify(parsed.hooks.PostToolUse);
+    expect(parsed.hooks.PostToolUse).toHaveLength(1);
+    expect(postToolUse).toContain('CODEMAN_BACKGROUND_REWAKE_V3');
+    expect(postToolUse).not.toContain('CODEMAN_BACKGROUND_REWAKE_V2');
+  });
+
+  it('should not add rewake hooks to a user-owned hook configuration', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const userHooks = {
+      PostToolUse: [
+        {
+          matcher: 'Write',
+          hooks: [{ type: 'command', command: './format.sh' }],
+        },
+      ],
+    };
+    writeFileSync(settingsPath, JSON.stringify({ hooks: userHooks }, null, 2));
+
+    await refreshStaleCodemanHooks(testDir);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(parsed.hooks).toEqual(userHooks);
+  });
+
+  it('should preserve user hook events while installing Codeman hooks', async () => {
     const claudeDir = join(testDir, '.claude');
     mkdirSync(claudeDir, { recursive: true });
-    writeFileSync(
-      join(claudeDir, 'settings.local.json'),
-      JSON.stringify({ hooks: { oldHook: [] } }, null, 2),
-    );
+    writeFileSync(join(claudeDir, 'settings.local.json'), JSON.stringify({ hooks: { oldHook: [] } }, null, 2));
 
     await writeHooksConfig(testDir);
 
     const parsed = JSON.parse(readFileSync(join(claudeDir, 'settings.local.json'), 'utf-8'));
-    expect(parsed.hooks.oldHook).toBeUndefined();
+    expect(parsed.hooks.oldHook).toEqual([]);
     expect(parsed.hooks.Notification).toBeDefined();
+  });
+
+  it('should safely add Codeman hooks to an existing managed-case settings file', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const userHooks = {
+      PostToolUse: [{ matcher: 'Write', hooks: [{ type: 'command', command: './format.sh' }] }],
+    };
+    writeFileSync(settingsPath, JSON.stringify({ hooks: userHooks, permissions: { allow: ['Read'] } }, null, 2));
+
+    await ensureCodemanHooks(testDir);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(parsed.permissions).toEqual({ allow: ['Read'] });
+    expect(parsed.hooks.PostToolUse).toEqual(expect.arrayContaining(userHooks.PostToolUse));
+    expect(JSON.stringify(parsed.hooks)).toContain('CODEMAN_BACKGROUND_REWAKE_V3');
+    expect(JSON.stringify(parsed.hooks)).toContain('CODEMAN_SUBAGENT_STOP_GUARD_V1');
+  });
+
+  it('should not replace a malformed managed-case settings file', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    writeFileSync(settingsPath, '{ malformed');
+
+    await ensureCodemanHooks(testDir);
+
+    expect(readFileSync(settingsPath, 'utf-8')).toBe('{ malformed');
   });
 
   it('should handle malformed existing settings.local.json', async () => {
@@ -187,6 +480,286 @@ describe('writeHooksConfig', () => {
     await writeHooksConfig(testDir);
     const content = readFileSync(join(testDir, '.claude', 'settings.local.json'), 'utf-8');
     expect(content.endsWith('\n')).toBe(true);
+  });
+});
+
+describe('background task rewake helper', () => {
+  const testDir = join(tmpdir(), 'codeman-background-rewake-test-' + Date.now());
+
+  beforeEach(() => {
+    mkdirSync(testDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  function runHelper(input: Record<string, unknown>): Promise<{ code: number | null; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['-e', generateBackgroundWakeScript()], {
+        stdio: ['pipe', 'ignore', 'pipe'],
+      });
+      let stderr = '';
+      const timeout = setTimeout(() => {
+        child.kill();
+        reject(new Error('background rewake helper timed out'));
+      }, 5000);
+
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+      });
+      child.on('error', reject);
+      child.on('close', (code) => {
+        clearTimeout(timeout);
+        resolve({ code, stderr });
+      });
+      child.stdin.end(JSON.stringify(input));
+    });
+  }
+
+  it('exits without waiting for an ordinary Bash result', async () => {
+    const result = await runHelper({
+      transcript_path: join(testDir, 'transcript.jsonl'),
+      tool_response: { stdout: 'ordinary command completed' },
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe('');
+  });
+
+  it('exits 2 when the matching background command completes', async () => {
+    const transcriptPath = join(testDir, 'transcript.jsonl');
+    writeFileSync(transcriptPath, '');
+
+    const resultPromise = runHelper({
+      transcript_path: transcriptPath,
+      tool_response: {
+        stdout: 'Command running in background with ID: bg-test-1. Output is being written to: /tmp/bg-test-1.output.',
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content:
+          '<task-notification>\n<task-id>bg-test-1</task-id>\n<status>completed</status>\n' +
+          '<output-file>/tmp/bg-test-1.output</output-file>\n</task-notification>',
+      }) + '\n'
+    );
+
+    const result = await resultPromise;
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('bg-test-1');
+    expect(result.stderr).toContain('completed');
+    expect(result.stderr).toContain('/tmp/bg-test-1.output');
+  });
+
+  it('rewakes a subagent when Claude queues completion in the parent transcript', async () => {
+    const sessionId = '7148e9de-7673-48b8-bf38-6799e52c346a';
+    const sessionDir = join(testDir, sessionId);
+    const subagentDir = join(sessionDir, 'subagents');
+    const parentTranscriptPath = `${sessionDir}.jsonl`;
+    const subagentTranscriptPath = join(subagentDir, 'agent-afacts-class2.jsonl');
+    mkdirSync(subagentDir, { recursive: true });
+    writeFileSync(parentTranscriptPath, '');
+    writeFileSync(subagentTranscriptPath, '');
+
+    const resultPromise = runHelper({
+      session_id: sessionId,
+      agent_id: 'afacts-class2',
+      transcript_path: subagentTranscriptPath,
+      tool_response: {
+        backgroundTaskId: 'bg-subagent-1',
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    writeFileSync(
+      parentTranscriptPath,
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content:
+          '<task-notification>\n<task-id>bg-subagent-1</task-id>\n<status>completed</status>\n' +
+          '<output-file>/tmp/bg-subagent-1.output</output-file>\n</task-notification>',
+      }) + '\n'
+    );
+
+    const result = await resultPromise;
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('bg-subagent-1');
+    expect(result.stderr).toContain('/tmp/bg-subagent-1.output');
+  });
+
+  it('includes a marked background report in the wake feedback', async () => {
+    const transcriptPath = join(testDir, 'transcript.jsonl');
+    const tasksDir = join(testDir, 'tasks');
+    const outputPath = join(tasksDir, 'bg-report-1.output');
+    mkdirSync(tasksDir, { recursive: true });
+    writeFileSync(transcriptPath, '');
+    writeFileSync(
+      outputPath,
+      [
+        'launcher output',
+        '=== CODEMAN_RESULT_BEGIN ===',
+        'Summary line',
+        'Detail after the old 30-line preview boundary',
+        '=== CODEMAN_RESULT_END ===',
+      ].join('\n')
+    );
+
+    const resultPromise = runHelper({
+      transcript_path: transcriptPath,
+      tool_response: {
+        stdout: `Command running in background with ID: bg-report-1. Output is being written to: ${outputPath}.`,
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        content:
+          '<task-notification>\n<task-id>bg-report-1</task-id>\n<status>completed</status>\n' +
+          `<output-file>${outputPath}</output-file>\n</task-notification>`,
+      }) + '\n'
+    );
+
+    const result = await resultPromise;
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain('<codeman-background-result>');
+    expect(result.stderr).toContain('Summary line');
+    expect(result.stderr).toContain('Detail after the old 30-line preview boundary');
+  });
+});
+
+describe('subagent stop guard helper', () => {
+  const testDir = join(tmpdir(), 'codeman-subagent-stop-guard-test-' + Date.now());
+
+  beforeEach(() => {
+    mkdirSync(testDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  function runGuard(transcriptLines: unknown[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+    const transcriptPath = join(testDir, 'agent-test.jsonl');
+    writeFileSync(transcriptPath, transcriptLines.map((line) => JSON.stringify(line)).join('\n') + '\n');
+
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['-e', generateSubagentStopGuardScript()], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+      });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code, stdout, stderr }));
+      child.stdin.end(JSON.stringify({ agent_transcript_path: transcriptPath }));
+    });
+  }
+
+  async function withLiveTask<T>(taskId: string, action: () => Promise<T>): Promise<T> {
+    const tasksDir = join(testDir, 'tasks');
+    mkdirSync(tasksDir, { recursive: true });
+    const outputFd = openSync(join(tasksDir, `${taskId}.output`), 'a');
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], {
+      stdio: ['ignore', outputFd, outputFd],
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', resolve);
+      child.once('error', reject);
+    });
+    closeSync(outputFd);
+
+    try {
+      return await action();
+    } finally {
+      const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+      child.kill();
+      await closed;
+    }
+  }
+
+  const monitorResult = (taskId: string) => ({
+    type: 'user',
+    message: {
+      content: [
+        {
+          type: 'tool_result',
+          content: `Monitor started (task ${taskId}, pid 123).`,
+        },
+      ],
+    },
+  });
+
+  const completion = (taskId: string) => ({
+    type: 'user',
+    message: {
+      content:
+        `<task-notification>\n<task-id>${taskId}</task-id>\n` + '<status>completed</status>\n</task-notification>',
+    },
+  });
+
+  it('blocks an intermediate subagent stop while a sibling monitor is active', async () => {
+    const result = await withLiveTask('monitor-still-live', () =>
+      runGuard([monitorResult('monitor-first'), monitorResult('monitor-still-live'), completion('monitor-first')])
+    );
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(JSON.parse(result.stdout)).toMatchObject({ decision: 'block' });
+    expect(result.stdout).toContain('monitor-still-live');
+    expect(result.stdout).not.toContain('monitor-first,');
+  });
+
+  it('allows a subagent to stop after all of its monitored work finishes', async () => {
+    const result = await runGuard([
+      monitorResult('monitor-first'),
+      monitorResult('monitor-second'),
+      completion('monitor-first'),
+      completion('monitor-second'),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe('');
+  });
+
+  it('also recognizes background Bash task ownership', async () => {
+    const result = await withLiveTask('bash-live-1', () =>
+      runGuard([
+        {
+          type: 'user',
+          message: {
+            content: [
+              {
+                type: 'tool_result',
+                content: 'Command running in background with ID: bash-live-1. Output is being written to a task file.',
+              },
+            ],
+          },
+        },
+      ])
+    );
+
+    expect(JSON.parse(result.stdout)).toMatchObject({ decision: 'block' });
+    expect(result.stdout).toContain('bash-live-1');
   });
 });
 
@@ -214,7 +787,7 @@ describe('Hook Event API', () => {
       body: JSON.stringify({}),
     });
     const createData = await createRes.json();
-    testSessionId = createData.session.id;
+    testSessionId = createData.data.session.id;
   });
 
   afterAll(async () => {
@@ -396,7 +969,7 @@ describe('Hook Data Sanitization', () => {
       body: JSON.stringify({}),
     });
     const createData = await createRes.json();
-    testSessionId = createData.session.id;
+    testSessionId = createData.data.session.id;
   });
 
   afterAll(async () => {
@@ -634,17 +1207,20 @@ describe('Hook Config Generation - Extended', () => {
   it('should generate valid JSON structure', () => {
     const config = generateHooksConfig();
     expect(config.hooks).toBeDefined();
-    expect(config.hooks.Notification).toHaveLength(3);
+    expect(config.hooks.Notification).toHaveLength(5);
     expect(config.hooks.Stop).toHaveLength(1);
   });
 
   it('should include all event types', () => {
     const config = generateHooksConfig();
     const notifHooks = config.hooks.Notification as Array<{ matcher?: string }>;
-    const matchers = notifHooks.map(n => n.matcher);
+    const matchers = notifHooks.map((n) => n.matcher);
     expect(matchers).toContain('idle_prompt');
     expect(matchers).toContain('permission_prompt');
     expect(matchers).toContain('elicitation_dialog');
+    // Approvals Inbox resolution signals (dialog answered in the terminal).
+    expect(matchers).toContain('elicitation_complete');
+    expect(matchers).toContain('elicitation_response');
   });
 
   it('should use environment variable placeholders', () => {
@@ -694,13 +1270,16 @@ describe('Hook Config Generation - Extended', () => {
 
   it('should have consistent structure across all notification hooks', () => {
     const config = generateHooksConfig();
-    const notifHooks = config.hooks.Notification as Array<{ matcher: string; hooks: Array<{ type: string; command: string; timeout: number }> }>;
+    const notifHooks = config.hooks.Notification as Array<{
+      matcher: string;
+      hooks: Array<{ type: string; command: string; timeout: number }>;
+    }>;
 
     for (const hook of notifHooks) {
       expect(hook.matcher).toBeDefined();
       expect(hook.hooks).toHaveLength(1);
       expect(hook.hooks[0].type).toBe('command');
-      expect(hook.hooks[0].timeout).toBe(10000);
+      expect(hook.hooks[0].timeout).toBe(10);
       expect(hook.hooks[0].command).toBeTruthy();
     }
   });

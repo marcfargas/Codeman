@@ -182,7 +182,7 @@ Object.assign(CodemanApp.prototype, {
         body: JSON.stringify({ goal, config }),
       });
       const data = await res.json();
-      if (data.ok) {
+      if (data.data?.ok) {
         this.orchestratorState = { state: 'planning', plan: null };
         this.showOrchestratorPanel();
         this.renderOrchestratorPanel();
@@ -259,8 +259,8 @@ Object.assign(CodemanApp.prototype, {
     try {
       const res = await fetch('/api/orchestrator/status');
       const data = await res.json();
-      if (data.ok) {
-        this.orchestratorState = data;
+      if (data.data?.ok) {
+        this.orchestratorState = data.data;
         this.renderOrchestratorPanel();
       }
     } catch (err) {
@@ -392,10 +392,10 @@ Object.assign(CodemanApp.prototype, {
     let actions = '';
     if (orchState === 'executing' || orchState === 'failed') {
       if (phase.status === 'pending') {
-        actions += `<button class="orch-phase-btn" onclick="app.orchestratorSkipPhase('${phase.id}')" title="Skip">skip</button>`;
+        actions += `<button class="orch-phase-btn" onclick="app.orchestratorSkipPhase(${escapeHtml(JSON.stringify(phase.id))})" title="Skip">skip</button>`;
       }
       if (phase.status === 'failed') {
-        actions += `<button class="orch-phase-btn" onclick="app.orchestratorRetryPhase('${phase.id}')" title="Retry">retry</button>`;
+        actions += `<button class="orch-phase-btn" onclick="app.orchestratorRetryPhase(${escapeHtml(JSON.stringify(phase.id))})" title="Retry">retry</button>`;
       }
     }
 

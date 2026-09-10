@@ -20,6 +20,13 @@
 
 const CACHE_NAME = 'codeman-v1';
 
+// Reverse-proxy base path: the worker is served at `<base>/sw.js`, so its own
+// location tells us the mount prefix ('' at root, or '/codeman'). Every URL below
+// is prefixed through B() so the cached shell, icons and API calls resolve under
+// the mount instead of escaping to the origin root.
+const SW_BASE = self.location.pathname.replace(/\/sw\.js$/, '');
+const B = (p) => (p && p[0] === '/' ? SW_BASE + p : p);
+
 // Core app shell -- cached on install for instant startup
 const APP_SHELL = [
   '/',
@@ -40,11 +47,12 @@ const APP_SHELL = [
   '/vendor/xterm-addon-fit.min.js',
   '/vendor/xterm-addon-unicode11.min.js',
   '/vendor/xterm-zerolag-input.js',
+  '/vendor/xterm-predictive-echo.js',
   '/vendor/xterm.css',
   '/icon-192.png',
   '/icon-512.png',
   '/manifest.json',
-];
+].map(B);
 
 // --- Install: precache app shell ---
 
@@ -110,14 +118,14 @@ self.addEventListener('push', (event) => {
     return;
   }
 
-  const { title, body, tag, sessionId, urgency, actions } = payload;
+  const { title, hostTitle, body, tag, sessionId, approvalId, urgency, actions } = payload;
 
   const options = {
     body: body || '',
     tag: tag || 'codeman-default',
-    icon: '/icon-192.png',
-    badge: '/icon-192.png',
-    data: { sessionId, url: sessionId ? `/?session=${sessionId}` : '/' },
+    icon: B('/icon-192.png'),
+    badge: B('/icon-192.png'),
+    data: { sessionId, approvalId, url: sessionId ? B(`/?session=${sessionId}`) : B('/') },
     renotify: true,
     requireInteraction: urgency === 'critical',
   };
@@ -126,32 +134,63 @@ self.addEventListener('push', (event) => {
     options.actions = actions;
   }
 
+  // Match the in-page Notification format: "codeman:<host>: <event title>".
+  // hostTitle is sent by servers >= the hostname-aware push payload change;
+  // older servers omit it and we fall back to the bare title.
+  const displayTitle = hostTitle && title
+    ? `${hostTitle}: ${title}`
+    : (title || hostTitle || 'Codeman');
+
   event.waitUntil(
-    self.registration.showNotification(title || 'Codeman', options)
+    self.registration.showNotification(displayTitle, options)
   );
 });
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 
-  const { sessionId, url } = event.notification.data || {};
-  const targetUrl = url || '/';
+  const { sessionId, approvalId, url } = event.notification.data || {};
+  const targetUrl = url || B('/');
+  const action = event.action || null;
 
-  event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
-      // Try to find an existing Codeman tab
-      for (const client of clients) {
-        if (client.url.includes(self.location.origin)) {
-          client.postMessage({
-            type: 'notification-click',
-            sessionId,
-            action: event.action || null,
-          });
-          return client.focus();
-        }
-      }
-      // No existing tab -- open a new one
-      return self.clients.openWindow(targetUrl);
-    })
-  );
+  // Approve/Deny action buttons answer the Approvals Inbox item directly from
+  // the worker, so they work with NO Codeman tab open (lock-screen approvals).
+  // Same-origin POST with cookie credentials; the CSRF Origin check passes
+  // because a service worker fetch carries the worker's own (same) origin.
+  if ((action === 'approve' || action === 'deny') && approvalId) {
+    event.waitUntil(
+      fetch(B(`/api/approvals/${encodeURIComponent(approvalId)}/answer`), {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      }).then((res) => {
+        if (res && res.ok) return undefined;
+        // 401/404/409: let the human see the state by falling back to a tab.
+        return openOrFocus(sessionId, action, approvalId, targetUrl);
+      }).catch(() => openOrFocus(sessionId, action, approvalId, targetUrl))
+    );
+    return;
+  }
+
+  event.waitUntil(openOrFocus(sessionId, action, approvalId, targetUrl));
 });
+
+function openOrFocus(sessionId, action, approvalId, targetUrl) {
+  return self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+    // Try to find an existing Codeman tab
+    for (const client of clients) {
+      if (client.url.includes(self.location.origin)) {
+        client.postMessage({
+          type: 'notification-click',
+          sessionId,
+          approvalId,
+          action,
+        });
+        return client.focus();
+      }
+    }
+    // No existing tab -- open a new one
+    return self.clients.openWindow(targetUrl);
+  });
+}

@@ -27,6 +27,8 @@ import type { RalphStatusBlock, CircuitBreakerStatus } from '../types.js';
 import { SseEvent } from './sse-events.js';
 import { getLifecycleLog } from '../session-lifecycle-log.js';
 import { fileStreamManager } from '../file-stream-manager.js';
+import { sessionWaits } from './session-wait-registry.js';
+import { approvalInbox } from './approval-inbox.js';
 
 /** Stored listener references for session cleanup (prevents memory leaks) */
 export interface SessionListenerRefs {
@@ -45,7 +47,12 @@ export interface SessionListenerRefs {
   taskFailed: (task: BackgroundTask, error: string) => void;
   autoClear: (data: { tokens: number; threshold: number }) => void;
   autoCompact: (data: { tokens: number; threshold: number; prompt?: string }) => void;
+  limitPauseScheduled: (data: { resetAt: number; resumeAt: number; matched: string }) => void;
+  limitResume: (data: { attempt: number }) => void;
+  limitResumeCancelled: (data: { reason: string }) => void;
+  respawnBreakerTripped: (data: { count: number }) => void;
   cliInfoUpdated: (data: { version?: string; model?: string; accountType?: string; latestVersion?: string }) => void;
+  mouseTrackingChanged: (active: boolean) => void;
   ralphLoopUpdate: (state: RalphTrackerState) => void;
   ralphTodoUpdate: (todos: RalphTodoItem[]) => void;
   ralphCompletionDetected: (phrase: string) => void;
@@ -55,10 +62,11 @@ export interface SessionListenerRefs {
   bashToolStart: (tool: ActiveBashTool) => void;
   bashToolEnd: (tool: ActiveBashTool) => void;
   bashToolsUpdate: (tools: ActiveBashTool[]) => void;
+  attachmentRequested: (event: { path: string; source: 'external' | 'codex-generated' }) => void;
 }
 
 /** Dependencies injected by WebServer — keeps listener creation decoupled from server internals. */
-export interface SessionListenerDeps {
+interface SessionListenerDeps {
   broadcast(event: string, data: unknown): void;
   batchTerminalData(sessionId: string, data: string): void;
   batchTaskUpdate(sessionId: string, task: BackgroundTask): void;
@@ -74,10 +82,11 @@ export interface SessionListenerDeps {
   removeSessionListenerRefs(sessionId: string): void;
   cleanupRespawnOnExit(sessionId: string): void;
   getStore(): import('../state-store.js').StateStore;
+  registerAttachment(sessionId: string, filePath: string, source: 'external' | 'codex-generated'): Promise<void>;
 }
 
 /**
- * Creates all 25 session listener handlers, capturing dependencies via closure.
+ * Creates all 26 session listener handlers, capturing dependencies via closure.
  * Call `attachSessionListeners()` after to wire them to the session.
  */
 export function createSessionListeners(session: Session, deps: SessionListenerDeps): SessionListenerRefs {
@@ -86,6 +95,9 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
 
     /** Batches PTY output → broadcasts `session:terminal` at 16-50ms intervals */
     terminal: (data) => {
+      // Feeds `GET /api/sessions/:id/wait-output`. No-ops with a single Map lookup
+      // when nothing is waiting, which is the case on virtually every chunk.
+      sessionWaits.notifyOutput(session.id, data);
       deps.batchTerminalData(session.id, data);
     },
 
@@ -131,6 +143,29 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
 
     /** Broadcasts `session:exit` + `session:updated` — PTY process exited; cleans up respawn, timers, listeners */
     exit: (code) => {
+      // Before anything that can throw: a caller blocked on this session must learn
+      // the process died rather than sit until its timeout.
+      //
+      // Both halves are required, in this order — the same pair `_doCleanupSession`
+      // uses on the delete path, for the same reason. `notifySignal` resolves ONLY
+      // waiters that asked for `exit`; everyone else (`until=working`, `until=stop`,
+      // every wait-output) would keep a slot in the process-wide pool until their
+      // timeout, on a session whose feeds this very handler is about to tear down:
+      // `removeSessionListenerRefs` below detaches the `terminal` listener that is
+      // the only input to `notifyOutput`, and the `idle`/`working` listeners with it.
+      // Nothing can reach those waiters afterwards, so holding them is a guaranteed
+      // ten-minute lie. `cancelAll` answers them `ended: true`, which the plan's §3.6
+      // specifies for exactly this case ("Never hang").
+      //
+      // Safe against the respawn cycle: a respawn writes `/clear` + a kickstart
+      // prompt through the mux and never restarts the PTY, so it emits no `exit` and
+      // cannot cancel an orchestrating agent's wait. And for an agent driving a
+      // worker this is the right trade even when the PTY exit was only a tmux
+      // DETACH: `ended` means "re-check and re-issue", one extra round trip, versus
+      // burning the caller's entire timeout learning nothing.
+      sessionWaits.notifySignal(session.id, 'exit');
+      sessionWaits.cancelAll(session.id);
+      approvalInbox.resolveForSession(session.id, 'session_ended');
       getLifecycleLog().log({
         event: 'exit',
         sessionId: session.id,
@@ -181,7 +216,28 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
 
     /** Broadcasts `session:working` — Claude started processing */
     working: () => {
+      sessionWaits.notifySignal(session.id, 'working');
+      // An idle-prompt inbox item means "composer is waiting"; any working
+      // transition means input arrived, so the item is moot. ONLY the idle
+      // kind: `working` is heuristic and can flap mid-turn, so clearing a
+      // pending permission/question dialog on the signal ALONE would
+      // false-clear real approvals.
+      approvalInbox.resolveForSession(session.id, 'resolved_in_terminal', ['idle']);
+      // A permission/question dialog gets the pane-VERIFIED variant instead:
+      // the signal only decides when to look, `verifyStillAnswerable` re-reads
+      // the screen and resolves only when the dialog is really gone. Without
+      // this, answering a dialog in the terminal left its red "needs you" alert
+      // armed for the rest of the turn, because the only other staleness check
+      // lives in `GET /api/approvals` and nothing calls that while a page is
+      // open. `stop` was the first thing to clear it, which on a long turn is
+      // minutes away.
+      approvalInbox.resolveIfDialogGone(session.id);
       deps.broadcast(SseEvent.SessionWorking, { id: session.id });
+      // Full state ride-along: the home screens sort the running group on
+      // lastSubmitAt, and without this the browser keeps the stamp it loaded
+      // with (a turn started after page load ranks by the PREVIOUS turn's
+      // Enter). Debounced, so working-signal flaps cost one broadcast.
+      deps.broadcastSessionStateDebounced(session.id);
       const tracker = deps.getRunSummaryTracker(session.id);
       if (tracker) {
         tracker.recordWorking();
@@ -191,6 +247,7 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
 
     /** Broadcasts `session:idle` — Claude finished processing, waiting for input */
     idle: () => {
+      sessionWaits.notifySignal(session.id, 'idle');
       deps.broadcast(SseEvent.SessionIdle, { id: session.id });
       deps.broadcastSessionStateDebounced(session.id);
       const tracker = deps.getRunSummaryTracker(session.id);
@@ -243,12 +300,69 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
       if (tracker) tracker.recordAutoCompact(data.tokens, data.threshold);
     },
 
+    /** Broadcasts `session:limitPauseScheduled` — usage-limit pause detected, auto-resume armed.
+     *  Persisted so a pending schedule survives a Codeman restart. */
+    limitPauseScheduled: (data: { resetAt: number; resumeAt: number; matched: string }) => {
+      deps.broadcast(SseEvent.SessionLimitPauseScheduled, { sessionId: session.id, ...data });
+      deps.broadcastSessionStateDebounced(session.id);
+      deps.persistSessionState(session);
+    },
+
+    /** Broadcasts `session:limitResume` — auto-resume prompt sent after limit reset */
+    limitResume: (data: { attempt: number }) => {
+      deps.broadcast(SseEvent.SessionLimitResume, { sessionId: session.id, ...data });
+      deps.broadcastSessionStateDebounced(session.id);
+      deps.persistSessionState(session);
+    },
+
+    /** Broadcasts `session:limitResumeCancelled` — pending auto-resume no longer needed */
+    limitResumeCancelled: (data: { reason: string }) => {
+      deps.broadcast(SseEvent.SessionLimitResumeCancelled, { sessionId: session.id, ...data });
+      deps.broadcastSessionStateDebounced(session.id);
+      deps.persistSessionState(session);
+    },
+
+    /**
+     * Broadcasts `session:respawnBreakerTripped` (COD-118) — repeated non-zero PTY exits
+     * tripped the circuit breaker; the session is now errored and respawn is blocked.
+     * Also pushes the errored state (`session:updated`) so the tab renders the error,
+     * persists it, and notifies for diagnostic visibility.
+     */
+    respawnBreakerTripped: (data: { count: number }) => {
+      deps.broadcast(SseEvent.SessionRespawnBreakerTripped, { sessionId: session.id, ...data });
+      deps.broadcast(SseEvent.SessionUpdated, deps.getSessionStateWithRespawn(session));
+      deps.persistSessionState(session);
+      deps.sendPushNotifications(SseEvent.SessionRespawnBreakerTripped, {
+        sessionId: session.id,
+        sessionName: session.name,
+        count: data.count,
+      });
+      const tracker = deps.getRunSummaryTracker(session.id);
+      if (tracker) {
+        tracker.recordError('Respawn circuit breaker tripped', `${data.count} non-zero PTY exits within window`);
+      }
+    },
+
     // ─── CLI Info ────────────────────────────────────────────
 
     /** Broadcasts `session:cliInfo` — Claude Code version, model, account type parsed from terminal */
     cliInfoUpdated: (data: { version?: string; model?: string; accountType?: string; latestVersion?: string }) => {
       deps.broadcast(SseEvent.SessionCliInfo, { sessionId: session.id, ...data });
       deps.broadcastSessionStateDebounced(session.id);
+    },
+
+    /**
+     * The CLI turned mouse tracking on or off (observed while stripping the
+     * DECSETs out of the stream). Rides the full session state so the browser
+     * learns it through the session object it already merges, with no new SSE
+     * event to keep in sync across the two registries.
+     *
+     * Broadcast IMMEDIATELY, not debounced: this flips when a dialog opens, and
+     * a user can click that dialog inside the 500ms debounce window, which is
+     * exactly the click that has to be reported.
+     */
+    mouseTrackingChanged: () => {
+      deps.broadcast(SseEvent.SessionUpdated, { session: deps.getSessionStateWithRespawn(session) });
     },
 
     // ─── Ralph Tracking Events ──────────────────────────────
@@ -330,6 +444,13 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
     bashToolsUpdate: (tools: ActiveBashTool[]) => {
       deps.broadcast(SseEvent.SessionBashToolsUpdate, { sessionId: session.id, tools });
     },
+
+    /** Registers an explicit attachment card requested by terminal magic text. */
+    attachmentRequested: (event: { path: string; source: 'external' | 'codex-generated' }) => {
+      deps.registerAttachment(session.id, event.path, event.source).catch((err) => {
+        console.error(`[Attachment] Failed to register ${event.path} for ${session.id}:`, err);
+      });
+    },
   };
 }
 
@@ -350,7 +471,12 @@ export function attachSessionListeners(session: Session, refs: SessionListenerRe
   session.on('taskFailed', refs.taskFailed);
   session.on('autoClear', refs.autoClear);
   session.on('autoCompact', refs.autoCompact);
+  session.on('limitPauseScheduled', refs.limitPauseScheduled);
+  session.on('limitResume', refs.limitResume);
+  session.on('limitResumeCancelled', refs.limitResumeCancelled);
+  session.on('respawnBreakerTripped', refs.respawnBreakerTripped);
   session.on('cliInfoUpdated', refs.cliInfoUpdated);
+  session.on('mouseTrackingChanged', refs.mouseTrackingChanged);
   session.on('ralphLoopUpdate', refs.ralphLoopUpdate);
   session.on('ralphTodoUpdate', refs.ralphTodoUpdate);
   session.on('ralphCompletionDetected', refs.ralphCompletionDetected);
@@ -360,6 +486,7 @@ export function attachSessionListeners(session: Session, refs: SessionListenerRe
   session.on('bashToolStart', refs.bashToolStart);
   session.on('bashToolEnd', refs.bashToolEnd);
   session.on('bashToolsUpdate', refs.bashToolsUpdate);
+  session.on('attachmentRequested', refs.attachmentRequested);
 }
 
 /** Detach all listeners from a session (prevents memory leaks from closure references). */
@@ -379,7 +506,12 @@ export function detachSessionListeners(session: Session, refs: SessionListenerRe
   session.off('taskFailed', refs.taskFailed);
   session.off('autoClear', refs.autoClear);
   session.off('autoCompact', refs.autoCompact);
+  session.off('limitPauseScheduled', refs.limitPauseScheduled);
+  session.off('limitResume', refs.limitResume);
+  session.off('limitResumeCancelled', refs.limitResumeCancelled);
+  session.off('respawnBreakerTripped', refs.respawnBreakerTripped);
   session.off('cliInfoUpdated', refs.cliInfoUpdated);
+  session.off('mouseTrackingChanged', refs.mouseTrackingChanged);
   session.off('ralphLoopUpdate', refs.ralphLoopUpdate);
   session.off('ralphTodoUpdate', refs.ralphTodoUpdate);
   session.off('ralphCompletionDetected', refs.ralphCompletionDetected);
@@ -389,4 +521,5 @@ export function detachSessionListeners(session: Session, refs: SessionListenerRe
   session.off('bashToolStart', refs.bashToolStart);
   session.off('bashToolEnd', refs.bashToolEnd);
   session.off('bashToolsUpdate', refs.bashToolsUpdate);
+  session.off('attachmentRequested', refs.attachmentRequested);
 }

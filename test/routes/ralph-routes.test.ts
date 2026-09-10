@@ -21,6 +21,8 @@ function createMockRalphTracker() {
     disableAutoEnable: vi.fn(),
     startLoop: vi.fn(),
     setMaxIterations: vi.fn(),
+    setMaxTodos: vi.fn(),
+    setTodoExpirationMinutes: vi.fn(),
     resetCircuitBreaker: vi.fn(),
     generateFixPlanMarkdown: vi.fn(() => '# Fix Plan\n\n- [ ] Task 1\n'),
     importFixPlanMarkdown: vi.fn(() => 3),
@@ -62,11 +64,13 @@ describe('ralph-routes', () => {
       });
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(true);
+      expect(body).toEqual({});
     });
 
     it('enables ralph tracker', async () => {
-      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<typeof createMockRalphTracker>;
+      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<
+        typeof createMockRalphTracker
+      >;
 
       const res = await harness.app.inject({
         method: 'POST',
@@ -79,7 +83,9 @@ describe('ralph-routes', () => {
     });
 
     it('disables ralph tracker', async () => {
-      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<typeof createMockRalphTracker>;
+      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<
+        typeof createMockRalphTracker
+      >;
 
       const res = await harness.app.inject({
         method: 'POST',
@@ -99,7 +105,7 @@ describe('ralph-routes', () => {
       });
       expect((harness.ctx.mux as Record<string, unknown>).updateRalphEnabled).toHaveBeenCalledWith(
         harness.ctx._sessionId,
-        true,
+        true
       );
     });
 
@@ -116,7 +122,9 @@ describe('ralph-routes', () => {
     });
 
     it('handles reset option', async () => {
-      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<typeof createMockRalphTracker>;
+      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<
+        typeof createMockRalphTracker
+      >;
 
       await harness.app.inject({
         method: 'POST',
@@ -127,7 +135,9 @@ describe('ralph-routes', () => {
     });
 
     it('configures completion phrase and max iterations', async () => {
-      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<typeof createMockRalphTracker>;
+      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<
+        typeof createMockRalphTracker
+      >;
 
       await harness.app.inject({
         method: 'POST',
@@ -138,7 +148,9 @@ describe('ralph-routes', () => {
     });
 
     it('sets max iterations independently', async () => {
-      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<typeof createMockRalphTracker>;
+      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<
+        typeof createMockRalphTracker
+      >;
 
       await harness.app.inject({
         method: 'POST',
@@ -148,13 +160,32 @@ describe('ralph-routes', () => {
       expect(tracker.setMaxIterations).toHaveBeenCalledWith(50);
     });
 
+    it('applies maxTodos and todoExpirationMinutes to the tracker (COD-52)', async () => {
+      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<
+        typeof createMockRalphTracker
+      >;
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${harness.ctx._sessionId}/ralph-config`,
+        payload: { maxTodos: 25, todoExpirationMinutes: 90 },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      // The ralph-config success path returns a bare {} envelope (matching its
+      // sibling config routes); an error would surface as { success: false }.
+      expect(body.success).not.toBe(false);
+      expect(tracker.setMaxTodos).toHaveBeenCalledWith(25);
+      expect(tracker.setTodoExpirationMinutes).toHaveBeenCalledWith(90);
+    });
+
     it('returns error for unknown session', async () => {
       const res = await harness.app.inject({
         method: 'POST',
         url: '/api/sessions/nonexistent/ralph-config',
         payload: { enabled: true },
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(404);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -178,13 +209,15 @@ describe('ralph-routes', () => {
         url: `/api/sessions/${harness.ctx._sessionId}/ralph-config`,
         payload: { enabled: 'not-boolean' },
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
 
     it('handles disableAutoEnable flag', async () => {
-      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<typeof createMockRalphTracker>;
+      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<
+        typeof createMockRalphTracker
+      >;
 
       await harness.app.inject({
         method: 'POST',
@@ -208,7 +241,9 @@ describe('ralph-routes', () => {
 
   describe('POST /api/sessions/:id/ralph-circuit-breaker/reset', () => {
     it('resets circuit breaker for valid session', async () => {
-      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<typeof createMockRalphTracker>;
+      const tracker = (harness.ctx._session as Record<string, unknown>).ralphTracker as ReturnType<
+        typeof createMockRalphTracker
+      >;
 
       const res = await harness.app.inject({
         method: 'POST',
@@ -216,7 +251,7 @@ describe('ralph-routes', () => {
       });
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(true);
+      expect(body).toEqual({});
       expect(tracker.resetCircuitBreaker).toHaveBeenCalled();
     });
 
@@ -225,7 +260,7 @@ describe('ralph-routes', () => {
         method: 'POST',
         url: '/api/sessions/nonexistent/ralph-circuit-breaker/reset',
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(404);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -253,7 +288,7 @@ describe('ralph-routes', () => {
         method: 'GET',
         url: '/api/sessions/nonexistent/ralph-status',
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(404);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -279,7 +314,7 @@ describe('ralph-routes', () => {
         method: 'GET',
         url: '/api/sessions/nonexistent/fix-plan',
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(404);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -315,7 +350,7 @@ describe('ralph-routes', () => {
         url: '/api/sessions/nonexistent/fix-plan/import',
         payload: { content: 'test' },
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(404);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -326,7 +361,7 @@ describe('ralph-routes', () => {
         url: `/api/sessions/${harness.ctx._sessionId}/fix-plan/import`,
         payload: {},
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -341,7 +376,7 @@ describe('ralph-routes', () => {
         url: '/api/sessions/nonexistent/ralph-prompt/write',
         payload: { content: 'test prompt' },
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(404);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -365,7 +400,7 @@ describe('ralph-routes', () => {
         url: `/api/sessions/${harness.ctx._sessionId}/ralph-prompt/write`,
         payload: {},
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -379,7 +414,7 @@ describe('ralph-routes', () => {
         method: 'POST',
         url: '/api/sessions/nonexistent/fix-plan/write',
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(404);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -405,7 +440,7 @@ describe('ralph-routes', () => {
         method: 'POST',
         url: '/api/sessions/nonexistent/fix-plan/read',
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(404);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -426,13 +461,39 @@ describe('ralph-routes', () => {
   // ========== POST /api/ralph-loop/start ==========
 
   describe('POST /api/ralph-loop/start', () => {
+    it('awaits layout insertion and stops lifecycle work when registration rejects', async () => {
+      let rejectRegistration!: (error: Error) => void;
+      harness.ctx.addSession.mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectRegistration = reject;
+          })
+      );
+
+      const pending = harness.app.inject({
+        method: 'POST',
+        url: '/api/ralph-loop/start',
+        payload: { taskDescription: 'test task', completionPhrase: 'DONE', caseName: 'registration-order' },
+      });
+      await vi.waitFor(() => expect(harness.ctx.addSession).toHaveBeenCalledTimes(1));
+      expect(harness.ctx.persistSessionState).not.toHaveBeenCalled();
+      expect(harness.ctx.setupSessionListeners).not.toHaveBeenCalled();
+
+      rejectRegistration(new Error('layout capacity exceeded'));
+      const response = await pending;
+      expect(response.statusCode).toBe(500);
+      expect(harness.ctx.persistSessionState).not.toHaveBeenCalled();
+      expect(harness.ctx.setupSessionListeners).not.toHaveBeenCalled();
+      expect(harness.ctx.broadcast).not.toHaveBeenCalledWith('session:created', expect.anything());
+    });
+
     it('rejects invalid request body', async () => {
       const res = await harness.app.inject({
         method: 'POST',
         url: '/api/ralph-loop/start',
         payload: {},
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -466,7 +527,7 @@ describe('ralph-routes', () => {
           caseName: '../escape-path',
         },
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });

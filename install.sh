@@ -5,12 +5,32 @@
 # Usage: curl -fsSL https://raw.githubusercontent.com/Ark0N/Codeman/master/install.sh | bash
 #
 # Environment variables:
-#   CODEMAN_NONINTERACTIVE=1  - Skip all prompts (for CI/automation)
+#   CODEMAN_NONINTERACTIVE=1  - Skip all prompts and accept their defaults
+#                               (CI/automation). Required for headless runs
+#                               that need system changes (sudo package
+#                               installs, AI CLI download); without it those
+#                               steps abort instead of running silently.
 #   CODEMAN_INSTALL_DIR       - Custom install directory (default: ~/.codeman/app)
 #   CODEMAN_SKIP_SYSTEMD=1    - Skip systemd/launchd service setup prompt
 #   CODEMAN_NODE_VERSION      - Node.js major version to install (default: 22)
 #   CODEMAN_REPO_URL          - Custom git repository URL (default: upstream Codeman)
 #   CODEMAN_BRANCH            - Git branch to install (default: master)
+#   CODEMAN_HOST              - Preset the network binding and skip the prompt
+#                               (e.g. 0.0.0.0 for LAN access, 127.0.0.1 for
+#                               local-only; interactive default is 0.0.0.0,
+#                               non-interactive default is 127.0.0.1)
+#   CODEMAN_PASSWORD          - Preset the dashboard password (skips the
+#                               password prompt when binding to the network)
+#   CODEMAN_TAILSCALE=1       - Preset the Tailscale choice: bind loopback and
+#                               front it with `tailscale serve` HTTPS (skips
+#                               the network prompt; never installs Tailscale
+#                               in non-interactive runs)
+#
+# Subcommands:
+#   install.sh update     - Update an existing install
+#   install.sh uninstall  - Remove services, symlinks and (optionally) data
+#   install.sh tailscale  - Set up (or repair) Tailscale serve HTTPS access
+#                           for an existing install
 
 set -euo pipefail
 
@@ -25,6 +45,36 @@ MIN_NODE_VERSION=18
 TARGET_NODE_VERSION="${CODEMAN_NODE_VERSION:-22}"
 NONINTERACTIVE="${CODEMAN_NONINTERACTIVE:-0}"
 SKIP_SYSTEMD="${CODEMAN_SKIP_SYSTEMD:-0}"
+
+# Network binding chosen during install (choose_network_binding). Empty
+# BIND_HOST means "not chosen" (e.g. the update path) and falls back to the
+# server's own loopback default.
+BIND_HOST=""
+BIND_PASSWORD=""
+BIND_ACK="0"
+
+# Binding found in an already-installed service (read_existing_binding), used
+# so updates and re-installs preserve the user's previous choice instead of
+# silently loosening it to the new network-access default.
+EXISTING_FOUND="0"
+EXISTING_HOST=""
+EXISTING_PASSWORD=""
+EXISTING_ACK="0"
+
+# Tailscale serve URL configured or detected during this run
+# (setup_tailscale_access / detect_tailscale_serve_url). Empty when the
+# Tailscale path was not taken or not completed.
+TAILSCALE_SERVE_URL=""
+# Set to 1 when serve commands must go through sudo because granting the user
+# tailscale "operator" rights failed (ensure_tailscale_operator).
+TS_NEED_ROOT="0"
+
+# puppeteer is a devDependency used only by scripts/browser-comparison.mjs — its
+# ~150MB chrome-headless-shell download is never needed to build or run Codeman.
+# Skipping it avoids a slow download and a fatal install failure when a prior
+# download left a corrupt cache (folder present, executable missing). Respect an
+# explicit caller override so contributors can still fetch the browser if needed.
+export PUPPETEER_SKIP_DOWNLOAD="${PUPPETEER_SKIP_DOWNLOAD:-1}"
 
 # Claude CLI search paths (from src/utils/claude-cli-resolver.ts)
 CLAUDE_SEARCH_PATHS=(
@@ -44,6 +94,70 @@ OPENCODE_SEARCH_PATHS=(
     "$HOME/.bun/bin/opencode"
     "$HOME/.npm-global/bin/opencode"
     "$HOME/bin/opencode"
+)
+
+# Codex CLI search paths (from src/utils/codex-cli-resolver.ts)
+CODEX_SEARCH_PATHS=(
+    "$HOME/.codex/bin/codex"
+    "$HOME/.local/bin/codex"
+    "/usr/local/bin/codex"
+    "$HOME/.bun/bin/codex"
+    "$HOME/.npm-global/bin/codex"
+    "$HOME/bin/codex"
+)
+
+# Gemini CLI search paths (from src/utils/gemini-cli-resolver.ts)
+GEMINI_SEARCH_PATHS=(
+    "$HOME/.gemini/bin/gemini"
+    "$HOME/.local/bin/gemini"
+    "/usr/local/bin/gemini"
+    "$HOME/.bun/bin/gemini"
+    "$HOME/.npm-global/bin/gemini"
+    "$HOME/bin/gemini"
+)
+
+# Pi CLI search paths (from src/utils/pi-cli-resolver.ts)
+PI_SEARCH_PATHS=(
+    "$HOME/.local/bin/pi"
+    "/usr/local/bin/pi"
+    "$HOME/.bun/bin/pi"
+    "$HOME/.npm-global/bin/pi"
+    "$HOME/bin/pi"
+)
+
+# DeepSeek Harness search paths (from src/utils/deepseek-cli-resolver.ts)
+DSH_SEARCH_PATHS=(
+    "$HOME/.local/bin/dsh"
+    "/usr/local/bin/dsh"
+    "$HOME/.npm-global/bin/dsh"
+    "$HOME/bin/dsh"
+)
+
+# Grok CLI search paths (from src/utils/grok-cli-resolver.ts)
+GROK_SEARCH_PATHS=(
+    "$HOME/.grok/bin/grok"
+    "$HOME/.local/bin/grok"
+    "/usr/local/bin/grok"
+    "$HOME/bin/grok"
+)
+
+# Antigravity CLI search paths (from src/utils/antigravity-cli-resolver.ts)
+ANTIGRAVITY_SEARCH_PATHS=(
+    "$HOME/.local/bin/agy"
+    "$HOME/.antigravity/bin/agy"
+    "/usr/local/bin/agy"
+    "$HOME/bin/agy"
+)
+
+# OMP CLI search paths (from src/utils/omp-cli-resolver.ts's OMP_SEARCH_DIRS —
+# ~/.local/bin leads, omp.sh's installer target; ~/.omp/bin is a fallback only)
+OMP_SEARCH_PATHS=(
+    "$HOME/.local/bin/omp"
+    "$HOME/.omp/bin/omp"
+    "/usr/local/bin/omp"
+    "$HOME/.bun/bin/omp"
+    "$HOME/.npm-global/bin/omp"
+    "$HOME/bin/omp"
 )
 
 # ============================================================================
@@ -97,6 +211,62 @@ error() {
 die() {
     error "$1"
     exit 1
+}
+
+# Security notice — printed at the very end of install/update so it is the last
+# thing the user sees. Adapts to the binding chosen during install; the update
+# path (BIND_HOST empty) gets the generic text.
+print_security_notice() {
+    echo ""
+    if [[ "$BIND_HOST" == "0.0.0.0" && -z "$BIND_PASSWORD" ]]; then
+        echo -e "  ${RED}${BOLD}============================================================${NC}"
+        echo -e "  ${RED}${BOLD}  WARNING: NETWORK ACCESS WITHOUT A PASSWORD${NC}"
+        echo -e "  ${RED}${BOLD}============================================================${NC}"
+        echo -e "  ${RED}The dashboard is reachable by EVERY device on your network,${NC}"
+        echo -e "  ${RED}and whoever opens it can run commands as ${BOLD}$USER${NC}${RED} through${NC}"
+        echo -e "  ${RED}your AI agents. Anyone on your Wi-Fi owns this machine.${NC}"
+        echo ""
+        echo -e "  Fix it by setting a password (takes 30 seconds):"
+        echo -e "    ${CYAN}•${NC} re-run the installer and choose a password, or"
+        echo -e "    ${CYAN}•${NC} add ${CYAN}Environment=CODEMAN_PASSWORD=<yours>${NC} to the service"
+        echo -e "  Or switch back to local-only: ${CYAN}CODEMAN_HOST=127.0.0.1${NC}"
+        echo -e "  ${DIM}Details: docs/security-architecture.md${NC}"
+    elif [[ "$BIND_HOST" == "0.0.0.0" ]]; then
+        echo -e "  ${YELLOW}${BOLD}Security:${NC}"
+        echo -e "    The dashboard is reachable from your network at port 3000 and is"
+        echo -e "    password-protected (user ${BOLD}admin${NC}). Keep that password strong:"
+        echo -e "    whoever logs in can run commands through your agents."
+        echo -e "    For access from OUTSIDE your network, prefer Tailscale or a tunnel."
+        echo -e "    ${DIM}Details: docs/security-architecture.md${NC}"
+    else
+        # Loopback bind: when a tailscale serve mapping fronts it, lead with
+        # the actual URL instead of the generic "do ONE of" list. Detection is
+        # dynamic (tailscaled state is the single source of truth).
+        local notice_ts_url="$TAILSCALE_SERVE_URL"
+        if [[ -z "$notice_ts_url" ]]; then
+            notice_ts_url=$(detect_tailscale_serve_url 2>/dev/null) || notice_ts_url=""
+        fi
+        if [[ -n "$notice_ts_url" ]]; then
+            echo -e "  ${YELLOW}${BOLD}Security:${NC}"
+            echo -e "    Codeman binds ${BOLD}127.0.0.1${NC}, fronted by Tailscale serve:"
+            echo -e "    reachable at ${BOLD}$notice_ts_url${NC} (HTTPS, your tailnet only)."
+            echo -e "    Tailscale authenticates every device before traffic reaches Codeman."
+            echo -e "    ${DIM}Details: docs/security-architecture.md${NC}"
+        else
+            echo -e "  ${YELLOW}${BOLD}Security:${NC}"
+            echo -e "    Codeman binds ${BOLD}127.0.0.1${NC} (this machine only) — no password needed by default."
+            echo -e "    To reach it from another device, do ONE of:"
+            if check_tailscale; then
+                echo -e "      ${CYAN}•${NC} ${CYAN}bash $INSTALL_DIR/install.sh tailscale${NC}   ${DIM}(Tailscale is installed here; HTTPS, recommended)${NC}, or"
+            else
+                echo -e "      ${CYAN}•${NC} tailscale serve / cloudflared tunnel   ${DIM}(recommended)${NC}, or"
+            fi
+            echo -e "      ${CYAN}•${NC} ${CYAN}codeman web --host 0.0.0.0${NC}  AND set ${CYAN}CODEMAN_PASSWORD${NC}"
+            echo -e "    A non-loopback bind without a password still starts, but warns loudly."
+            echo -e "    ${DIM}Details: docs/security-architecture.md${NC}"
+        fi
+    fi
+    echo ""
 }
 
 # ============================================================================
@@ -257,6 +427,27 @@ check_tmux() {
     command -v tmux &>/dev/null
 }
 
+# node-pty ships prebuilt binaries for darwin and win32 ONLY, so on Linux it is
+# always compiled from source during `npm install`. Without a toolchain that
+# fails deep inside node-gyp with `not found: make`, which reads like an npm bug
+# rather than a missing system package (issue: fresh Ubuntu 24 server install).
+# So the toolchain is checked up front, exactly like git and tmux.
+#
+# Returns a human-readable list of what is missing, empty when all present.
+missing_build_tools() {
+    local missing=""
+    command -v make &>/dev/null || missing="make"
+    if ! command -v c++ &>/dev/null && ! command -v g++ &>/dev/null && ! command -v clang++ &>/dev/null; then
+        missing="${missing:+$missing, }a C++ compiler (g++)"
+    fi
+    command -v python3 &>/dev/null || missing="${missing:+$missing, }python3"
+    printf '%s' "$missing"
+}
+
+check_build_tools() {
+    [[ -z "$(missing_build_tools)" ]]
+}
+
 check_claude() {
     # Check PATH first
     if command -v claude &>/dev/null; then
@@ -308,6 +499,234 @@ get_opencode_path() {
     fi
 
     for path in "${OPENCODE_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            echo "$path"
+            return
+        fi
+    done
+}
+
+check_codex() {
+    if command -v codex &>/dev/null; then
+        return 0
+    fi
+
+    for path in "${CODEX_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+get_codex_path() {
+    if command -v codex &>/dev/null; then
+        command -v codex
+        return
+    fi
+
+    for path in "${CODEX_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            echo "$path"
+            return
+        fi
+    done
+}
+
+check_gemini() {
+    if command -v gemini &>/dev/null; then
+        return 0
+    fi
+
+    for path in "${GEMINI_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+get_gemini_path() {
+    if command -v gemini &>/dev/null; then
+        command -v gemini
+        return
+    fi
+
+    for path in "${GEMINI_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            echo "$path"
+            return
+        fi
+    done
+}
+
+check_antigravity() {
+    if command -v agy &>/dev/null; then
+        return 0
+    fi
+
+    for path in "${ANTIGRAVITY_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+get_antigravity_path() {
+    if command -v agy &>/dev/null; then
+        command -v agy
+        return
+    fi
+
+    for path in "${ANTIGRAVITY_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            echo "$path"
+            return
+        fi
+    done
+}
+
+# `pi` is a short, generic name (Raspberry Pi tooling, personal scripts), so the
+# server-side resolver additionally probes `pi --version`. Detection here only feeds
+# the "you have no AI CLI" hint, so a plain executable test is enough.
+check_pi() {
+    if command -v pi &>/dev/null; then
+        return 0
+    fi
+
+    for path in "${PI_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+get_pi_path() {
+    if command -v pi &>/dev/null; then
+        command -v pi
+        return
+    fi
+
+    for path in "${PI_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            echo "$path"
+            return
+        fi
+    done
+}
+
+# `grok` has known squatters too (the unrelated @vibe-kit/grok-cli), so the
+# server-side resolver additionally probes `grok --version`. Detection here only
+# feeds the "you have no AI CLI" hint, so a plain executable test is enough.
+check_grok() {
+    if command -v grok &>/dev/null; then
+        return 0
+    fi
+
+    for path in "${GROK_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# `dsh` is the hardest name of the lot: Debian ships an unrelated `dsh`
+# (dancer's shell). The server-side resolver settles it by demanding the
+# harness's own help banner; detection here only feeds the "you have no AI CLI"
+# hint, so the same banner grep is enough — but unlike every sibling probe it
+# EXECUTES the candidate, so it must be bounded. </dev/null is load-bearing
+# twice over: a foreign binary that blocks on stdin would hang the install, and
+# under `curl | bash` a child that reads stdin EATS THE REST OF THIS SCRIPT.
+# The timeout (where coreutils ships one; stock macOS has none) bounds a binary
+# that ignores EOF, mirroring the server resolver's own EXEC_TIMEOUT_MS.
+dsh_banner_probe() {
+    local runner=()
+    if command -v timeout &>/dev/null; then runner=(timeout 5); fi
+    "${runner[@]}" "$1" --help </dev/null 2>/dev/null | grep -qi "DeepSeek Harness"
+}
+
+# Resolved ONCE and memoized: the probe executes a possibly-foreign binary, and
+# the check/get/reminder call sites together used to re-run the whole scan many
+# times per install.
+DSH_RESOLVE_DONE=""
+DSH_RESOLVED_PATH=""
+resolve_dsh() {
+    [[ -n "$DSH_RESOLVE_DONE" ]] && return 0
+    DSH_RESOLVE_DONE=1
+    local candidate path
+    if command -v dsh &>/dev/null; then
+        candidate="$(command -v dsh)"
+        if dsh_banner_probe "$candidate"; then
+            DSH_RESOLVED_PATH="$candidate"
+            return 0
+        fi
+    fi
+
+    for path in "${DSH_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]] && dsh_banner_probe "$path"; then
+            DSH_RESOLVED_PATH="$path"
+            return 0
+        fi
+    done
+    return 0
+}
+
+check_dsh() {
+    resolve_dsh
+    [[ -n "$DSH_RESOLVED_PATH" ]]
+}
+
+get_dsh_path() {
+    resolve_dsh
+    echo "$DSH_RESOLVED_PATH"
+}
+
+get_grok_path() {
+    if command -v grok &>/dev/null; then
+        command -v grok
+        return
+    fi
+
+    for path in "${GROK_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            echo "$path"
+            return
+        fi
+    done
+}
+
+# `omp` is a short name too, so like grok/pi the server-side resolver
+# additionally probes `omp --version`. Detection here only feeds the
+# "you have no AI CLI" hint, so a plain executable test is enough.
+check_omp() {
+    if command -v omp &>/dev/null; then
+        return 0
+    fi
+
+    for path in "${OMP_SEARCH_PATHS[@]}"; do
+        if [[ -x "$path" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+get_omp_path() {
+    if command -v omp &>/dev/null; then
+        command -v omp
+        return
+    fi
+
+    for path in "${OMP_SEARCH_PATHS[@]}"; do
         if [[ -x "$path" ]]; then
             echo "$path"
             return
@@ -582,6 +1001,50 @@ install_git_suse() {
     run_as_root zypper install -y git
 }
 
+# Build toolchain for node-pty's source compile (see missing_build_tools).
+install_buildtools_debian() {
+    info "Installing build tools via apt (build-essential, python3)..."
+    ensure_sudo
+    run_as_root apt-get update -qq
+    run_as_root apt-get install -y -qq build-essential python3
+}
+
+install_buildtools_fedora() {
+    info "Installing build tools (gcc, gcc-c++, make, python3)..."
+    ensure_sudo
+    if command -v dnf &>/dev/null; then
+        run_as_root dnf install -y gcc gcc-c++ make python3
+    else
+        run_as_root yum install -y gcc gcc-c++ make python3
+    fi
+}
+
+install_buildtools_arch() {
+    info "Installing build tools via pacman (base-devel, python)..."
+    ensure_sudo
+    run_as_root pacman -Sy --noconfirm base-devel python
+}
+
+install_buildtools_alpine() {
+    info "Installing build tools via apk (build-base, python3)..."
+    ensure_sudo
+    run_as_root apk add --no-cache build-base python3
+}
+
+install_buildtools_suse() {
+    info "Installing build tools via zypper..."
+    ensure_sudo
+    run_as_root zypper install -y gcc gcc-c++ make python3
+}
+
+install_buildtools_macos() {
+    # macOS normally never gets here: node-pty ships darwin prebuilds. Only a
+    # forced source build needs a compiler, and Xcode CLT is its only supplier.
+    info "Requesting Xcode Command Line Tools..."
+    xcode-select --install 2>/dev/null || true
+    die "Finish the Xcode Command Line Tools install in the dialog, then re-run this installer."
+}
+
 install_cloudflared_macos() {
     info "Installing cloudflared via Homebrew..."
     ensure_homebrew
@@ -662,17 +1125,54 @@ install_cloudflared_suse() {
 # Interactive Prompts
 # ============================================================================
 
+# `curl | bash` leaves stdin attached to the pipe, so a plain `read` never sees
+# the keyboard even though the user is sitting at a terminal. These helpers
+# prompt via /dev/tty whenever a real terminal is available, and only fall back
+# to defaults when there is genuinely none (CI, truly headless pipes).
+has_tty() {
+    [[ -t 0 ]] && return 0
+    { : < /dev/tty; } 2>/dev/null
+}
+
+read_reply() {
+    # read_reply <varname>: read one line from the user's real terminal
+    if [[ -t 0 ]]; then
+        read -r "$1"
+    else
+        read -r "$1" < /dev/tty
+    fi
+}
+
+read_secret() {
+    # read_secret <varname>: like read_reply but without echoing (passwords)
+    if [[ -t 0 ]]; then
+        read -rs "$1"
+    else
+        read -rs "$1" < /dev/tty
+    fi
+    echo "" >&2
+}
+
+# headless_guard <action>: refuse consequential system changes (sudo package
+# installs, third-party curl | bash installers) when nobody can consent, i.e.
+# no terminal AND no explicit CODEMAN_NONINTERACTIVE=1 opt-in. Interactive
+# runs fall through to their normal prompt; opted-in automation proceeds with
+# the prompt defaults as before.
+headless_guard() {
+    local action="$1"
+    if [[ "$NONINTERACTIVE" == "1" ]] || has_tty; then
+        return 0
+    fi
+    error "No interactive terminal, but the installer would need to: $action."
+    error "Re-run from a terminal to be prompted, or set CODEMAN_NONINTERACTIVE=1 to approve such steps in automation."
+    exit 1
+}
+
 prompt_yes_no() {
     local prompt="$1"
     local default="${2:-y}"
 
-    if [[ "$NONINTERACTIVE" == "1" ]]; then
-        [[ "$default" == "y" ]]
-        return
-    fi
-
-    # Check if stdin is a terminal
-    if [[ ! -t 0 ]]; then
+    if [[ "$NONINTERACTIVE" == "1" ]] || ! has_tty; then
         # Non-interactive, use default
         [[ "$default" == "y" ]]
         return
@@ -687,7 +1187,7 @@ prompt_yes_no() {
 
     while true; do
         echo -en "${CYAN}$prompt${NC} $yn_hint " >&2
-        read -r answer
+        read_reply answer || answer="$default"
         answer="${answer:-$default}"
         case "$answer" in
             [Yy]|[Yy][Ee][Ss]) return 0 ;;
@@ -781,26 +1281,737 @@ add_to_path() {
     success "Added to $profile"
 }
 
-setup_sc_alias() {
+# The `sc` bash chooser was retired in favour of `codeman tui`, which reaches
+# sessions 10+, carries the server's real states and leaves an attach with one
+# key. Older installers wrote this alias, so take it back out.
+#
+# Marker-owned on purpose: it matches the exact line WE wrote, so a user's own
+# `alias sc=` for something entirely different is never touched. The rewrite
+# goes through `cat >` rather than `mv` so the profile keeps its own mode and
+# ownership.
+remove_sc_alias() {
     local profile
     profile=$(detect_shell_profile)
+    [[ -f "$profile" ]] || return 0
+    grep -qE "^alias sc='tmux-chooser'\$" "$profile" 2>/dev/null || return 0
 
-    # Check if alias already exists
-    if [[ -f "$profile" ]] && grep -qE "^alias sc=" "$profile" 2>/dev/null; then
-        info "Alias 'sc' already configured in $profile"
+    local tmp
+    tmp=$(mktemp 2>/dev/null) || return 0
+    if sed -e "/^alias sc='tmux-chooser'\$/d" \
+           -e '/^# Codeman tmux session shortcut$/d' "$profile" > "$tmp" 2>/dev/null; then
+        cat "$tmp" > "$profile"
+        info "Removed the retired 'sc' alias from $profile (use: codeman tui)"
+    fi
+    rm -f "$tmp"
+}
+
+# ============================================================================
+# Network Binding
+# ============================================================================
+
+# Best-effort LAN IP for "open this URL from your phone" hints.
+detect_lan_ip() {
+    local ip=""
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+    else
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    echo "${ip:-<your-ip>}"
+}
+
+# Escape a value for a quoted systemd Environment="KEY=value" assignment.
+systemd_env_escape() {
+    printf '%s' "$1" | sed 's/[\\"]/\\&/g'
+}
+
+# Escape a value for embedding in a launchd plist <string>.
+xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+systemd_env_unescape() {
+    printf '%s' "$1" | sed 's/\\\(["\\]\)/\1/g'
+}
+
+xml_unescape() {
+    printf '%s' "$1" | sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g'
+}
+
+# Read the binding out of an already-installed service file, if any. A service
+# file WITHOUT our CODEMAN_HOST line is a pre-1.8 install, which effectively
+# ran loopback (the server default), so it reports 127.0.0.1.
+read_existing_binding() {
+    EXISTING_FOUND="0"; EXISTING_HOST=""; EXISTING_PASSWORD=""; EXISTING_ACK="0"
+    local unit="$HOME/.config/systemd/user/codeman-web.service"
+    local plist="$HOME/Library/LaunchAgents/com.codeman.web.plist"
+
+    if [[ -f "$unit" ]]; then
+        EXISTING_FOUND="1"
+        EXISTING_HOST=$(sed -n 's/^Environment=CODEMAN_HOST=//p' "$unit" | head -1)
+        local pwline
+        pwline=$(sed -n 's/^Environment="CODEMAN_PASSWORD=\(.*\)"$/\1/p' "$unit" | head -1)
+        [[ -n "$pwline" ]] && EXISTING_PASSWORD=$(systemd_env_unescape "$pwline")
+        grep -q '^Environment=CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1' "$unit" && EXISTING_ACK="1"
+    elif [[ -f "$plist" ]]; then
+        EXISTING_FOUND="1"
+        EXISTING_HOST=$(awk '/<key>CODEMAN_HOST<\/key>/{getline; print}' "$plist" | sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p')
+        local pwraw
+        pwraw=$(awk '/<key>CODEMAN_PASSWORD<\/key>/{getline; print}' "$plist" | sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p')
+        [[ -n "$pwraw" ]] && EXISTING_PASSWORD=$(xml_unescape "$pwraw")
+        grep -q '<key>CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK</key>' "$plist" && EXISTING_ACK="1"
+    fi
+
+    if [[ "$EXISTING_FOUND" == "1" && -z "$EXISTING_HOST" ]]; then
+        EXISTING_HOST="127.0.0.1"
+    fi
+    return 0
+}
+
+# Ask how the dashboard should be reachable and set BIND_HOST/BIND_PASSWORD/
+# BIND_ACK. Interactive default is network access (0.0.0.0) because that is
+# what most installs need; loopback is offered as the safer alternative.
+# Non-interactive runs keep the safe loopback default unless CODEMAN_HOST is
+# preset. The server binary itself still defaults to 127.0.0.1 either way.
+choose_network_binding() {
+    # Preset via environment: honor it and skip the prompt entirely.
+    # CODEMAN_TAILSCALE=1 composes with a loopback (or absent) CODEMAN_HOST.
+    if [[ -n "${CODEMAN_HOST:-}" ]]; then
+        BIND_HOST="$CODEMAN_HOST"
+        BIND_PASSWORD="${CODEMAN_PASSWORD:-}"
+        if [[ "$BIND_HOST" != "127.0.0.1" && -z "$BIND_PASSWORD" ]]; then
+            BIND_ACK="1"
+        fi
+        info "Network binding preset via CODEMAN_HOST: $BIND_HOST"
+        if [[ "${CODEMAN_TAILSCALE:-0}" == "1" ]]; then
+            if [[ "$BIND_HOST" == "127.0.0.1" ]]; then
+                setup_tailscale_access || true
+            else
+                warn "CODEMAN_TAILSCALE=1 ignored: CODEMAN_HOST=$BIND_HOST is not loopback."
+            fi
+        fi
+        return 0
+    fi
+    if [[ "${CODEMAN_TAILSCALE:-0}" == "1" ]]; then
+        BIND_HOST="127.0.0.1"
+        BIND_PASSWORD="${CODEMAN_PASSWORD:-}"
+        info "Tailscale access preset via CODEMAN_TAILSCALE=1"
+        setup_tailscale_access || true
         return 0
     fi
 
-    echo "" >> "$profile"
-    echo "# Codeman tmux session shortcut" >> "$profile"
-    echo "alias sc='tmux-chooser'" >> "$profile"
+    # A previous install's choice is the baseline: re-installing must never
+    # silently loosen it.
+    read_existing_binding
 
-    info "Added 'sc' alias for tmux-chooser"
+    if [[ "$NONINTERACTIVE" == "1" ]] || ! has_tty; then
+        if [[ "$EXISTING_FOUND" == "1" ]]; then
+            BIND_HOST="$EXISTING_HOST"
+            BIND_PASSWORD="$EXISTING_PASSWORD"
+            BIND_ACK="$EXISTING_ACK"
+            info "Non-interactive install: preserving existing binding ($BIND_HOST)"
+        else
+            BIND_HOST="127.0.0.1"
+            info "Non-interactive install: binding 127.0.0.1 (preset CODEMAN_HOST=0.0.0.0 to override)"
+        fi
+        return 0
+    fi
+
+    # Tailscale state, for the menu hint and the default choice. Detection
+    # only; never installs, logs in, or prompts for sudo here.
+    local ts_hint="will be installed for you" ts_ready="0" ts_detected_url=""
+    if check_tailscale; then
+        ts_hint="installed, needs login"
+        if command -v node &>/dev/null && [[ "$(ts_status_field 's.BackendState')" == "Running" ]]; then
+            ts_ready="1"
+            ts_hint="already connected"
+            ts_detected_url=$(detect_tailscale_serve_url) || ts_detected_url=""
+            if [[ -n "$ts_detected_url" ]]; then
+                ts_hint="already serving Codeman"
+            fi
+        fi
+    fi
+
+    # Defaults: an existing setup wins (existing loopback installs default to
+    # Tailscale only when its serve mapping is already present); fresh installs
+    # default to Tailscale when it is already connected, else network access.
+    # A bare Enter never pulls in new software.
+    local default_choice="2"
+    if [[ "$EXISTING_FOUND" == "1" && "$EXISTING_HOST" == "127.0.0.1" ]]; then
+        if [[ -n "$ts_detected_url" ]]; then
+            default_choice="1"
+        else
+            default_choice="3"
+        fi
+    elif [[ "$EXISTING_FOUND" != "1" && "$ts_ready" == "1" ]]; then
+        default_choice="1"
+    fi
+
+    echo -e "  ${BOLD}Network access${NC}"
+    echo ""
+    echo -e "  How should the Codeman dashboard be reachable?"
+    echo ""
+    echo -e "    ${CYAN}1)${NC} ${BOLD}Tailscale${NC} ${DIM}($ts_hint)${NC}"
+    echo -e "       Private VPN access from your phone or laptop, anywhere."
+    echo -e "       Real HTTPS, no password needed: your tailnet is the login."
+    echo -e "    ${CYAN}2)${NC} ${BOLD}Any device on your network${NC} ${DIM}(0.0.0.0)${NC}"
+    echo -e "       Open it straight from your phone or laptop on the same Wi-Fi."
+    echo -e "       ${YELLOW}Less safe: set a password so only you control your agents.${NC}"
+    echo -e "    ${CYAN}3)${NC} ${BOLD}This machine only${NC} ${DIM}(127.0.0.1)${NC}"
+    echo -e "       Safest. Reach it remotely via Tailscale or a tunnel later."
+    echo ""
+    if [[ "$EXISTING_FOUND" == "1" ]]; then
+        echo -e "  ${DIM}Current setup: $EXISTING_HOST$([[ -n "$EXISTING_PASSWORD" ]] && echo ", password set"). Enter keeps it.${NC}"
+        echo ""
+    fi
+
+    local bind_choice=""
+    while true; do
+        echo -en "${CYAN}Choose [1/2/3] (default $default_choice):${NC} " >&2
+        read_reply bind_choice || bind_choice="$default_choice"
+        bind_choice="${bind_choice:-$default_choice}"
+        case "$bind_choice" in
+            1|2|3) break ;;
+            *) echo "Please enter 1, 2, or 3." >&2 ;;
+        esac
+    done
+
+    if [[ "$bind_choice" == "3" ]]; then
+        BIND_HOST="127.0.0.1"
+        success "Binding 127.0.0.1 (this machine only)"
+        return 0
+    fi
+
+    if [[ "$bind_choice" == "1" ]]; then
+        BIND_HOST="127.0.0.1"
+        setup_tailscale_access || true
+
+        # Password is optional here: the tailnet already authenticates devices.
+        # An existing password is always kept (never silently loosen).
+        if [[ -n "$EXISTING_PASSWORD" ]]; then
+            BIND_PASSWORD="$EXISTING_PASSWORD"
+            info "Keeping the existing dashboard password"
+        elif [[ -n "${CODEMAN_PASSWORD:-}" ]]; then
+            BIND_PASSWORD="$CODEMAN_PASSWORD"
+            info "Using CODEMAN_PASSWORD from the environment"
+        elif prompt_yes_no "Add a dashboard password too? (optional; your tailnet already authenticates your devices)" "n"; then
+            local ts_pw="" ts_pw2=""
+            while true; do
+                echo -en "${CYAN}Dashboard password:${NC} " >&2
+                read_secret ts_pw || ts_pw=""
+                if [[ -z "$ts_pw" ]]; then
+                    info "No password set"
+                    break
+                fi
+                echo -en "${CYAN}Confirm password:${NC} " >&2
+                read_secret ts_pw2 || ts_pw2=""
+                if [[ "$ts_pw" == "$ts_pw2" ]]; then
+                    BIND_PASSWORD="$ts_pw"
+                    success "Password set (login user: admin)"
+                    break
+                fi
+                echo "Passwords do not match, try again." >&2
+            done
+        fi
+        return 0
+    fi
+
+    # Keep a custom non-loopback host from a previous install (e.g. a specific
+    # interface IP); otherwise bind all interfaces.
+    if [[ "$EXISTING_FOUND" == "1" && -n "$EXISTING_HOST" && "$EXISTING_HOST" != "127.0.0.1" ]]; then
+        BIND_HOST="$EXISTING_HOST"
+    else
+        BIND_HOST="0.0.0.0"
+    fi
+
+    if [[ -n "${CODEMAN_PASSWORD:-}" ]]; then
+        BIND_PASSWORD="$CODEMAN_PASSWORD"
+        info "Using CODEMAN_PASSWORD from the environment"
+        return 0
+    fi
+
+    echo ""
+    local pw="" pw2="" keep_hint=""
+    [[ -n "$EXISTING_PASSWORD" ]] && keep_hint="Enter to keep the current one" || keep_hint="Enter to skip"
+    while true; do
+        echo -en "${CYAN}Set a dashboard password (recommended; $keep_hint):${NC} " >&2
+        read_secret pw || pw=""
+        if [[ -z "$pw" ]]; then
+            if [[ -n "$EXISTING_PASSWORD" ]]; then
+                BIND_PASSWORD="$EXISTING_PASSWORD"
+                success "Keeping the existing password"
+                break
+            fi
+            echo ""
+            warn "Without a password, EVERY device on your network gets full access"
+            warn "to your agents (they run commands as $USER)."
+            if prompt_yes_no "Continue WITHOUT a password?" "n"; then
+                BIND_ACK="1"
+                break
+            fi
+            continue
+        fi
+        echo -en "${CYAN}Confirm password:${NC} " >&2
+        read_secret pw2 || pw2=""
+        if [[ "$pw" == "$pw2" ]]; then
+            BIND_PASSWORD="$pw"
+            success "Password set (login user: admin)"
+            break
+        fi
+        echo "Passwords do not match, try again." >&2
+    done
+    return 0
+}
+
+# ============================================================================
+# Tailscale Access (loopback bind fronted by `tailscale serve` HTTPS)
+# ============================================================================
+# The recommended remote-access setup: Codeman stays on 127.0.0.1 and
+# tailscaled fronts it with a real Let's Encrypt certificate for
+# https://<node>.<tailnet>.ts.net, reachable from the user's tailnet only.
+# The app side needs zero configuration (.ts.net is in the server's trusted
+# host suffixes). All state lives in tailscaled: no marker files, `tailscale
+# serve status` is the single source of truth, and `--bg` config persists
+# across reboots on its own.
+#
+# Safety rule for every function here: NEVER `tailscale serve reset` and never
+# touch mappings other than 443 -> Codeman's port. Users may have unrelated
+# serve config (other ports, other apps) that a reset would destroy.
+
+get_tailscale_path() {
+    if command -v tailscale &>/dev/null; then
+        command -v tailscale
+        return 0
+    fi
+    # macOS GUI app (App Store or brew cask) ships the CLI inside the bundle
+    # and does not put it on PATH.
+    if [[ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]]; then
+        echo "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+        return 0
+    fi
+    return 1
+}
+
+check_tailscale() {
+    get_tailscale_path >/dev/null 2>&1
+}
+
+ts_cmd() {
+    local ts_bin
+    ts_bin=$(get_tailscale_path) || return 127
+    "$ts_bin" "$@"
+}
+
+# Serve mutations need root or "operator" rights on Linux; TS_NEED_ROOT is set
+# by ensure_tailscale_operator when the operator grant failed. Detection paths
+# run with TS_NEED_ROOT=0 and must never trigger a sudo prompt.
+ts_cmd_serve() {
+    local ts_bin
+    ts_bin=$(get_tailscale_path) || return 127
+    if [[ "$TS_NEED_ROOT" == "1" ]]; then
+        run_as_root "$ts_bin" "$@"
+    else
+        "$ts_bin" "$@"
+    fi
+}
+
+# ts_status_field <js-expr>: evaluate an expression against the parsed
+# `tailscale status --json` object bound to `s`, printing the result (empty on
+# any error). node is guaranteed at every call site (the installer installs it
+# before the binding prompt; the subcommand requires a completed install).
+ts_status_field() {
+    ts_cmd status --json 2>/dev/null | node -e '
+        let d = "";
+        process.stdin.on("data", (c) => (d += c));
+        process.stdin.on("end", () => {
+            try {
+                const s = JSON.parse(d);
+                const v = eval(process.argv[1]);
+                if (v !== undefined && v !== null && v !== false) process.stdout.write(String(v));
+            } catch {}
+        });
+    ' "$1" 2>/dev/null
+}
+
+# Print the local port that the :443 web handler proxies to, empty when 443 is
+# unconfigured. Any scheme counts (http://, and https+insecure:// from setups
+# where Codeman itself runs --https), so legacy configs are recognized as ours.
+ts_serve_443_target_port() {
+    ts_cmd_serve serve status --json 2>/dev/null | node -e '
+        let d = "";
+        process.stdin.on("data", (c) => (d += c));
+        process.stdin.on("end", () => {
+            try {
+                const s = JSON.parse(d);
+                for (const [hostport, cfg] of Object.entries(s.Web || {})) {
+                    if (!hostport.endsWith(":443")) continue;
+                    const proxy = cfg && cfg.Handlers && cfg.Handlers["/"] && cfg.Handlers["/"].Proxy;
+                    if (!proxy) continue;
+                    const m = String(proxy).match(/:(\d+)\/?$/);
+                    if (m) process.stdout.write(m[1]);
+                    return;
+                }
+            } catch {}
+        });
+    ' 2>/dev/null
+}
+
+# Print https://<node>.<tailnet>.ts.net when tailscale is running AND serve
+# already forwards 443 to Codeman's port; print nothing otherwise. Safe to call
+# anywhere (no sudo, no side effects); used by the security notice, uninstall,
+# and the re-run default.
+detect_tailscale_serve_url() {
+    check_tailscale || return 0
+    command -v node &>/dev/null || return 0
+    [[ "$(ts_status_field 's.BackendState')" == "Running" ]] || return 0
+    local port="${CODEMAN_PORT:-3000}"
+    [[ "$(ts_serve_443_target_port)" == "$port" ]] || return 0
+    local dns
+    dns=$(ts_status_field 's.Self && s.Self.DNSName')
+    [[ -n "$dns" ]] || return 0
+    echo "https://${dns%.}"
+}
+
+tailscale_retrofit_hint() {
+    warn "$1: falling back to local-only access (127.0.0.1)."
+    echo -e "  ${DIM}Set up Tailscale access any time later with:${NC} ${CYAN}bash $INSTALL_DIR/install.sh tailscale${NC}" >&2
+}
+
+offer_install_tailscale() {
+    if [[ "$NONINTERACTIVE" == "1" ]]; then
+        info "Tailscale is not installed; skipping (non-interactive runs never install it)."
+        return 1
+    fi
+    headless_guard "install Tailscale (curl | sh from tailscale.com)"
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if command -v brew &>/dev/null; then
+            if ! prompt_yes_no "Tailscale is not installed. Install it now with Homebrew?" "y"; then
+                return 1
+            fi
+            if ! brew install --cask tailscale; then
+                warn "Homebrew install failed."
+                return 1
+            fi
+            open -a Tailscale 2>/dev/null || true
+            info "Log in via the Tailscale menu-bar app if it asks."
+        else
+            info "Install the Tailscale app first: https://tailscale.com/download/macos"
+            if ! prompt_yes_no "Continue once Tailscale is installed?" "n"; then
+                return 1
+            fi
+        fi
+    else
+        if ! prompt_yes_no "Tailscale is not installed. Install it now (official installer from tailscale.com)?" "y"; then
+            return 1
+        fi
+        info "Running the official Tailscale installer (it may ask for sudo)..."
+        # When piped (curl | bash), stdin is our pipe: give the child installer
+        # the real terminal so its own sudo prompt works.
+        if [[ -e /dev/tty ]]; then
+            if ! sh -c "$(download_to_stdout https://tailscale.com/install.sh)" < /dev/tty; then
+                warn "Tailscale installation failed."
+                return 1
+            fi
+        else
+            if ! sh -c "$(download_to_stdout https://tailscale.com/install.sh)"; then
+                warn "Tailscale installation failed."
+                return 1
+            fi
+        fi
+    fi
+
+    if ! check_tailscale; then
+        warn "tailscale was not found after the install."
+        return 1
+    fi
+    success "Tailscale installed"
+    return 0
+}
+
+ensure_tailscale_login() {
+    local state
+    state=$(ts_status_field 's.BackendState')
+    if [[ "$state" == "Running" ]]; then
+        return 0
+    fi
+    if [[ "$NONINTERACTIVE" == "1" ]] || ! has_tty; then
+        warn "Tailscale is installed but not connected (state: ${state:-unknown})."
+        return 1
+    fi
+
+    info "Tailscale needs to log in to your tailnet."
+    echo -e "  ${DIM}A login URL will be printed: open it on any device. Waiting up to 5 minutes.${NC}"
+    local ts_bin up_ok="0"
+    ts_bin=$(get_tailscale_path) || return 1
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        # The GUI app's CLI runs as the user; no root needed.
+        if "$ts_bin" up --timeout=300s; then up_ok="1"; fi
+    else
+        if [[ -e /dev/tty ]]; then
+            if run_as_root "$ts_bin" up --timeout=300s < /dev/tty; then up_ok="1"; fi
+        else
+            if run_as_root "$ts_bin" up --timeout=300s; then up_ok="1"; fi
+        fi
+    fi
+    if [[ "$up_ok" != "1" ]]; then
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            info "If the CLI cannot log in, open the Tailscale app, log in there, then run:"
+            info "  bash $INSTALL_DIR/install.sh tailscale"
+        fi
+        return 1
+    fi
+    [[ "$(ts_status_field 's.BackendState')" == "Running" ]]
+}
+
+# Linux: `tailscale serve` needs root or operator rights. Grant operator once
+# (with the user's consent via sudo) so serve config never needs sudo again;
+# fall back to sudo-per-command when the grant fails.
+ensure_tailscale_operator() {
+    if [[ "$(uname -s)" == "Darwin" ]] || [[ $EUID -eq 0 ]]; then
+        return 0
+    fi
+    if ts_cmd serve status &>/dev/null; then
+        return 0
+    fi
+    if ! command -v sudo &>/dev/null; then
+        warn "No sudo available; tailscale serve configuration may fail without root."
+        TS_NEED_ROOT="1"
+        return 0
+    fi
+    info "Granting your user Tailscale 'operator' rights (one-time sudo; lets serve run without root)..."
+    local ts_bin
+    ts_bin=$(get_tailscale_path) || return 0
+    if run_as_root "$ts_bin" set --operator="$USER" 2>/dev/null && ts_cmd serve status &>/dev/null; then
+        success "Operator rights granted"
+        return 0
+    fi
+    warn "Could not grant operator rights; serve commands will use sudo."
+    TS_NEED_ROOT="1"
+    return 0
+}
+
+# HTTPS certificates are a per-tailnet admin toggle. Serve without them cannot
+# terminate TLS, and a plain-HTTP fallback would silently break the "real
+# HTTPS" promise (PWA install, web push), so guide the user through enabling
+# them instead of degrading.
+ensure_tailnet_https() {
+    while true; do
+        local magic cert
+        magic=$(ts_status_field 's.CurrentTailnet && s.CurrentTailnet.MagicDNSEnabled ? "1" : ""')
+        cert=$(ts_status_field 'Array.isArray(s.CertDomains) && s.CertDomains.length > 0 ? "1" : ""')
+        if [[ "$magic" == "1" && "$cert" == "1" ]]; then
+            return 0
+        fi
+        warn "Your tailnet has not enabled HTTPS certificates yet (a one-time admin toggle)."
+        echo -e "    Open ${CYAN}https://login.tailscale.com/admin/dns${NC} and enable:" >&2
+        if [[ "$magic" == "1" ]]; then
+            echo -e "      ${CYAN}1.${NC} MagicDNS            ${GREEN}(already on)${NC}" >&2
+        else
+            echo -e "      ${CYAN}1.${NC} MagicDNS" >&2
+        fi
+        if [[ "$cert" == "1" ]]; then
+            echo -e "      ${CYAN}2.${NC} HTTPS Certificates  ${GREEN}(already on)${NC}" >&2
+        else
+            echo -e "      ${CYAN}2.${NC} HTTPS Certificates" >&2
+        fi
+        if [[ "$NONINTERACTIVE" == "1" ]] || ! has_tty; then
+            return 1
+        fi
+        if ! prompt_yes_no "Re-check now? (answering no skips Tailscale setup)" "y"; then
+            return 1
+        fi
+    done
+}
+
+setup_tailscale_serve() {
+    local port="${CODEMAN_PORT:-3000}"
+    local dns url existing
+    dns=$(ts_status_field 's.Self && s.Self.DNSName')
+    if [[ -z "$dns" ]]; then
+        warn "Could not determine this machine's tailnet DNS name."
+        return 1
+    fi
+    url="https://${dns%.}"
+
+    existing=$(ts_serve_443_target_port)
+    if [[ "$existing" == "$port" ]]; then
+        TAILSCALE_SERVE_URL="$url"
+        success "Tailscale serve already forwards $url to port $port (kept as-is)"
+        return 0
+    fi
+    if [[ -n "$existing" ]]; then
+        warn "tailscale serve already forwards $url (port 443) to local port $existing."
+        if ! prompt_yes_no "Replace that mapping with Codeman (port $port)?" "n"; then
+            info "Keeping the existing mapping."
+            return 1
+        fi
+    fi
+
+    info "Configuring: tailscale serve --bg $port"
+    local serve_out
+    if serve_out=$(ts_cmd_serve serve --bg "$port" 2>&1); then
+        TAILSCALE_SERVE_URL="$url"
+        success "Tailscale HTTPS enabled: $url"
+        echo -e "  ${DIM}(persists across reboots; inspect with: tailscale serve status)${NC}"
+        return 0
+    fi
+    warn "tailscale serve failed:"
+    printf '%s\n' "$serve_out" | sed 's/^/    /' >&2
+    return 1
+}
+
+# Curl the ts.net URL until it answers. 200 = reachable; 401 = reachable behind
+# the dashboard password. The first request can be slow while tailscaled
+# obtains the Let's Encrypt certificate.
+verify_tailscale_access() {
+    if [[ -z "$TAILSCALE_SERVE_URL" ]]; then
+        return 0
+    fi
+    if ! command -v curl &>/dev/null; then
+        info "curl not available; open $TAILSCALE_SERVE_URL to verify."
+        return 0
+    fi
+    info "Verifying $TAILSCALE_SERVE_URL (first load can take ~30s while the HTTPS certificate is issued)..."
+    local i http_code
+    for ((i = 1; i <= 10; i++)); do
+        http_code=$(curl -skm 10 -o /dev/null -w '%{http_code}' "$TAILSCALE_SERVE_URL/api/status" 2>/dev/null) || http_code=""
+        if [[ "$http_code" == "200" || "$http_code" == "401" ]]; then
+            success "Reachable: $TAILSCALE_SERVE_URL"
+            return 0
+        fi
+        sleep 3
+    done
+    warn "Could not reach $TAILSCALE_SERVE_URL/api/status yet."
+    warn "It may need another minute (certificate issuance). Inspect: tailscale serve status"
+    warn "If Codeman itself runs with --https, the serve target must be:"
+    warn "  tailscale serve --bg https+insecure://localhost:${CODEMAN_PORT:-3000}"
+    return 1
+}
+
+# Orchestrator: walk every state (not installed -> logged out -> operator ->
+# tailnet HTTPS -> serve) and end with TAILSCALE_SERVE_URL set, or fall back
+# gracefully (the caller keeps the loopback bind either way).
+setup_tailscale_access() {
+    TAILSCALE_SERVE_URL=""
+    if ! check_tailscale; then
+        if ! offer_install_tailscale; then
+            tailscale_retrofit_hint "Tailscale is not installed"
+            return 1
+        fi
+    fi
+    if ! command -v node &>/dev/null; then
+        tailscale_retrofit_hint "node is not on PATH yet"
+        return 1
+    fi
+    if ! ensure_tailscale_login; then
+        tailscale_retrofit_hint "Tailscale is not connected"
+        return 1
+    fi
+    ensure_tailscale_operator
+    if ! ensure_tailnet_https; then
+        tailscale_retrofit_hint "HTTPS certificates are not enabled for your tailnet"
+        return 1
+    fi
+    if ! setup_tailscale_serve; then
+        tailscale_retrofit_hint "tailscale serve could not be configured"
+        return 1
+    fi
+    return 0
+}
+
+# A loopback install with Tailscale already connected but nothing fronting
+# Codeman is one command away from working remote access — and that is exactly
+# where a user lands when the first install died BEFORE the network-access
+# prompt (it runs after the build, so any build failure costs the network step
+# too) or when they finished a broken build by hand instead of re-running the
+# installer. Detect that state on re-run and offer the retrofit, rather than
+# leaving them to discover `install.sh tailscale` on their own. Never nags a
+# deliberate network bind, and never nags once a serve mapping already exists.
+maybe_offer_tailscale_repair() {
+    # A non-loopback bind already has network access; leave that choice alone.
+    if [[ "$EXISTING_FOUND" == "1" && -n "$EXISTING_HOST" && "$EXISTING_HOST" != "127.0.0.1" ]]; then
+        return 0
+    fi
+    check_tailscale || return 0
+    command -v node &>/dev/null || return 0
+    [[ "$(ts_status_field 's.BackendState')" == "Running" ]] || return 0
+    # Already fronting Codeman: nothing to repair.
+    [[ -z "$(detect_tailscale_serve_url)" ]] || return 0
+
+    echo ""
+    info "Tailscale is connected here, but no serve mapping fronts Codeman yet."
+    if [[ "$NONINTERACTIVE" == "1" ]] || ! has_tty; then
+        echo -e "  ${DIM}Enable HTTPS access from your tailnet with:${NC} ${CYAN}bash $INSTALL_DIR/install.sh tailscale${NC}"
+        return 0
+    fi
+    if ! prompt_yes_no "Set up Tailscale HTTPS access now? (your tailnet is the login; no password needed)" "y"; then
+        echo -e "  ${DIM}Any time later:${NC} ${CYAN}bash $INSTALL_DIR/install.sh tailscale${NC}"
+        return 0
+    fi
+    if setup_tailscale_access; then
+        verify_tailscale_access || true
+    fi
+    return 0
+}
+
+# `install.sh tailscale`: retrofit Tailscale access onto an existing install
+# (also the target of every "set it up later" hint above).
+setup_tailscale_subcommand() {
+    print_banner
+    if ! command -v node &>/dev/null; then
+        die "node is required. Install Codeman first (run the installer without arguments)."
+    fi
+
+    read_existing_binding
+    if [[ "$EXISTING_FOUND" == "1" && -n "$EXISTING_HOST" && "$EXISTING_HOST" != "127.0.0.1" ]]; then
+        warn "Your service binds $EXISTING_HOST (network-wide). Tailscale serve will work, but the"
+        warn "dashboard stays reachable on your LAN too. Re-run the installer and choose Tailscale"
+        warn "to switch to the tighter loopback-only bind."
+        echo ""
+    fi
+
+    if ! setup_tailscale_access; then
+        exit 1
+    fi
+
+    # Verify end-to-end only when Codeman is actually answering locally.
+    local port="${CODEMAN_PORT:-3000}" server_up="0"
+    if command -v curl &>/dev/null; then
+        if curl -skm 5 -o /dev/null "http://127.0.0.1:$port/api/status" 2>/dev/null ||
+            curl -skm 5 -o /dev/null "https://127.0.0.1:$port/api/status" 2>/dev/null; then
+            server_up="1"
+        fi
+    fi
+    if [[ "$server_up" == "1" ]]; then
+        verify_tailscale_access || true
+    else
+        info "Codeman does not appear to be running on port $port right now."
+        info "Once it is, open: $TAILSCALE_SERVE_URL"
+    fi
+
+    BIND_HOST="${EXISTING_HOST:-127.0.0.1}"
+    BIND_PASSWORD="$EXISTING_PASSWORD"
+    print_security_notice
 }
 
 # ============================================================================
 # Service Setup (Linux systemd / macOS launchd)
 # ============================================================================
+
+# Wait briefly for codeman-web.service to report active. A bad node path or a
+# busy port makes the unit crash within the first seconds (then sit in
+# activating/auto-restart), so a blind "started!" message would be a lie.
+verify_systemd_active() {
+    local attempt
+    for attempt in 1 2 3; do
+        sleep 2
+        if systemctl --user is-active --quiet codeman-web.service 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 setup_launchd_service() {
     local plist_label="com.codeman.web"
@@ -834,6 +2045,21 @@ setup_launchd_service() {
     local node_path
     node_path=$(command -v node)
 
+    # Binding chosen during install (empty on paths that never asked)
+    local bind_plist=""
+    if [[ -n "$BIND_HOST" ]]; then
+        bind_plist="    <key>CODEMAN_HOST</key>
+    <string>$BIND_HOST</string>"
+        if [[ -n "$BIND_PASSWORD" ]]; then
+            bind_plist+=$'\n'"    <key>CODEMAN_PASSWORD</key>
+    <string>$(xml_escape "$BIND_PASSWORD")</string>"
+        fi
+        if [[ "$BIND_ACK" == "1" ]]; then
+            bind_plist+=$'\n'"    <key>CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK</key>
+    <string>1</string>"
+        fi
+    fi
+
     cat > "$agent_plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -855,6 +2081,7 @@ setup_launchd_service() {
     <string>$HOME</string>
     <key>LANG</key>
     <string>en_US.UTF-8</string>
+$bind_plist
   </dict>
   <key>WorkingDirectory</key>
   <string>$HOME</string>
@@ -874,7 +2101,15 @@ EOF
 
     launchctl load "$agent_plist" 2>/dev/null || true
 
-    success "LaunchAgent installed and started"
+    # launchctl load is silent about many failures: confirm the agent is loaded
+    sleep 2
+    if launchctl list "$plist_label" &>/dev/null; then
+        success "LaunchAgent installed and started"
+        return 0
+    fi
+    warn "LaunchAgent did not load."
+    warn "Inspect: launchctl list | grep codeman ; tail -20 /tmp/codeman.log"
+    return 1
 }
 
 setup_systemd_service() {
@@ -888,6 +2123,18 @@ setup_systemd_service() {
     # Find node binary path
     local node_path
     node_path=$(command -v node)
+
+    # Binding chosen during install (empty on paths that never asked)
+    local bind_env=""
+    if [[ -n "$BIND_HOST" ]]; then
+        bind_env="Environment=CODEMAN_HOST=$BIND_HOST"
+        if [[ -n "$BIND_PASSWORD" ]]; then
+            bind_env+=$'\n'"Environment=\"CODEMAN_PASSWORD=$(systemd_env_escape "$BIND_PASSWORD")\""
+        fi
+        if [[ "$BIND_ACK" == "1" ]]; then
+            bind_env+=$'\n'"Environment=CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1"
+        fi
+    fi
 
     # Create service file
     cat > "$service_file" << EOF
@@ -903,13 +2150,21 @@ Restart=always
 RestartSec=10
 Environment=NODE_ENV=production
 Environment=PATH=$PATH
+$bind_env
 
 [Install]
 WantedBy=default.target
 EOF
 
-    # Reload systemd
-    systemctl --user daemon-reload
+    # Reload systemd. A user D-Bus session is required for systemctl --user
+    # (missing under bare `ssh host 'curl | bash'` provisioning), so detect
+    # that up front instead of dying mid-setup with a cryptic trap message.
+    if ! systemctl --user daemon-reload 2>/dev/null; then
+        warn "systemctl --user is unavailable (no user D-Bus session?); cannot manage user services here."
+        warn "Unit written to $service_file. From a normal login shell, enable it with:"
+        warn "  systemctl --user daemon-reload && systemctl --user enable --now codeman-web"
+        return 1
+    fi
 
     # Enable service
     systemctl --user enable codeman-web.service 2>/dev/null || true
@@ -919,10 +2174,17 @@ EOF
         loginctl enable-linger "$USER" 2>/dev/null || true
     fi
 
-    # Start the service immediately
-    systemctl --user start codeman-web.service 2>/dev/null || true
+    # (Re)start the service. restart, not start: on a re-run over an existing
+    # running service, start would be a no-op and leave the OLD build running.
+    systemctl --user restart codeman-web.service 2>/dev/null || true
 
-    success "Systemd service installed and started"
+    if verify_systemd_active; then
+        success "Systemd service installed and started"
+        return 0
+    fi
+    warn "codeman-web.service did not become active."
+    warn "Inspect: systemctl --user status codeman-web ; journalctl --user -u codeman-web -e"
+    return 1
 }
 
 setup_tunnel_service() {
@@ -944,6 +2206,29 @@ setup_tunnel_service() {
 # ============================================================================
 # Installation Helpers
 # ============================================================================
+
+# npm install with an actionable message for the failure that actually happens
+# on a fresh Linux box: no toolchain, so node-pty cannot compile.
+npm_install_deps() {
+    if npm install --quiet --no-fund --no-audit 2>/dev/null; then
+        return 0
+    fi
+    if npm install --no-fund --no-audit; then
+        return 0
+    fi
+
+    error "npm install failed."
+    if [[ "$(detect_os)" == "linux" ]] && ! check_build_tools; then
+        error "Missing native build tools: $(missing_build_tools)"
+        error "node-pty has no Linux prebuilds, so it must compile from source."
+        error "Install them and re-run this installer:"
+        error "  Debian/Ubuntu:  sudo apt-get install -y build-essential python3"
+        error "  Fedora/RHEL:    sudo dnf install -y gcc gcc-c++ make python3"
+        error "  Arch:           sudo pacman -S --noconfirm base-devel python"
+        error "  Alpine:         sudo apk add build-base python3"
+    fi
+    exit 1
+}
 
 install_dependency() {
     local dep_name="$1"
@@ -1006,6 +2291,7 @@ main() {
     # Git
     info "Checking Git..."
     if ! check_git; then
+        headless_guard "install Git (system package via sudo)"
         if prompt_yes_no "Git is not installed. Install it now?"; then
             install_dependency "git" "$os" "$distro"
         else
@@ -1024,6 +2310,7 @@ main() {
             warn "Node.js $node_version is installed but version $MIN_NODE_VERSION+ is required."
         fi
 
+        headless_guard "install Node.js v$TARGET_NODE_VERSION (system package via sudo)"
         if prompt_yes_no "Install Node.js v$TARGET_NODE_VERSION?"; then
             install_dependency "node" "$os" "$distro"
 
@@ -1048,6 +2335,7 @@ main() {
     if check_tmux; then
         success "tmux is installed"
     else
+        headless_guard "install tmux (system package via sudo)"
         if prompt_yes_no "tmux is not installed. Install it now?"; then
             install_dependency "tmux" "$os" "$distro"
         else
@@ -1055,9 +2343,41 @@ main() {
         fi
     fi
 
-    # AI CLI (at least one required: Claude Code or OpenCode)
+    # Native build toolchain. node-pty compiles from source on Linux, so this is
+    # a hard requirement there, not a nicety.
+    if [[ "$os" == "linux" ]]; then
+        info "Checking build tools (node-pty compiles from source on Linux)..."
+        local missing_tools
+        missing_tools="$(missing_build_tools)"
+        if [[ -z "$missing_tools" ]]; then
+            success "Build tools are installed"
+        else
+            warn "Missing build tools: $missing_tools"
+            headless_guard "install build tools (system package via sudo)"
+            if prompt_yes_no "Install the build tools now?"; then
+                install_dependency "buildtools" "$os" "$distro"
+                hash -r 2>/dev/null || true
+                missing_tools="$(missing_build_tools)"
+                if [[ -n "$missing_tools" ]]; then
+                    die "Build tools still missing after install: $missing_tools. Install them manually and re-run."
+                fi
+                success "Build tools installed"
+            else
+                die "A build toolchain (make, g++, python3) is required: node-pty has no Linux prebuilds and compiles from source."
+            fi
+        fi
+    fi
+
+    # AI CLI (Codeman drives one of: Claude Code, OpenCode, Codex, Gemini, Antigravity, Pi)
     local has_claude=false
     local has_opencode=false
+    local has_codex=false
+    local has_gemini=false
+    local has_antigravity=false
+    local has_pi=false
+    local has_grok=false
+    local has_dsh=false
+    local has_omp=false
 
     info "Checking AI CLI tools..."
     if check_claude; then
@@ -1068,28 +2388,59 @@ main() {
         has_opencode=true
         success "OpenCode found at $(get_opencode_path)"
     fi
+    if check_codex; then
+        has_codex=true
+        success "Codex found at $(get_codex_path)"
+    fi
+    if check_gemini; then
+        has_gemini=true
+        success "Gemini CLI found at $(get_gemini_path)"
+    fi
+    if check_antigravity; then
+        has_antigravity=true
+        success "Antigravity CLI found at $(get_antigravity_path)"
+    fi
+    if check_pi; then
+        has_pi=true
+        success "Pi CLI found at $(get_pi_path)"
+    fi
+    if check_grok; then
+        has_grok=true
+        success "Grok CLI found at $(get_grok_path)"
+    fi
+    if check_dsh; then
+        has_dsh=true
+        success "DeepSeek Harness found at $(get_dsh_path)"
+    fi
+    if check_omp; then
+        has_omp=true
+        success "OMP CLI found at $(get_omp_path)"
+    fi
 
-    if [[ "$has_claude" == "false" ]] && [[ "$has_opencode" == "false" ]]; then
+    if [[ "$has_claude" == "false" && "$has_opencode" == "false" && "$has_codex" == "false" && "$has_gemini" == "false" && "$has_antigravity" == "false" && "$has_pi" == "false" && "$has_grok" == "false" && "$has_dsh" == "false" && "$has_omp" == "false" ]]; then
         echo ""
-        warn "No AI CLI found. Codeman requires at least one: Claude Code or OpenCode."
+        warn "No AI CLI found. Codeman needs at least one: Claude Code, OpenCode, Codex, Antigravity, Gemini, Pi, Grok, DeepSeek Harness, or OMP."
+        headless_guard "install an AI CLI (curl | bash from its vendor)"
         echo ""
         echo -e "  ${BOLD}Which AI CLI would you like to install?${NC}"
         echo -e "    ${CYAN}1)${NC} Claude Code  (Anthropic)"
         echo -e "    ${CYAN}2)${NC} OpenCode     (open-source)"
         echo -e "    ${CYAN}3)${NC} Both"
+        echo -e "    ${CYAN}4)${NC} Skip         (I'll install one myself, e.g. Codex, Antigravity, Gemini, Pi, Grok, DeepSeek Harness or OMP)"
         echo ""
 
         local cli_choice=""
-        if [[ "$NONINTERACTIVE" == "1" ]] || [[ ! -t 0 ]]; then
-            # Non-interactive: default to Claude Code
+        if [[ "$NONINTERACTIVE" == "1" ]] || ! has_tty; then
+            # Explicit automation opt-in: default to Claude Code
             cli_choice="1"
+            info "CODEMAN_NONINTERACTIVE=1: defaulting to Claude Code"
         else
             while true; do
-                echo -en "${CYAN}Choose [1/2/3]:${NC} " >&2
-                read -r cli_choice
+                echo -en "${CYAN}Choose [1/2/3/4]:${NC} " >&2
+                read_reply cli_choice || { cli_choice="1"; break; }
                 case "$cli_choice" in
-                    1|2|3) break ;;
-                    *) echo "Please enter 1, 2, or 3." >&2 ;;
+                    1|2|3|4) break ;;
+                    *) echo "Please enter 1, 2, 3, or 4." >&2 ;;
                 esac
             done
         fi
@@ -1118,8 +2469,14 @@ main() {
             fi
         fi
 
-        if [[ "$has_claude" == "false" ]] && [[ "$has_opencode" == "false" ]]; then
-            die "At least one AI CLI is required. Install manually and re-run the installer."
+        if [[ "$cli_choice" == "4" ]]; then
+            warn "Skipping AI CLI install. Codeman will run, but sessions need a CLI to drive."
+            info "Install one later, e.g.: npm install -g @openai/codex                          (Codex)"
+            info "                    or: curl -fsSL https://antigravity.google/cli/install.sh | bash  (Antigravity)"
+            info "                    or: npm install -g --ignore-scripts @earendil-works/pi-coding-agent   (Pi)"
+            info "                    or: curl -fsSL https://x.ai/cli/install.sh | bash                     (Grok)"
+        elif [[ "$has_claude" == "false" ]] && [[ "$has_opencode" == "false" ]]; then
+            die "The selected AI CLI failed to install. Install one manually and re-run the installer."
         fi
     fi
 
@@ -1183,7 +2540,7 @@ main() {
     # ========================================================================
 
     info "Installing dependencies..."
-    npm install --quiet --no-fund --no-audit 2>/dev/null || npm install --no-fund --no-audit
+    npm_install_deps
 
     info "Building..."
     npm run build --quiet 2>/dev/null || npm run build
@@ -1201,19 +2558,30 @@ main() {
         ln -sf "$INSTALL_DIR/dist/index.js" "$symlink_dir/codeman"
         info "Created symlink: $symlink_dir/codeman"
 
-        # Install tmux-chooser as 'tmux-chooser' command
-        if [[ -f "$INSTALL_DIR/scripts/tmux-chooser.sh" ]]; then
-            ln -sf "$INSTALL_DIR/scripts/tmux-chooser.sh" "$symlink_dir/tmux-chooser"
-            info "Created symlink: $symlink_dir/tmux-chooser"
-            # Add 'sc' alias for quick access
-            setup_sc_alias
+        # tmux-chooser/`sc` is retired; `codeman tui` replaces it. Sweep up what
+        # an older installer left behind, so an update does not leave a symlink
+        # pointing at a script this version no longer ships.
+        if [[ -L "$symlink_dir/tmux-chooser" ]]; then
+            rm -f "$symlink_dir/tmux-chooser"
+            info "Removed the retired tmux-chooser symlink (use: codeman tui)"
         fi
+        remove_sc_alias
 
         # Add ~/.local/bin to PATH if not already there
         if [[ ":$PATH:" != *":$symlink_dir:"* ]]; then
             add_to_path "$symlink_dir"
         fi
     fi
+
+    # ========================================================================
+    # Mark install complete
+    # ========================================================================
+
+    # The dispatcher at the bottom only routes a bare re-run to the quiet
+    # update path when this marker exists, so an aborted first install
+    # (failed npm install/build, Ctrl+C) re-runs the full setup flow
+    # (symlinks, PATH, launch menu) instead of silently "updating".
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$INSTALL_DIR/.install-complete"
 
     # ========================================================================
     # Launch Options
@@ -1223,6 +2591,11 @@ main() {
     echo -e "${GREEN}${BOLD}============================================================${NC}"
     echo -e "${GREEN}${BOLD}  Codeman installed successfully!${NC}"
     echo -e "${GREEN}${BOLD}============================================================${NC}"
+    echo ""
+
+    # Ask how the dashboard should be reachable BEFORE the launch menu, so the
+    # service files and the run-now path all inherit the choice.
+    choose_network_binding
     echo ""
 
     local launch_choice=""
@@ -1248,12 +2621,13 @@ main() {
         echo -e "    ${CYAN}3)${NC} Don't start — I'll run it later"
         echo ""
 
-        if [[ "$NONINTERACTIVE" == "1" ]] || [[ ! -t 0 ]]; then
+        if [[ "$NONINTERACTIVE" == "1" ]] || ! has_tty; then
             launch_choice="3"
+            info "No interactive terminal detected: not starting (run 'codeman web' when ready)"
         else
             while true; do
                 echo -en "${CYAN}Choose [1/2/3]:${NC} " >&2
-                read -r launch_choice
+                read_reply launch_choice || { launch_choice="3"; break; }
                 case "$launch_choice" in
                     1|2|3) break ;;
                     *) echo "Please enter 1, 2, or 3." >&2 ;;
@@ -1268,12 +2642,13 @@ main() {
         echo -e "    ${CYAN}2)${NC} Don't start — I'll run it later"
         echo ""
 
-        if [[ "$NONINTERACTIVE" == "1" ]] || [[ ! -t 0 ]]; then
+        if [[ "$NONINTERACTIVE" == "1" ]] || ! has_tty; then
             launch_choice="2"
+            info "No interactive terminal detected: not starting (run 'codeman web' when ready)"
         else
             while true; do
                 echo -en "${CYAN}Choose [1/2]:${NC} " >&2
-                read -r launch_choice
+                read_reply launch_choice || { launch_choice="2"; break; }
                 case "$launch_choice" in
                     1) break ;;
                     2) break ;;
@@ -1289,14 +2664,16 @@ main() {
 
     # Handle service setup
     if [[ "$launch_choice" == "2" ]]; then
+        local service_ok=true
         if [[ "$service_type" == "launchd" ]]; then
-            setup_launchd_service
+            setup_launchd_service || service_ok=false
         else
-            setup_systemd_service
+            setup_systemd_service || service_ok=false
         fi
 
-        # Offer tunnel service if cloudflared is available (Linux only — systemd tunnel service)
-        if [[ "$service_type" == "systemd" ]] && check_cloudflared && [[ -f "$INSTALL_DIR/scripts/codeman-tunnel.service" ]]; then
+        # Offer tunnel service if cloudflared is available (Linux only: systemd tunnel service).
+        # Skipped when service setup failed: it needs the same systemctl --user access.
+        if [[ "$service_ok" == "true" ]] && [[ "$service_type" == "systemd" ]] && check_cloudflared && [[ -f "$INSTALL_DIR/scripts/codeman-tunnel.service" ]]; then
             echo ""
             if prompt_yes_no "Also set up Cloudflare tunnel service? (requires CODEMAN_PASSWORD)" "n"; then
                 setup_tunnel_service
@@ -1304,10 +2681,29 @@ main() {
         fi
 
         echo ""
-        echo -e "  ${GREEN}${BOLD}Codeman is running now!${NC}"
-        echo ""
-        echo -e "    ${CYAN}# Open in browser${NC}"
-        echo -e "    http://localhost:3000"
+        if [[ "$service_ok" == "true" ]]; then
+            # With Tailscale configured, prove the URL actually answers now
+            # that the server is up (never claim success blindly).
+            if [[ -n "$TAILSCALE_SERVE_URL" ]]; then
+                verify_tailscale_access || true
+                echo ""
+            fi
+            echo -e "  ${GREEN}${BOLD}Codeman is running now!${NC}"
+            echo ""
+            echo -e "    ${CYAN}# Open in browser${NC}"
+            if [[ -n "$TAILSCALE_SERVE_URL" ]]; then
+                echo -e "    $TAILSCALE_SERVE_URL   ${DIM}(any device on your tailnet, HTTPS)${NC}"
+                echo -e "    http://localhost:3000       ${DIM}(this machine)${NC}"
+            elif [[ "$BIND_HOST" == "0.0.0.0" ]]; then
+                echo -e "    http://$(detect_lan_ip):3000   ${DIM}(any device on your network)${NC}"
+                echo -e "    http://localhost:3000       ${DIM}(this machine)${NC}"
+            else
+                echo -e "    http://localhost:3000"
+            fi
+        else
+            echo -e "  ${YELLOW}${BOLD}The service was set up but is not running yet${NC} (see warnings above)."
+            echo -e "  ${DIM}You can always run it directly:${NC} ${CYAN}codeman web${NC}"
+        fi
         echo ""
         echo -e "  ${BOLD}Manage the service:${NC}"
         echo ""
@@ -1328,11 +2724,34 @@ main() {
     if [[ "$launch_choice" != "2" ]]; then
         echo -e "  ${BOLD}Quick Start:${NC}"
         echo ""
-        echo -e "    ${CYAN}codeman web${NC}            # Start the web server"
-        echo -e "    ${CYAN}codeman web --https${NC}    # With HTTPS (for remote access)"
+        if [[ "$BIND_HOST" == "0.0.0.0" ]]; then
+            if [[ -n "$BIND_PASSWORD" ]]; then
+                echo -e "    ${CYAN}CODEMAN_HOST=0.0.0.0 CODEMAN_PASSWORD='<your-password>' codeman web${NC}"
+            else
+                echo -e "    ${CYAN}CODEMAN_HOST=0.0.0.0 codeman web${NC}"
+            fi
+            echo -e "    ${DIM}(a bare 'codeman web' binds 127.0.0.1, this machine only)${NC}"
+            echo ""
+            echo -e "    ${CYAN}# Open in browser${NC}"
+            echo -e "    http://$(detect_lan_ip):3000   ${DIM}(any device on your network)${NC}"
+        else
+            echo -e "    ${CYAN}codeman web${NC}            # Start the web server"
+            echo -e "    ${CYAN}codeman web --https${NC}    # With HTTPS (for remote access)"
+            echo ""
+            echo -e "    ${CYAN}# Open in browser${NC}"
+            echo -e "    http://localhost:3000"
+            if [[ -n "$TAILSCALE_SERVE_URL" ]]; then
+                echo -e "    $TAILSCALE_SERVE_URL   ${DIM}(any device on your tailnet, once running)${NC}"
+            fi
+        fi
         echo ""
-        echo -e "    ${CYAN}# Open in browser${NC}"
-        echo -e "    http://localhost:3000"
+    fi
+
+    if [[ -n "$TAILSCALE_SERVE_URL" ]]; then
+        echo -e "  ${BOLD}Remote Access (Tailscale):${NC}"
+        echo ""
+        echo -e "    $TAILSCALE_SERVE_URL   ${DIM}(HTTPS, any device on your tailnet)${NC}"
+        echo -e "    ${CYAN}tailscale serve status${NC}      # Inspect the mapping"
         echo ""
     fi
 
@@ -1347,21 +2766,33 @@ main() {
 
     echo -e "  ${BOLD}Mobile Access (Termius/SSH):${NC}"
     echo ""
-    echo -e "    ${CYAN}sc${NC}              # Interactive tmux session chooser"
-    echo -e "    ${CYAN}sc 2${NC}            # Quick attach to session 2"
-    echo -e "    ${CYAN}sc -h${NC}           # Help"
+    echo -e "    ${CYAN}codeman tui${NC}     # Full-screen session dashboard"
+    echo -e "    ${CYAN}codeman tui 2${NC}   # Attach straight to session 2"
+    echo -e "    ${CYAN}codeman tui -l${NC}  # Numbered list, then exit"
     echo ""
 
     echo -e "  ${BOLD}Documentation:${NC}"
     echo -e "    https://github.com/Ark0N/Codeman"
     echo ""
 
-    if ! check_claude && ! check_opencode; then
+    if ! check_claude && ! check_opencode && ! check_codex && ! check_gemini && ! check_antigravity && ! check_pi && ! check_grok && ! check_dsh && ! check_omp; then
         echo -e "  ${YELLOW}${BOLD}Reminder:${NC} Install at least one AI CLI to start using Codeman:"
-        echo -e "    ${CYAN}curl -fsSL https://claude.ai/install.sh | bash${NC}  # Claude Code"
-        echo -e "    ${CYAN}curl -fsSL https://opencode.ai/install | bash${NC}   # OpenCode"
+        echo -e "    ${CYAN}curl -fsSL https://claude.ai/install.sh | bash${NC}                # Claude Code"
+        echo -e "    ${CYAN}curl -fsSL https://opencode.ai/install | bash${NC}                 # OpenCode"
+        echo -e "    ${CYAN}npm install -g @openai/codex${NC}                                  # Codex"
+        echo -e "    ${CYAN}curl -fsSL https://antigravity.google/cli/install.sh | bash${NC}   # Antigravity"
+        echo -e "    ${CYAN}npm install -g --ignore-scripts @earendil-works/pi-coding-agent${NC}  # Pi"
+        echo -e "    ${CYAN}curl -fsSL https://x.ai/cli/install.sh | bash${NC}                 # Grok"
+        echo -e "    ${CYAN}curl -fsSL https://omp.sh/install | sh${NC}                        # OMP"
         echo ""
+        echo -e "  DeepSeek Harness has no vendor one-liner — install it from within Codeman"
+        echo -e "  once the server is up (Run dropdown → Install DeepSeek Profile, or see"
+        echo -e "  docs/deepseek-integration.md)."
     fi
+
+    # Security notice — last informational block so it stays visible (when not
+    # auto-launching below; if we exec, the server prints the same notice anyway).
+    print_security_notice
 
     # Run now in foreground (must be last — exec replaces the shell)
     if [[ "$launch_choice" == "1" ]]; then
@@ -1375,6 +2806,11 @@ main() {
         # Source profile to pick up PATH changes, then exec codeman
         # shellcheck disable=SC1090
         source "$profile" 2>/dev/null || true
+        if [[ -n "$BIND_HOST" ]]; then
+            export CODEMAN_HOST="$BIND_HOST"
+            [[ -n "$BIND_PASSWORD" ]] && export CODEMAN_PASSWORD="$BIND_PASSWORD"
+            [[ "$BIND_ACK" == "1" ]] && export CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1
+        fi
         exec node "$INSTALL_DIR/dist/index.js" web
     fi
 }
@@ -1387,10 +2823,26 @@ update() {
     info "Updating Codeman..."
     cd "$INSTALL_DIR"
     git remote set-url origin "$REPO_URL" 2>/dev/null || true
+
+    # Never blow away local changes silently (this used to be an unconditional
+    # reset --hard). Interactive users get a choice; headless runs auto-stash
+    # so the changes stay recoverable, the same policy as scripts/self-update.sh.
+    if ! git diff --quiet 2>/dev/null || ! git diff --staged --quiet 2>/dev/null; then
+        warn "Local changes detected in $INSTALL_DIR"
+        if prompt_yes_no "Stash local changes and update? (recover with: git stash pop)"; then
+            git stash push --quiet -m "codeman-installer auto-stash $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            info "Local changes stashed (see 'git stash list' in $INSTALL_DIR)"
+        else
+            info "Keeping local changes; update skipped."
+            return 0
+        fi
+    fi
+
     git fetch --quiet origin
     git reset --hard "origin/$BRANCH" --quiet
-    npm install --quiet --no-fund --no-audit 2>/dev/null || npm install --no-fund --no-audit
+    npm_install_deps
     npm run build --quiet 2>/dev/null || npm run build
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$INSTALL_DIR/.install-complete"
     success "Updated to $(node -e "console.log(require('./package.json').version)")"
     echo ""
 
@@ -1398,8 +2850,13 @@ update() {
     local agent_plist="$HOME/Library/LaunchAgents/com.codeman.web.plist"
     if systemctl --user is-active codeman-web.service &>/dev/null 2>&1; then
         info "Restarting codeman-web service..."
-        systemctl --user restart codeman-web.service
-        success "codeman-web service restarted"
+        systemctl --user restart codeman-web.service 2>/dev/null || true
+        if verify_systemd_active; then
+            success "codeman-web service restarted"
+        else
+            warn "codeman-web.service did not come back up."
+            warn "Inspect: systemctl --user status codeman-web ; journalctl --user -u codeman-web -e"
+        fi
     elif [[ -f "$agent_plist" ]]; then
         info "Restarting LaunchAgent..."
         launchctl unload "$agent_plist" 2>/dev/null || true
@@ -1410,6 +2867,21 @@ update() {
         echo -e "    ${CYAN}pkill -f 'codeman.*web'; codeman web &${NC}"
     fi
     echo ""
+
+    # Reflect the service's actual binding in the closing notice. Updates
+    # never rewrite the service files, so the existing choice is authoritative.
+    read_existing_binding
+    if [[ "$EXISTING_FOUND" == "1" ]]; then
+        BIND_HOST="$EXISTING_HOST"
+        BIND_PASSWORD="$EXISTING_PASSWORD"
+        BIND_ACK="$EXISTING_ACK"
+    fi
+
+    # An update is the only place a half-configured install gets a second
+    # chance at remote access; the fresh-install path asks outright.
+    maybe_offer_tailscale_repair
+
+    print_security_notice
 }
 
 uninstall() {
@@ -1449,6 +2921,20 @@ uninstall() {
         success "Removed LaunchDaemon"
     fi
 
+    # Remove OUR tailscale serve mapping (443 -> Codeman's port) only. Other
+    # serve config stays untouched, and never `tailscale serve reset`.
+    local ts_url=""
+    ts_url=$(detect_tailscale_serve_url 2>/dev/null) || ts_url=""
+    if [[ -n "$ts_url" ]]; then
+        if prompt_yes_no "Remove the Tailscale serve mapping for Codeman ($ts_url)?" "y"; then
+            if ts_cmd_serve serve --https=443 off 2>/dev/null; then
+                success "Removed tailscale serve mapping"
+            else
+                warn "Could not remove it automatically. Run: tailscale serve --https=443 off"
+            fi
+        fi
+    fi
+
     # Remove symlinks
     local symlink_dir="$HOME/.local/bin"
     if [[ -L "$symlink_dir/codeman" ]]; then
@@ -1459,6 +2945,7 @@ uninstall() {
         rm -f "$symlink_dir/tmux-chooser"
         success "Removed symlink: $symlink_dir/tmux-chooser"
     fi
+    remove_sc_alias
 
     # Remove install directory
     if [[ -d "$INSTALL_DIR" ]]; then
@@ -1466,6 +2953,9 @@ uninstall() {
             rm -rf "$INSTALL_DIR"
             success "Removed $INSTALL_DIR"
         else
+            # Clear the marker so a future installer run does full setup again
+            # (the symlinks and services being removed here need recreating).
+            rm -f "$INSTALL_DIR/.install-complete"
             info "Kept $INSTALL_DIR"
         fi
     fi
@@ -1494,8 +2984,12 @@ uninstall() {
 case "${1:-}" in
     update)    update ;;
     uninstall) uninstall ;;
+    tailscale) setup_tailscale_subcommand ;;
     *)
-        if [[ -z "${1:-}" && -d "$INSTALL_DIR/.git" ]]; then
+        # Only a COMPLETED install re-runs as a quiet update. A partial one
+        # (clone succeeded but build/menu never finished) lacks the marker and
+        # re-runs the full flow, so a failed first attempt can actually finish.
+        if [[ -z "${1:-}" && -d "$INSTALL_DIR/.git" && -f "$INSTALL_DIR/.install-complete" ]]; then
             print_banner
             update
         else

@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { WebServer } from '../src/web/server.js';
-import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { safeRmHomeTree } from './mocks/index.js';
 
 const TEST_PORT = 3110;
 const CASES_DIR = join(homedir(), 'codeman-cases');
@@ -19,13 +19,12 @@ describe('Edge Cases and Error Handling', () => {
   });
 
   afterEach(() => {
-    // Clean up cases created during this test
+    // Clean up cases created during this test. SAFETY: CASES_DIR is
+    // homedir()-derived, which on some platforms ignores the test HOME — the
+    // containment gate refuses to delete anything not under the temp HOME.
     while (createdCases.length > 0) {
       const caseName = createdCases.pop()!;
-      const casePath = join(CASES_DIR, caseName);
-      if (existsSync(casePath)) {
-        rmSync(casePath, { recursive: true, force: true });
-      }
+      safeRmHomeTree(join(CASES_DIR, caseName));
     }
   });
 
@@ -41,14 +40,14 @@ describe('Edge Cases and Error Handling', () => {
       const data = await response.json();
 
       expect(data.success).toBe(false);
-      expect(data.error).toBe('Session not found');
+      expect(data.error).toContain('not found');
     });
 
     it('should handle getting non-existent session gracefully', async () => {
       const response = await fetch(`${baseUrl}/api/sessions/non-existent-id-12345`);
       const data = await response.json();
 
-      expect(data.error).toBe('Session not found');
+      expect(data.error).toContain('not found');
     });
 
     it('should handle running prompt on non-existent session', async () => {
@@ -59,7 +58,7 @@ describe('Edge Cases and Error Handling', () => {
       });
       const data = await response.json();
 
-      expect(data.error).toBe('Session not found');
+      expect(data.error).toContain('not found');
     });
 
     it('should handle input to non-existent session', async () => {
@@ -70,7 +69,7 @@ describe('Edge Cases and Error Handling', () => {
       });
       const data = await response.json();
 
-      expect(data.error).toBe('Session not found');
+      expect(data.error).toContain('not found');
     });
 
     it('should handle resize on non-existent session', async () => {
@@ -81,7 +80,7 @@ describe('Edge Cases and Error Handling', () => {
       });
       const data = await response.json();
 
-      expect(data.error).toBe('Session not found');
+      expect(data.error).toContain('not found');
     });
 
     it('should handle interactive mode on non-existent session', async () => {
@@ -90,21 +89,21 @@ describe('Edge Cases and Error Handling', () => {
       });
       const data = await response.json();
 
-      expect(data.error).toBe('Session not found');
+      expect(data.error).toContain('not found');
     });
 
     it('should handle terminal buffer request on non-existent session', async () => {
       const response = await fetch(`${baseUrl}/api/sessions/non-existent/terminal`);
       const data = await response.json();
 
-      expect(data.error).toBe('Session not found');
+      expect(data.error).toContain('not found');
     });
 
     it('should handle output request on non-existent session', async () => {
       const response = await fetch(`${baseUrl}/api/sessions/non-existent/output`);
       const data = await response.json();
 
-      expect(data.error).toBe('Session not found');
+      expect(data.error).toContain('not found');
     });
   });
 
@@ -190,7 +189,7 @@ describe('Edge Cases and Error Handling', () => {
 
       // Should succeed with valid characters, even if long
       if (data.success) {
-        createdCases.push(longName);
+        createdCases.push(data.data.caseName);
       }
       // Either succeeds or fails gracefully
       expect(data).toHaveProperty('success');
@@ -202,8 +201,8 @@ describe('Edge Cases and Error Handling', () => {
       const response = await fetch(`${baseUrl}/api/sessions/non-existent/respawn`);
       const data = await response.json();
 
-      expect(data.enabled).toBe(false);
-      expect(data.status).toBeNull();
+      expect(data.data.enabled).toBe(false);
+      expect(data.data.status).toBeNull();
     });
 
     it('should handle starting respawn on non-existent session', async () => {
@@ -212,7 +211,7 @@ describe('Edge Cases and Error Handling', () => {
       });
       const data = await response.json();
 
-      expect(data.error).toBe('Session not found');
+      expect(data.error).toContain('not found');
     });
 
     it('should handle stopping non-existent respawn controller', async () => {
@@ -221,7 +220,10 @@ describe('Edge Cases and Error Handling', () => {
       });
       const data = await response.json();
 
-      expect(data.error).toBe('Respawn controller not found');
+      // respawn/stop now owner-gates via findSessionOrFail first (multi-user #18), so a
+      // non-existent session id 404s as "Session ... not found" (same not-found semantics,
+      // matching the sibling start/config/enable handlers).
+      expect(data.error).toContain('not found');
     });
 
     it('should handle updating config on non-existent session', async () => {
@@ -232,7 +234,7 @@ describe('Edge Cases and Error Handling', () => {
       });
       const data = await response.json();
 
-      expect(data.error).toBe('Session not found');
+      expect(data.error).toContain('not found');
     });
   });
 
@@ -272,30 +274,32 @@ describe('Concurrent Session Handling', () => {
 
   it('should handle multiple sessions simultaneously', async () => {
     // Create multiple sessions concurrently
-    const createPromises = Array(5).fill(null).map(() =>
-      fetch(`${baseUrl}/api/sessions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workingDir: '/tmp' }),
-      }).then(r => r.json())
-    );
+    const createPromises = Array(5)
+      .fill(null)
+      .map(() =>
+        fetch(`${baseUrl}/api/sessions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ workingDir: '/tmp' }),
+        }).then((r) => r.json())
+      );
 
     const results = await Promise.all(createPromises);
 
     // All should succeed
     for (const result of results) {
       expect(result.success).toBe(true);
-      expect(result.session.id).toBeDefined();
+      expect(result.data.session.id).toBeDefined();
     }
 
     // Verify sessions are listed
     const listRes = await fetch(`${baseUrl}/api/sessions`);
     const sessions = await listRes.json();
-    expect(sessions.length).toBeGreaterThanOrEqual(5);
+    expect(sessions.data.length).toBeGreaterThanOrEqual(5);
 
     // Clean up - delete all created sessions
     for (const result of results) {
-      await fetch(`${baseUrl}/api/sessions/${result.session.id}`, {
+      await fetch(`${baseUrl}/api/sessions/${result.data.session.id}`, {
         method: 'DELETE',
       });
     }
@@ -315,7 +319,7 @@ describe('Concurrent Session Handling', () => {
       expect(createData.success).toBe(true);
 
       // Delete immediately
-      const deleteRes = await fetch(`${baseUrl}/api/sessions/${createData.session.id}`, {
+      const deleteRes = await fetch(`${baseUrl}/api/sessions/${createData.data.session.id}`, {
         method: 'DELETE',
       });
       const deleteData = await deleteRes.json();
@@ -327,32 +331,26 @@ describe('Concurrent Session Handling', () => {
     const caseNames = ['concurrent-test-1', 'concurrent-test-2', 'concurrent-test-3'];
     const createdCases: string[] = [];
 
-    const quickStartPromises = caseNames.map(name =>
+    const quickStartPromises = caseNames.map((name) =>
       fetch(`${baseUrl}/api/quick-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ caseName: `${name}-${Date.now()}` }),
-      }).then(r => r.json())
+      }).then((r) => r.json())
     );
 
     const results = await Promise.all(quickStartPromises);
 
     for (const result of results) {
       expect(result.success).toBe(true);
-      if (result.caseName) {
-        createdCases.push(result.caseName);
+      if (result.data.caseName) {
+        createdCases.push(result.data.caseName);
       }
     }
 
-    // Cleanup
-    const { rmSync, existsSync } = await import('node:fs');
-    const { join } = await import('node:path');
-    const { homedir } = await import('node:os');
+    // Cleanup (containment-gated: never touch prod ~/codeman-cases)
     for (const name of createdCases) {
-      const path = join(homedir(), 'codeman-cases', name);
-      if (existsSync(path)) {
-        rmSync(path, { recursive: true, force: true });
-      }
+      safeRmHomeTree(join(homedir(), 'codeman-cases', name));
     }
   });
 });

@@ -65,7 +65,7 @@ describe('push-routes', () => {
         expect.objectContaining({
           endpoint: 'https://push.example.com/send/abc123',
           keys: { p256dh: 'test-p256dh-key', auth: 'test-auth-key' },
-        }),
+        })
       );
     });
 
@@ -87,7 +87,7 @@ describe('push-routes', () => {
         expect.objectContaining({
           userAgent: 'TestBrowser/1.0',
           pushPreferences: { 'session:idle': true, 'session:error': false },
-        }),
+        })
       );
     });
 
@@ -99,7 +99,7 @@ describe('push-routes', () => {
           keys: { p256dh: 'test-p256dh', auth: 'test-auth' },
         },
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -112,7 +112,7 @@ describe('push-routes', () => {
           endpoint: 'https://push.example.com/send/abc123',
         },
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -131,7 +131,11 @@ describe('push-routes', () => {
       });
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(true);
+      // Handler returns a bare {} on success; the uniform envelope wraps it to
+      // { success:true, data:{} } in production. At the route-handler layer the
+      // harness sees the bare return, so the meaningful check is the empty body
+      // plus the pushStore call below.
+      expect(body).toEqual({});
       expect(harness.ctx.pushStore.updatePreferences).toHaveBeenCalledWith('sub-123', {
         'session:idle': true,
         'session:error': true,
@@ -160,7 +164,7 @@ describe('push-routes', () => {
         url: '/api/push/subscribe/sub-123',
         payload: {},
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
     });
@@ -176,7 +180,11 @@ describe('push-routes', () => {
       });
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(true);
+      // Handler returns a bare {} on success; the uniform envelope wraps it to
+      // { success:true, data:{} } in production. At the route-handler layer the
+      // harness sees the bare return, so the meaningful check is the empty body
+      // plus the pushStore call below.
+      expect(body).toEqual({});
       expect(harness.ctx.pushStore.removeSubscription).toHaveBeenCalledWith('sub-123');
     });
 

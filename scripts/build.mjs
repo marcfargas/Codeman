@@ -32,6 +32,12 @@ run('chmod dist/index.js', 'chmod +x dist/index.js');
 // 2. Copy static assets (clean first to remove stale hashed files from previous builds)
 run('clean public', 'rm -rf dist/web/public');
 run('prepare dirs', 'mkdir -p dist/web dist/templates dist/web/public/vendor');
+// Fetch the opt-in gesture overlay's MediaPipe wasm + model into src/ (idempotent,
+// non-fatal, kept out of git) so the copy below carries them into dist/.
+run('gesture assets', 'node scripts/fetch-gesture-assets.mjs');
+// Rebuild the gesture overlay bundle from its vendored source (packages/gesture-control)
+// into src/web/public/gesture/gesture-codeman.js, so prod always reflects current source.
+run('gesture bundle', 'node scripts/build-gesture-bundle.mjs');
 run('copy web assets', 'cp -r src/web/public dist/web/');
 run('copy template', 'cp src/templates/case-template.md dist/templates/');
 
@@ -39,6 +45,7 @@ run('copy template', 'cp src/templates/case-template.md dist/templates/');
 run('xterm css', 'cp node_modules/@xterm/xterm/css/xterm.css dist/web/public/vendor/');
 run('xterm js', 'npx esbuild node_modules/@xterm/xterm/lib/xterm.js --minify --outfile=dist/web/public/vendor/xterm.min.js');
 run('xterm-addon-fit', 'npx esbuild node_modules/@xterm/addon-fit/lib/addon-fit.js --minify --outfile=dist/web/public/vendor/xterm-addon-fit.min.js');
+run('xterm-addon-serialize', 'npx esbuild node_modules/@xterm/addon-serialize/lib/addon-serialize.js --minify --outfile=dist/web/public/vendor/xterm-addon-serialize.min.js');
 run('xterm-addon-webgl', 'cp node_modules/@xterm/addon-webgl/lib/addon-webgl.js dist/web/public/vendor/xterm-addon-webgl.min.js');
 run('xterm-addon-unicode11', 'npx esbuild node_modules/@xterm/addon-unicode11/lib/addon-unicode11.js --minify --outfile=dist/web/public/vendor/xterm-addon-unicode11.min.js');
 run('xterm-zerolag-input', 'npx esbuild packages/xterm-zerolag-input/src/zerolag-input-addon.ts --bundle --minify --format=iife --global-name=XtermZerolagInput --outfile=dist/web/public/vendor/xterm-zerolag-input.js');
@@ -58,9 +65,28 @@ appendFileSync(
   '}\n'
 );
 
+// Predictive echo (codex): separate bundle so the zerolag bundle stays byte-identical
+run('xterm-predictive-echo', 'npx esbuild packages/xterm-zerolag-input/src/predictive-echo-addon.ts --bundle --minify --format=iife --global-name=XtermPredictiveEcho --outfile=dist/web/public/vendor/xterm-predictive-echo.js');
+appendFileSync(
+  join(ROOT, 'dist/web/public/vendor/xterm-predictive-echo.js'),
+  '\n// Global aliases for browser usage\n' +
+  'if(typeof window!=="undefined"){' +
+    'window.PredictiveEchoAddon=XtermPredictiveEcho.PredictiveEchoAddon;' +
+    'window.PredictiveEchoOverlay=class extends XtermPredictiveEcho.PredictiveEchoAddon{' +
+      'constructor(terminal){' +
+        'super({});' +
+        'this.activate(terminal);' +
+      '}' +
+    '};' +
+  '}\n'
+);
+
 // 4. Minify frontend assets
 run('minify input-cjk.js', 'npx esbuild dist/web/public/input-cjk.js --minify --outfile=dist/web/public/input-cjk.js --allow-overwrite');
+run('minify i18n.js', 'npx esbuild dist/web/public/i18n.js --minify --outfile=dist/web/public/i18n.js --allow-overwrite');
+run('minify sanitize-html.js', 'npx esbuild dist/web/public/sanitize-html.js --minify --outfile=dist/web/public/sanitize-html.js --allow-overwrite');
 run('minify app.js', 'npx esbuild dist/web/public/app.js --minify --outfile=dist/web/public/app.js --allow-overwrite');
+run('minify tab-rail-resize.js', 'npx esbuild dist/web/public/tab-rail-resize.js --minify --outfile=dist/web/public/tab-rail-resize.js --allow-overwrite');
 run('minify terminal-ui.js', 'npx esbuild dist/web/public/terminal-ui.js --minify --outfile=dist/web/public/terminal-ui.js --allow-overwrite');
 run('minify respawn-ui.js', 'npx esbuild dist/web/public/respawn-ui.js --minify --outfile=dist/web/public/respawn-ui.js --allow-overwrite');
 run('minify ralph-panel.js', 'npx esbuild dist/web/public/ralph-panel.js --minify --outfile=dist/web/public/ralph-panel.js --allow-overwrite');
@@ -78,12 +104,15 @@ console.log('\n[build] content-hash cache busting');
     'styles.css',
     'mobile.css',
     'constants.js',
+    'i18n.js',
     'mobile-handlers.js',
     'voice-input.js',
     'notification-manager.js',
     'keyboard-accessory.js',
     'input-cjk.js',
+    'sanitize-html.js',
     'app.js',
+    'tab-rail-resize.js',
     'terminal-ui.js',
     'respawn-ui.js',
     'ralph-panel.js',
@@ -93,7 +122,9 @@ console.log('\n[build] content-hash cache busting');
     'ralph-wizard.js',
     'api-client.js',
     'subagent-windows.js',
+    'image-input.js',
     'vendor/xterm-zerolag-input.js',
+    'vendor/xterm-predictive-echo.js',
   ];
   const manifest = {};
   for (const file of HASHABLE) {

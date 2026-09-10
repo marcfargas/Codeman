@@ -6,7 +6,7 @@
  */
 
 import { execSync, spawn } from 'child_process';
-import { chmodSync, existsSync } from 'fs';
+import { existsSync } from 'fs';
 import { homedir, platform } from 'os';
 import { join } from 'path';
 import { createRequire } from 'module';
@@ -148,35 +148,32 @@ if (majorVersion < MIN_NODE_VERSION) {
 }
 
 // ----------------------------------------------------------------------------
-// 1b. Fix node-pty spawn-helper permissions (macOS posix_spawnp fix)
+// 1b. Repair + verify node-pty (macOS posix_spawnp fix, issues #6 and #204)
+//
+// node-pty ships its macOS spawn-helper without the execute bit, which breaks
+// every session start on macOS. fixNodePty() chmods it, then proves a PTY can
+// actually be opened, and only falls back to a from-source rebuild if that
+// still fails. See scripts/fix-node-pty.mjs for the full story.
 // ----------------------------------------------------------------------------
 
 try {
-    const require = createRequire(import.meta.url);
-    const ptyPath = join(require.resolve('node-pty'), '..');
-    const spawnHelper = join(ptyPath, 'build', 'Release', 'spawn-helper');
-    if (existsSync(spawnHelper)) {
-        chmodSync(spawnHelper, 0o755);
-        console.log(colors.green('✓ node-pty spawn-helper permissions fixed'));
-    }
-} catch {
-    // Non-critical — only affects macOS with prebuilt binaries
-}
+    const { fixNodePty } = await import('./fix-node-pty.mjs');
+    const result = await fixNodePty({
+        log: (line) => console.log(colors.dim(`  ${line}`)),
+        warn: (line) => console.log(colors.yellow(`⚠ ${line}`)),
+    });
 
-// ----------------------------------------------------------------------------
-// 1c. Rebuild node-pty from source for Node.js 22+ compatibility
-// ----------------------------------------------------------------------------
-
-if (majorVersion >= 22) {
-    try {
-        console.log(colors.dim('  Rebuilding node-pty from source for Node.js 22+...'));
-        execSync('npm rebuild node-pty --build-from-source', { stdio: 'pipe', timeout: 120000 });
-        console.log(colors.green('✓ node-pty rebuilt from source'));
-    } catch {
+    if (result.ok) {
+        console.log(colors.green('✓ node-pty verified') + colors.dim(' (PTY spawn works)'));
+    } else {
         hasWarnings = true;
-        console.log(colors.yellow('⚠ Failed to rebuild node-pty from source'));
-        console.log(colors.dim('  You may need to run: npm rebuild node-pty --build-from-source'));
+        console.log(colors.yellow(`⚠ node-pty is not usable: ${result.reason}`));
+        console.log(colors.dim('  Sessions will fail to start. Try: ') + colors.cyan('npm run fix:node-pty'));
     }
+} catch (err) {
+    hasWarnings = true;
+    console.log(colors.yellow(`⚠ Could not verify node-pty: ${err.message}`));
+    console.log(colors.dim('  If sessions fail to start, run: ') + colors.cyan('npm run fix:node-pty'));
 }
 
 // ----------------------------------------------------------------------------
@@ -252,6 +249,7 @@ if (isGlobalInstall) {
         const require = createRequire(import.meta.url);
         const xtermDir = join(require.resolve('@xterm/xterm'), '..', '..');
         const fitDir = join(require.resolve('@xterm/addon-fit'), '..', '..');
+        const serializeDir = join(require.resolve('@xterm/addon-serialize'), '..', '..');
         const webglDir = join(require.resolve('@xterm/addon-webgl'), '..', '..');
         const unicode11Dir = join(require.resolve('@xterm/addon-unicode11'), '..', '..');
         const vendorDir = join(srcDir, 'web', 'public', 'vendor');
@@ -264,12 +262,14 @@ if (isGlobalInstall) {
         try {
             execSync(`npx esbuild "${join(xtermDir, 'lib', 'xterm.js')}" --minify --outfile="${join(vendorDir, 'xterm.min.js')}"`, { stdio: 'pipe' });
             execSync(`npx esbuild "${join(fitDir, 'lib', 'addon-fit.js')}" --minify --outfile="${join(vendorDir, 'xterm-addon-fit.min.js')}"`, { stdio: 'pipe' });
+            execSync(`npx esbuild "${join(serializeDir, 'lib', 'addon-serialize.js')}" --minify --outfile="${join(vendorDir, 'xterm-addon-serialize.min.js')}"`, { stdio: 'pipe' });
             execSync(`npx esbuild "${join(unicode11Dir, 'lib', 'addon-unicode11.js')}" --minify --outfile="${join(vendorDir, 'xterm-addon-unicode11.min.js')}"`, { stdio: 'pipe' });
             console.log(colors.green('✓ xterm vendor files copied to src/web/public/vendor/'));
         } catch {
             // Fallback: copy unminified
             copyFileSync(join(xtermDir, 'lib', 'xterm.js'), join(vendorDir, 'xterm.min.js'));
             copyFileSync(join(fitDir, 'lib', 'addon-fit.js'), join(vendorDir, 'xterm-addon-fit.min.js'));
+            copyFileSync(join(serializeDir, 'lib', 'addon-serialize.js'), join(vendorDir, 'xterm-addon-serialize.min.js'));
             copyFileSync(join(unicode11Dir, 'lib', 'addon-unicode11.js'), join(vendorDir, 'xterm-addon-unicode11.min.js'));
             console.log(colors.green('✓ xterm vendor files copied') + colors.dim(' (unminified — esbuild not available)'));
         }
@@ -304,11 +304,54 @@ if (isGlobalInstall) {
         } catch {
             console.log(colors.yellow('⚠ Failed to bundle xterm-zerolag-input — overlay may not work in dev mode'));
         }
+
+        // Predictive echo (codex): SEPARATE bundle so the zerolag bundle above stays
+        // byte-identical. If this file is missing or broken, codex simply falls back
+        // to plain PTY echo (pre-predictive behavior); nothing else is affected.
+        try {
+            const predSrc = join(import.meta.dirname, '..', 'packages', 'xterm-zerolag-input', 'src', 'predictive-echo-addon.ts');
+            const predOut = join(vendorDir, 'xterm-predictive-echo.js');
+            execSync(
+                `npx esbuild "${predSrc}" --bundle --format=iife --global-name=XtermPredictiveEcho --outfile="${predOut}"`,
+                { stdio: 'pipe' }
+            );
+            const { appendFileSync } = await import('fs');
+            appendFileSync(
+                predOut,
+                '\n// Global aliases for browser usage\n' +
+                'if(typeof window!=="undefined"){' +
+                    'window.PredictiveEchoAddon=XtermPredictiveEcho.PredictiveEchoAddon;' +
+                    'window.PredictiveEchoOverlay=class extends XtermPredictiveEcho.PredictiveEchoAddon{' +
+                        'constructor(terminal){' +
+                            'super({});' +
+                            'this.activate(terminal);' +
+                        '}' +
+                    '};' +
+                '}\n'
+            );
+            console.log(colors.green('✓ xterm-predictive-echo bundled to vendor/'));
+        } catch (e) {
+            console.log(colors.yellow('⚠ predictive-echo bundle failed (codex uses plain echo): ' + e.message));
+        }
     } catch (err) {
         hasWarnings = true;
         console.log(colors.yellow('⚠ Failed to copy xterm vendor files'));
         console.log(colors.dim(`  ${err.message}`));
         console.log(colors.dim('  Dev server may fail to load xterm.js — run: npm run build'));
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 4b. Fetch gesture-overlay runtime assets (MediaPipe wasm + model) for dev mode
+//     (src/web/public/gesture/). Opt-in feature (CODEMAN_GESTURE=1); non-fatal.
+//     Large binaries kept out of git; the build copies them into dist/.
+// ----------------------------------------------------------------------------
+
+if (!isGlobalInstall) {
+    try {
+        execSync(`node "${join(import.meta.dirname, 'fetch-gesture-assets.mjs')}"`, { stdio: 'inherit' });
+    } catch {
+        // Non-fatal — the gesture overlay is opt-in.
     }
 }
 
@@ -446,3 +489,16 @@ if (process.env.CI || process.env.CODEMAN_NO_AUTOSTART) {
         }
     }
 }
+
+// ----------------------------------------------------------------------------
+// Security note — printed on every install path
+// ----------------------------------------------------------------------------
+
+console.log(colors.bold('Security:'));
+console.log(colors.dim('  Codeman binds ') + colors.cyan('127.0.0.1') + colors.dim(' (this machine only) — no password needed by default.'));
+console.log(colors.dim('  To reach it from another device, do ONE of:'));
+console.log(colors.dim('    • ') + colors.cyan('tailscale serve') + colors.dim(' / ') + colors.cyan('cloudflared tunnel') + colors.dim('   (recommended), or'));
+console.log(colors.dim('    • ') + colors.cyan('codeman web --host 0.0.0.0') + colors.dim('  AND set ') + colors.cyan('CODEMAN_PASSWORD'));
+console.log(colors.dim('  A non-loopback bind without a password still starts, but warns loudly.'));
+console.log(colors.dim('  Details: docs/security-architecture.md'));
+console.log('');

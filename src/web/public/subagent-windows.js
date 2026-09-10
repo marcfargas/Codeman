@@ -33,10 +33,10 @@ Object.assign(CodemanApp.prototype, {
       const truncatedName = displayName.length > 25 ? displayName.substring(0, 25) + '…' : displayName;
       const statusClass = agent?.status || 'idle';
       agentItems.push(`
-        <div class="subagent-dropdown-item" onclick="event.stopPropagation(); app.restoreMinimizedSubagent('${escapeHtml(agentId)}', '${escapeHtml(sessionId)}')" title="Click to restore">
+        <div class="subagent-dropdown-item" onclick="event.stopPropagation(); app.restoreMinimizedSubagent(${escapeHtml(JSON.stringify(agentId))}, ${escapeHtml(JSON.stringify(sessionId))})" title="Click to restore">
           <span class="subagent-dropdown-status ${statusClass}"></span>
           <span class="subagent-dropdown-name">${escapeHtml(truncatedName)}</span>
-          <span class="subagent-dropdown-close" onclick="event.stopPropagation(); app.permanentlyCloseMinimizedSubagent('${escapeHtml(agentId)}', '${escapeHtml(sessionId)}')" title="Dismiss">&times;</span>
+          <span class="subagent-dropdown-close" onclick="event.stopPropagation(); app.permanentlyCloseMinimizedSubagent(${escapeHtml(JSON.stringify(agentId))}, ${escapeHtml(JSON.stringify(sessionId))})" title="Dismiss">&times;</span>
         </div>
       `);
     }
@@ -401,15 +401,12 @@ Object.assign(CodemanApp.prototype, {
           continue;
         }
 
-        // Draw curved line from TAB bottom-center to window top-center
-        const x1 = tabRect.left + tabRect.width / 2;
-        const y1 = tabRect.bottom;
-        const x2 = winRect.left + winRect.width / 2;
-        const y2 = winRect.top;
-
-        // Bezier curve control points for smooth curve
-        const midY = (y1 + y2) / 2;
-        const path = `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`;
+        // Draw a curved line from the tab to the window. Header strip: tab
+        // bottom-center → window top-center (vertical). Sidebar: tab right-edge →
+        // window left-edge (horizontal), otherwise the curve loops backwards
+        // underneath the sidebar. _tabAnchor/_tabConnectorPath live in app.js.
+        const anchor = this._tabAnchor(tabRect);
+        const path = this._tabConnectorPath(anchor, winRect);
 
         const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
         line.setAttribute('d', path);
@@ -455,6 +452,25 @@ Object.assign(CodemanApp.prototype, {
         svg.appendChild(line);
       }
     }
+
+    // Ultracode floating run windows → parent tab (additional layer, ultracode-windows.js).
+    // Drawn into the same SVG and same batched read/write pass; the tab-rect cache is shared.
+    if (typeof this._appendUltracodeConnectionLines === 'function') {
+      this._appendUltracodeConnectionLines(svg, rects);
+    }
+    // Agent-transcript windows → their run window / tab (ultracode-windows.js).
+    if (typeof this._appendUltracodeAgentConnectionLines === 'function') {
+      this._appendUltracodeAgentConnectionLines(svg, rects);
+    }
+    // Tab → tab it spawned (session-lineage.js). Same shared read/write pass and the
+    // same tab-rect cache; desktop-only and gated on its own setting inside.
+    if (typeof this._appendLineageConnectionLines === 'function') {
+      this._appendLineageConnectionLines(svg, rects);
+    }
+
+    // Every path above was just created from scratch, so any line entrance in
+    // flight has to be re-attached here (resumed via a negative animation-delay).
+    this._applyLineEntrances?.(svg);
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -689,7 +705,7 @@ Object.assign(CodemanApp.prototype, {
       parentSessionId && parentSessionName
         ? `<div class="subagent-window-parent" data-parent-session="${parentSessionId}">
           <span class="parent-label">from</span>
-          <span class="parent-name" onclick="app.selectSession('${escapeHtml(parentSessionId)}')">${escapeHtml(parentSessionName)}</span>
+          <span class="parent-name" onclick="app.selectSession(${escapeHtml(JSON.stringify(parentSessionId))})">${escapeHtml(parentSessionName)}</span>
         </div>`
         : '';
 
@@ -710,7 +726,7 @@ Object.assign(CodemanApp.prototype, {
           <span class="status ${agent.status}">${agent.status}</span>
         </div>
         <div class="subagent-window-actions">
-          <button onclick="app.closeSubagentWindow('${escapeHtml(agentId)}')" title="Minimize to tab">─</button>
+          <button onclick="app.closeSubagentWindow(${escapeHtml(JSON.stringify(agentId))})" title="Minimize to tab">─</button>
         </div>
       </div>
       ${parentHeader}
@@ -719,15 +735,22 @@ Object.assign(CodemanApp.prototype, {
       </div>
     `;
 
+    // Only the `fly` entrance style parks the window on its parent tab; every
+    // CSS-animated style (entrance-animations.js) needs it to start at its
+    // resting position, or the animation would play at the wrong place.
+    const flyFromTab = !!parentTab && !isMobile && this.windowEntranceFliesFromTab?.() !== false;
+
     // If we have a parent tab, start window at tab position for spawn animation
     if (isMobile) {
       // Mobile: position using top (keyboard-aware positioning calculated above)
       win.style.top = `${finalY}px`;
       win.style.bottom = 'auto';
-    } else if (parentTab) {
-      const tabRect = parentTab.getBoundingClientRect();
-      win.style.left = `${tabRect.left}px`;
-      win.style.top = `${tabRect.bottom}px`;
+    } else if (flyFromTab) {
+      // Spawn at the tab: below it in header layout, to its RIGHT in sidebar
+      // layout — spawning at tabRect.left there would land on top of the sidebar.
+      const anchor = this._tabAnchor(parentTab.getBoundingClientRect());
+      win.style.left = `${anchor.spawnLeft}px`;
+      win.style.top = `${anchor.spawnTop}px`;
       win.style.transform = 'scale(0.3)';
       win.style.opacity = '0';
       win.classList.add('spawning');
@@ -802,7 +825,7 @@ Object.assign(CodemanApp.prototype, {
     this.subagentWindows.get(agentId).resizeObserver = resizeObserver;
 
     // Animate to final position if spawning from tab (desktop only)
-    if (parentTab && !isMobile) {
+    if (flyFromTab) {
       requestAnimationFrame(() => {
         win.style.transition = 'all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1)';
         win.style.left = `${finalX}px`;
@@ -814,11 +837,26 @@ Object.assign(CodemanApp.prototype, {
         setTimeout(() => {
           win.style.transition = '';
           win.classList.remove('spawning');
+          // The line only becomes meaningful once the window has landed, so its
+          // draw-in starts here rather than at spawn.
+          this.markConnectionLineEntering?.(agentId);
           this.updateConnectionLines();
         }, 400);
       });
     } else {
-      // No animation (mobile uses CSS positioning), just update connection lines
+      // CSS-animated entrance styles (and mobile) run in place. The window is
+      // already at its resting position, so the connection line can be drawn
+      // against a correct rect right away and animate alongside it.
+      //
+      // Skipped when the window spawns hidden (its agent belongs to a background
+      // tab): a display:none element never runs its animation, so `animationend`
+      // would never fire and the entrance class plus its inline custom property
+      // would stick to the window forever. Nothing is visible to animate anyway,
+      // and revealing it later is a tab switch, not a spawn.
+      if (!shouldHide) {
+        this.applyWindowEntrance?.(win);
+        this.markConnectionLineEntering?.(agentId);
+      }
       this.updateConnectionLines();
     }
 
@@ -974,6 +1012,9 @@ Object.assign(CodemanApp.prototype, {
       popupData.element.remove();
     }
     this.imagePopups.clear();
+
+    // Clean up ultracode floating run windows (re-seeded from data.workflowRuns on reconnect)
+    if (typeof this.removeAllUltracodeWindows === 'function') this.removeAllUltracodeWindows();
 
     // Clear orphaned plan generation state
     this.activePlanOrchestratorId = null;
@@ -1184,6 +1225,19 @@ Object.assign(CodemanApp.prototype, {
     dropdown.style.left = `${rect.left + rect.width / 2}px`;
     dropdown.style.transform = 'translateX(-50%)';
     dropdown.classList.add('open');
+
+    // Keep it on screen. A badge in the left sidebar — and above all one in the
+    // 44px collapsed rail — sits so far left that a centre-anchored dropdown
+    // hangs off the viewport. Measured after .open so it has a box; a no-op
+    // whenever the centred position already fits, so header layout is unchanged.
+    const dropRect = dropdown.getBoundingClientRect();
+    const overflowLeft = 8 - dropRect.left;
+    const overflowRight = dropRect.right - (window.innerWidth - 8);
+    if (overflowLeft > 0) {
+      dropdown.style.transform = `translateX(calc(-50% + ${Math.round(overflowLeft)}px))`;
+    } else if (overflowRight > 0) {
+      dropdown.style.transform = `translateX(calc(-50% - ${Math.round(overflowRight)}px))`;
+    }
   },
 
   // Schedule hide after delay (allows moving mouse to dropdown)

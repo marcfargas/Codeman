@@ -2,11 +2,11 @@
 
 Comprehensive mobile UI testing for Codeman's web interface using Playwright with dual-engine support (Chromium + WebKit).
 
-**325 tests across 135 devices — all passing.**
+**326 tests across 136 devices — all passing.**
 
 ## Purpose
 
-Validates Codeman's mobile UI across 135 devices, covering:
+Validates Codeman's mobile UI across 136 devices, covering:
 
 - **Keyboard simulation** — 3-layer approach to emulate virtual keyboards in headless browsers
 - **Touch/swipe interactions** — CDP trusted events (Chromium) + synthetic fallback (WebKit)
@@ -16,22 +16,30 @@ Validates Codeman's mobile UI across 135 devices, covering:
 
 ## Quick Start
 
+⚠️ Go through `npm run test:mobile`, not `npx vitest` directly. The suite serves the
+page from `src/web/public`, but `npm run build` puts the xterm vendor bundles in
+`dist/web/public`, so without them every `/vendor/xterm*` request 404s, `Terminal` is
+never defined and every test touching `app.terminal` fails on a null. The
+`pretest:mobile` hook (`scripts/prepare-test-vendor.mjs`) is what puts them in place,
+and npm only fires it for `npm run test:mobile`. Run the prepare script by hand first
+if you really need a bare `npx vitest`.
+
 ```bash
 # Run all mobile tests
-npx vitest run --config test/mobile/vitest.config.ts
+npm run test:mobile
 
 # Run a single test file
-npx vitest run --config test/mobile/vitest.config.ts test/mobile/keyboard.test.ts
+npm run test:mobile -- test/mobile/keyboard.test.ts
 
-# Quick mode — 6 representative devices, skip full matrix
-CI_QUICK=1 npx vitest run --config test/mobile/vitest.config.ts
+# Quick mode: 6 representative devices, skip full matrix
+CI_QUICK=1 npm run test:mobile
 
-# Full device matrix only (135 devices)
-npx vitest run --config test/mobile/vitest.config.ts test/mobile/device-matrix.test.ts
+# Full device matrix only (136 devices)
+npm run test:mobile -- test/mobile/device-matrix.test.ts
 
 # Update visual baselines (delete old baselines, re-run)
 rm -rf test/mobile/snapshots/*.png
-npx vitest run --config test/mobile/vitest.config.ts test/mobile/visual-regression.test.ts
+npm run test:mobile -- test/mobile/visual-regression.test.ts
 ```
 
 ## Test Files
@@ -43,7 +51,7 @@ npx vitest run --config test/mobile/vitest.config.ts test/mobile/visual-regressi
 | `subagent-windows.test.ts` | 3202 | Mobile subagent card dimensions, stacking, interactions |
 | `settings.test.ts` | 3203 | Settings modal, mobile defaults, persistence |
 | `layout.test.ts` | 3204 | General mobile layout, fixed elements, device classes |
-| `device-matrix.test.ts` | 3205 | Cross-device parametric tests (135 devices) |
+| `device-matrix.test.ts` | 3205 | Cross-device parametric tests (136 devices) |
 | `visual-regression.test.ts` | 3206 | Screenshot comparison at key breakpoints |
 | `accessibility.test.ts` | 3207 | WCAG touch targets, zoom, focus, ARIA |
 
@@ -58,7 +66,7 @@ npx vitest run --config test/mobile/vitest.config.ts test/mobile/visual-regressi
 | standard-tablet | 768–834px | ~8 | iPad Mini |
 | large-tablet | 835px+ | ~5 | iPad Pro 11" |
 
-135 devices are defined in `devices.ts` — 68 from Playwright's built-in device profiles plus 67 custom entries for newer devices (iPhone 16/17, Pixel 9, Galaxy S25, iPad Air M2, Surface Pro, etc.).
+136 devices are defined in `devices.ts` — 68 from Playwright's built-in device profiles plus 68 custom entries for newer devices (iPhone 16/17, Pixel 9, Galaxy S25, OPPO Find N5 unfolded, iPad Air M2, Surface Pro, etc.).
 
 ### How Devices Are Differentiated
 
@@ -98,7 +106,7 @@ Test File
   ├─ helpers/touch-sim.ts    → CDP trusted touch / synthetic fallback
   ├─ helpers/assertions.ts   → Layout, CSS, accessibility assertions
   ├─ helpers/visual.ts       → pixelmatch screenshot comparison
-  └─ devices.ts              → 135-device registry
+  └─ devices.ts              → 136-device registry
 ```
 
 ### Keyboard Simulation — 3-Layer Approach
